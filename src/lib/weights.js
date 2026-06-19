@@ -285,10 +285,7 @@ export async function loadWeights(device, url, onProgress) {
       ...headConfig,
       dimOut: [null, null, null, null, 3],
     }),
-    normalHead: buildConvStackWeights('normal_head', {
-      ...headConfig,
-      dimOut: [null, null, null, null, 3],
-    }),
+    // NOTE: moge-2-vitl has no normal_head — normals derived from point map
     maskHead: buildConvStackWeights('mask_head', {
       ...headConfig,
       dimOut: [null, null, null, null, 1],

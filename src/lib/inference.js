@@ -65,15 +65,9 @@ const MODEL_CONFIG = {
     resBlockInNorm: 'none',
     resBlockHiddenNorm: 'none',
   },
-  normalHead: {
-    dimIn: [1024, 256, 128, 64, 32],
-    dimResBlocks: [1024, 256, 128, 64, 32],
-    dimOut: [null, null, null, null, 3],
-    numResBlocks: [0, 1, 1, 1, 0],
-    resamplers: ['conv_transpose', 'conv_transpose', 'conv_transpose', 'bilinear'],
-    resBlockInNorm: 'none',
-    resBlockHiddenNorm: 'none',
-  },
+  // NOTE: moge-2-vitl does NOT have a normal_head.
+  // Normals are computed from the point map via finite differences.
+  // moge-2-vits-normal has a normal_head but we're targeting vitl.
   maskHead: {
     dimIn: [1024, 256, 128, 64, 32],
     dimResBlocks: [1024, 256, 128, 64, 32],
@@ -330,9 +324,36 @@ export class MoGeInference {
     return {
       neck: makeConvStackWeights(MODEL_CONFIG.neck),
       pointsHead: makeConvStackWeights(MODEL_CONFIG.pointsHead),
-      normalHead: makeConvStackWeights(MODEL_CONFIG.normalHead),
       maskHead: makeConvStackWeights(MODEL_CONFIG.maskHead),
     };
+  }
+
+  /**
+   * Try to load test fixture (real encoder features from PyTorch).
+   */
+  async _loadFixture() {
+    try {
+      const metaResp = await fetch('/test_fixtures/metadata.json');
+      if (!metaResp.ok) return null;
+      const meta = await metaResp.json();
+
+      const [featBuf, clsBuf] = await Promise.all([
+        fetch('/test_fixtures/encoder_features.bin').then(r => r.arrayBuffer()),
+        fetch('/test_fixtures/cls_token.bin').then(r => r.arrayBuffer()),
+      ]);
+
+      console.log(`Loaded test fixture: tokenH=${meta.tokenH}, tokenW=${meta.tokenW}`);
+      return {
+        features: new Float32Array(featBuf),
+        clsToken: new Float32Array(clsBuf),
+        tokenH: meta.tokenH,
+        tokenW: meta.tokenW,
+        meta,
+      };
+    } catch (e) {
+      console.warn('No test fixture available:', e.message);
+      return null;
+    }
   }
 
   /**
@@ -341,22 +362,32 @@ export class MoGeInference {
   async run(imageData) {
     const { width, height } = imageData;
     const device = this.device;
-
-    const tokenH = Math.floor(height / MODEL_CONFIG.patchSize);
-    const tokenW = Math.floor(width / MODEL_CONFIG.patchSize);
-
-    // --- STUB BACKBONE ---
-    // Random features at [encoderDim, tokenH, tokenW]
     const encoderDim = MODEL_CONFIG.encoder.dimOut;
-    const stubEncoderData = new Float32Array(encoderDim * tokenH * tokenW);
-    for (let i = 0; i < stubEncoderData.length; i++) {
-      stubEncoderData[i] = (Math.random() - 0.5) * 0.5;
-    }
-    const encoderFeatures = createStorageBuffer(device, stubEncoderData);
 
-    // Build input features for neck: encoder features + UV coords concatenated
-    // Level 0: [1024 + 2, tokenH, tokenW]
-    // Levels 1-4: [2, tokenH*2^i, tokenW*2^i] (UV only)
+    // Try to load real encoder features from fixture
+    const fixture = await this._loadFixture();
+
+    let encoderData;
+    let tokenH, tokenW;
+
+    if (fixture) {
+      encoderData = fixture.features;
+      tokenH = fixture.tokenH;
+      tokenW = fixture.tokenW;
+      console.log(`Using real encoder features: [${encoderDim}, ${tokenH}, ${tokenW}]`);
+    } else {
+      // Stub: random features
+      tokenH = Math.floor(height / MODEL_CONFIG.patchSize);
+      tokenW = Math.floor(width / MODEL_CONFIG.patchSize);
+      encoderData = new Float32Array(encoderDim * tokenH * tokenW);
+      for (let i = 0; i < encoderData.length; i++) {
+        encoderData[i] = (Math.random() - 0.5) * 0.5;
+      }
+      console.log(`Using stub encoder features: [${encoderDim}, ${tokenH}, ${tokenW}]`);
+    }
+
+    // Build neck input features: encoder features + UV coords at 5 scales
+    const aspect = width / height;
     const neckInputs = [];
     for (let level = 0; level < 5; level++) {
       const h = tokenH * (2 ** level);
@@ -365,14 +396,8 @@ export class MoGeInference {
 
       const data = new Float32Array(dimIn * h * w);
       if (level === 0) {
-        // Copy encoder features then append UV
-        for (let c = 0; c < encoderDim; c++) {
-          for (let s = 0; s < tokenH * tokenW; s++) {
-            data[c * h * w + s] = stubEncoderData[c * tokenH * tokenW + s];
-          }
-        }
-        // UV channels at end
-        const aspect = width / height;
+        // Encoder features [1024, tokenH, tokenW] + UV [2, tokenH, tokenW]
+        data.set(encoderData, 0);
         for (let y = 0; y < h; y++) {
           for (let x = 0; x < w; x++) {
             data[encoderDim * h * w + y * w + x] = ((x + 0.5) / w * 2 - 1) * aspect;
@@ -380,8 +405,7 @@ export class MoGeInference {
           }
         }
       } else {
-        // UV only
-        const aspect = width / height;
+        // UV only [2, h, w]
         for (let y = 0; y < h; y++) {
           for (let x = 0; x < w; x++) {
             data[0 * h * w + y * w + x] = ((x + 0.5) / w * 2 - 1) * aspect;
@@ -389,62 +413,50 @@ export class MoGeInference {
           }
         }
       }
-
       neckInputs.push({ buffer: createStorageBuffer(device, data), H: h, W: w });
     }
 
-    // --- NECK ---
+    // --- Dispatch ---
     const commandEncoder = device.createCommandEncoder();
 
+    // Neck
     const neckOutputs = dispatchConvStack(device, commandEncoder, neckInputs, this.weights.neck, MODEL_CONFIG.neck);
 
-    // --- HEADS ---
-    // Points head takes neck outputs as input
-    const pointsInputs = neckOutputs.map((f, i) => ({
-      buffer: f.buffer,
-      H: f.H,
-      W: f.W,
-    }));
+    // Points head
+    const pointsInputs = neckOutputs.map(f => ({ buffer: f.buffer, H: f.H, W: f.W }));
     const pointsOutputs = dispatchConvStack(device, commandEncoder, pointsInputs, this.weights.pointsHead, MODEL_CONFIG.pointsHead);
-
-    // Normal head
-    const normalInputs = neckOutputs.map(f => ({ buffer: f.buffer, H: f.H, W: f.W }));
-    const normalOutputs = dispatchConvStack(device, commandEncoder, normalInputs, this.weights.normalHead, MODEL_CONFIG.normalHead);
 
     // Mask head
     const maskInputs = neckOutputs.map(f => ({ buffer: f.buffer, H: f.H, W: f.W }));
     const maskOutputs = dispatchConvStack(device, commandEncoder, maskInputs, this.weights.maskHead, MODEL_CONFIG.maskHead);
 
-    // Submit all compute work
+    // Submit
     device.queue.submit([commandEncoder.finish()]);
 
-    // Read back the final level outputs
-    const lastPointsFeature = pointsOutputs[pointsOutputs.length - 1];
-    const lastNormalFeature = normalOutputs[normalOutputs.length - 1];
-    const lastMaskFeature = maskOutputs[maskOutputs.length - 1];
+    // Read back
+    const lastPoints = pointsOutputs[pointsOutputs.length - 1];
+    const lastMask = maskOutputs[maskOutputs.length - 1];
 
-    const [pointsRaw, normalsRaw, maskRaw] = await Promise.all([
-      readBuffer(device, lastPointsFeature.buffer, lastPointsFeature.C * lastPointsFeature.H * lastPointsFeature.W * 4),
-      readBuffer(device, lastNormalFeature.buffer, lastNormalFeature.C * lastNormalFeature.H * lastNormalFeature.W * 4),
-      readBuffer(device, lastMaskFeature.buffer, lastMaskFeature.C * lastMaskFeature.H * lastMaskFeature.W * 4),
+    const [pointsRaw, maskRaw] = await Promise.all([
+      readBuffer(device, lastPoints.buffer, lastPoints.C * lastPoints.H * lastPoints.W * 4),
+      readBuffer(device, lastMask.buffer, lastMask.C * lastMask.H * lastMask.W * 4),
     ]);
 
-    const outH = lastPointsFeature.H;
-    const outW = lastPointsFeature.W;
+    const outH = lastPoints.H;
+    const outW = lastPoints.W;
 
-    // Remap points: exp remap (xy * exp(z), exp(z))
+    // Post-processing: exp remap
     const points = new Float32Array(3 * outH * outW);
     const depth = new Float32Array(outH * outW);
     const colors = new Float32Array(3 * outH * outW);
 
     for (let i = 0; i < outH * outW; i++) {
-      // pointsRaw is in CHW: [3, outH, outW]
       let px = pointsRaw[0 * outH * outW + i];
       let py = pointsRaw[1 * outH * outW + i];
       let pz = pointsRaw[2 * outH * outW + i];
 
-      // exp remap
-      const expZ = Math.exp(Math.min(pz, 10)); // clamp to avoid overflow
+      // exp remap: xy = xy * exp(z), z = exp(z)
+      const expZ = Math.exp(Math.min(pz, 10));
       px = px * expZ;
       py = py * expZ;
       pz = expZ;
@@ -454,31 +466,48 @@ export class MoGeInference {
       points[i * 3 + 2] = pz;
       depth[i] = pz;
 
-      // Color from input image (resample to output resolution)
+      // Color from input image
       const oy = Math.floor(i / outW);
       const ox = i % outW;
-      const srcY = Math.floor(oy * height / outH);
-      const srcX = Math.floor(ox * width / outW);
+      const srcY = Math.min(Math.floor(oy * height / outH), height - 1);
+      const srcX = Math.min(Math.floor(ox * width / outW), width - 1);
       const srcIdx = srcY * width + srcX;
       colors[i * 3 + 0] = imageData.data[srcIdx * 4 + 0] / 255;
       colors[i * 3 + 1] = imageData.data[srcIdx * 4 + 1] / 255;
       colors[i * 3 + 2] = imageData.data[srcIdx * 4 + 2] / 255;
     }
 
-    // Normals: normalize vectors (CHW → per-pixel vec3)
+    // Compute normals from point map via finite differences (cross product)
+    // No normal_head in moge-2-vitl — normals are derived from geometry
     const normals = new Float32Array(3 * outH * outW);
-    for (let i = 0; i < outH * outW; i++) {
-      let nx = normalsRaw[0 * outH * outW + i];
-      let ny = normalsRaw[1 * outH * outW + i];
-      let nz = normalsRaw[2 * outH * outW + i];
-      const len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
-      normals[i * 3 + 0] = nx / len;
-      normals[i * 3 + 1] = ny / len;
-      normals[i * 3 + 2] = nz / len;
+    for (let y = 0; y < outH; y++) {
+      for (let x = 0; x < outW; x++) {
+        const i = y * outW + x;
+        const x1 = Math.min(x + 1, outW - 1);
+        const y1 = Math.min(y + 1, outH - 1);
+        const ir = y * outW + x1;
+        const ib = y1 * outW + x;
+
+        // dP/dx and dP/dy
+        const dxX = points[ir * 3 + 0] - points[i * 3 + 0];
+        const dxY = points[ir * 3 + 1] - points[i * 3 + 1];
+        const dxZ = points[ir * 3 + 2] - points[i * 3 + 2];
+        const dyX = points[ib * 3 + 0] - points[i * 3 + 0];
+        const dyY = points[ib * 3 + 1] - points[i * 3 + 1];
+        const dyZ = points[ib * 3 + 2] - points[i * 3 + 2];
+
+        // Cross product
+        let nx = dxY * dyZ - dxZ * dyY;
+        let ny = dxZ * dyX - dxX * dyZ;
+        let nz = dxX * dyY - dxY * dyX;
+        const len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+        normals[i * 3 + 0] = nx / len;
+        normals[i * 3 + 1] = ny / len;
+        normals[i * 3 + 2] = nz / len;
+      }
     }
 
-    // Clean up input buffers
-    encoderFeatures.destroy();
+    // Clean up
     neckInputs.forEach(f => f.buffer.destroy());
 
     return { depth, normals, points, colors, width: outW, height: outH };
