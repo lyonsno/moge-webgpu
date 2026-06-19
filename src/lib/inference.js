@@ -445,6 +445,27 @@ export class MoGeInference {
     const outH = lastPoints.H;
     const outW = lastPoints.W;
 
+    // Diagnostic: check raw output ranges
+    let pMin = Infinity, pMax = -Infinity, pNan = 0, pZero = 0;
+    for (let i = 0; i < pointsRaw.length; i++) {
+      if (isNaN(pointsRaw[i])) pNan++;
+      if (pointsRaw[i] === 0) pZero++;
+      if (isFinite(pointsRaw[i])) {
+        pMin = Math.min(pMin, pointsRaw[i]);
+        pMax = Math.max(pMax, pointsRaw[i]);
+      }
+    }
+    console.log(`Points raw: shape=[${lastPoints.C}, ${outH}, ${outW}], range=[${pMin.toFixed(4)}, ${pMax.toFixed(4)}], NaN=${pNan}, zeros=${pZero}/${pointsRaw.length}`);
+
+    let mMin = Infinity, mMax = -Infinity;
+    for (let i = 0; i < maskRaw.length; i++) {
+      if (isFinite(maskRaw[i])) {
+        mMin = Math.min(mMin, maskRaw[i]);
+        mMax = Math.max(mMax, maskRaw[i]);
+      }
+    }
+    console.log(`Mask raw: range=[${mMin.toFixed(4)}, ${mMax.toFixed(4)}]`);
+
     // Post-processing: exp remap
     const points = new Float32Array(3 * outH * outW);
     const depth = new Float32Array(outH * outW);

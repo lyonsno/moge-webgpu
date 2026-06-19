@@ -17,6 +17,7 @@ struct UpsampleParams {
   outH: u32,
   outW: u32,
   mode: u32,    // 0=nearest, 1=bilinear
+  numWorkgroupsX: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: UpsampleParams;
@@ -27,10 +28,12 @@ const WG_SIZE: u32 = 256;
 
 @compute @workgroup_size(WG_SIZE)
 fn upsample_main(
-  @builtin(global_invocation_id) gid: vec3<u32>,
+  @builtin(workgroup_id) wgid: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
   let totalOut = params.C * params.outH * params.outW;
-  let idx = gid.x;
+  let linearWG = wgid.x + wgid.y * params.numWorkgroupsX;
+  let idx = linearWG * WG_SIZE + lid.x;
 
   if (idx >= totalOut) {
     return;

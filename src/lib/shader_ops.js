@@ -16,6 +16,18 @@ import upsampleWGSL from '../shaders/upsample.wgsl?raw';
 import { createStorageBuffer, createEmptyBuffer } from './gpu.js';
 
 const pipelineCache = new Map();
+const MAX_WG_DIM = 65535;
+
+/**
+ * Split a total workgroup count into 2D dispatch (x, y) to stay within limits.
+ * Returns [wgX, wgY] where wgX * wgY >= totalWG and wgX <= MAX_WG_DIM.
+ */
+function splitWorkgroups(totalWG) {
+  if (totalWG <= MAX_WG_DIM) return [totalWG, 1];
+  const wgX = MAX_WG_DIM;
+  const wgY = Math.ceil(totalWG / MAX_WG_DIM);
+  return [wgX, wgY];
+}
 
 function getOrCreatePipeline(device, key, code, entryPoint) {
   if (pipelineCache.has(key)) return pipelineCache.get(key);
@@ -86,7 +98,9 @@ export function dispatchConv1x1(device, encoder, inputBuf, weightBuf, biasBuf, p
 
   const pipeline = getOrCreatePipeline(device, 'conv1x1', conv1x1WGSL, 'conv1x1_main');
 
-  const uniformData = new Uint32Array([inC, outC, H, W, hasBias]);
+  const totalWG = ceil(outC * H * W, 256);
+  const [wgX, wgY] = splitWorkgroups(totalWG);
+  const uniformData = new Uint32Array([inC, outC, H, W, hasBias, wgX]);
   const uniformBuf = device.createBuffer({
     size: uniformData.byteLength,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -112,7 +126,7 @@ export function dispatchConv1x1(device, encoder, inputBuf, weightBuf, biasBuf, p
   const pass = encoder.beginComputePass();
   pass.setPipeline(pipeline);
   pass.setBindGroup(0, bindGroup);
-  pass.dispatchWorkgroups(ceil(outC * H * W, 256));
+  pass.dispatchWorkgroups(wgX, wgY);
   pass.end();
 
   return { buffer: outputBuf, C: outC, H, W };
@@ -125,9 +139,11 @@ export function dispatchConv1x1(device, encoder, inputBuf, weightBuf, biasBuf, p
 export function dispatchActivation(device, encoder, inputA, inputB, count, op) {
   const pipeline = getOrCreatePipeline(device, 'activation', activationsWGSL, 'activation_main');
 
-  const uniformData = new Uint32Array([count, op]);
+  const totalWG = ceil(count, 256);
+  const [wgX, wgY] = splitWorkgroups(totalWG);
+  const uniformData = new Uint32Array([count, op, wgX]);
   const uniformBuf = device.createBuffer({
-    size: 8,
+    size: uniformData.byteLength,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     mappedAtCreation: true,
   });
@@ -150,7 +166,7 @@ export function dispatchActivation(device, encoder, inputA, inputB, count, op) {
   const pass = encoder.beginComputePass();
   pass.setPipeline(pipeline);
   pass.setBindGroup(0, bindGroup);
-  pass.dispatchWorkgroups(ceil(count, 256));
+  pass.dispatchWorkgroups(wgX, wgY);
   pass.end();
 
   return outputBuf;
@@ -165,15 +181,18 @@ export function dispatchGroupNorm(device, encoder, inputBuf, scaleBuf, biasBuf, 
   const statsPipeline = getOrCreatePipeline(device, 'gn_stats', groupnormWGSL, 'groupnorm_stats');
   const normPipeline = getOrCreatePipeline(device, 'gn_norm', groupnormWGSL, 'groupnorm_normalize');
 
-  // Uniform: C, H, W, numGroups, eps (f32)
-  const uniformArr = new ArrayBuffer(20);
-  const u32View = new Uint32Array(uniformArr, 0, 4);
-  const f32View = new Float32Array(uniformArr, 16, 1);
-  u32View.set([C, H, W, numGroups]);
-  f32View[0] = eps;
+  // Uniform: C, H, W, numGroups, eps (f32), numWorkgroupsX (u32)
+  const normTotalWG = ceil(C * H * W, 256);
+  const [normWgX, normWgY] = splitWorkgroups(normTotalWG);
+  const uniformArr = new ArrayBuffer(24);
+  const u32View = new Uint32Array(uniformArr);
+  const f32View = new Float32Array(uniformArr);
+  u32View[0] = C; u32View[1] = H; u32View[2] = W; u32View[3] = numGroups;
+  f32View[4] = eps;
+  u32View[5] = normWgX;
 
   const uniformBuf = device.createBuffer({
-    size: 20,
+    size: 24,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     mappedAtCreation: true,
   });
@@ -218,7 +237,7 @@ export function dispatchGroupNorm(device, encoder, inputBuf, scaleBuf, biasBuf, 
   const pass2 = encoder.beginComputePass();
   pass2.setPipeline(normPipeline);
   pass2.setBindGroup(0, normBindGroup);
-  pass2.dispatchWorkgroups(ceil(C * H * W, 256));
+  pass2.dispatchWorkgroups(normWgX, normWgY);
   pass2.end();
 
   return outputBuf;
@@ -235,7 +254,9 @@ export function dispatchPixelShuffle(device, encoder, inputBuf, params) {
 
   const pipeline = getOrCreatePipeline(device, 'pixelshuffle', pixelshuffleWGSL, 'pixelshuffle_main');
 
-  const uniformData = new Uint32Array([inC, inH, inW, outC, scaleFactor]);
+  const totalWG = ceil(outC * outH * outW, 256);
+  const [wgX, wgY] = splitWorkgroups(totalWG);
+  const uniformData = new Uint32Array([inC, inH, inW, outC, scaleFactor, wgX]);
   const uniformBuf = device.createBuffer({
     size: uniformData.byteLength,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -258,7 +279,7 @@ export function dispatchPixelShuffle(device, encoder, inputBuf, params) {
   const pass = encoder.beginComputePass();
   pass.setPipeline(pipeline);
   pass.setBindGroup(0, bindGroup);
-  pass.dispatchWorkgroups(ceil(outC * outH * outW, 256));
+  pass.dispatchWorkgroups(wgX, wgY);
   pass.end();
 
   return { buffer: outputBuf, C: outC, H: outH, W: outW };
@@ -272,7 +293,9 @@ export function dispatchUpsample(device, encoder, inputBuf, params) {
 
   const pipeline = getOrCreatePipeline(device, 'upsample', upsampleWGSL, 'upsample_main');
 
-  const uniformData = new Uint32Array([C, inH, inW, outH, outW, mode]);
+  const totalWG = ceil(C * outH * outW, 256);
+  const [wgX, wgY] = splitWorkgroups(totalWG);
+  const uniformData = new Uint32Array([C, inH, inW, outH, outW, mode, wgX]);
   const uniformBuf = device.createBuffer({
     size: uniformData.byteLength,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -295,7 +318,7 @@ export function dispatchUpsample(device, encoder, inputBuf, params) {
   const pass = encoder.beginComputePass();
   pass.setPipeline(pipeline);
   pass.setBindGroup(0, bindGroup);
-  pass.dispatchWorkgroups(ceil(C * outH * outW, 256));
+  pass.dispatchWorkgroups(wgX, wgY);
   pass.end();
 
   return { buffer: outputBuf, C, H: outH, W: outW };
@@ -314,7 +337,9 @@ export function dispatchConvTranspose2d(device, encoder, inputBuf, weightBuf, bi
 
   const pipeline = getOrCreatePipeline(device, 'conv_transpose2d', convTranspose2dWGSL, 'conv_transpose2d_main');
 
-  const uniformData = new Uint32Array([inC, inH, inW, outC, outH, outW, kH, kW, stride, stride, hasBias]);
+  const totalWG = ceil(outC * outH * outW, 256);
+  const [wgX, wgY] = splitWorkgroups(totalWG);
+  const uniformData = new Uint32Array([inC, inH, inW, outC, outH, outW, kH, kW, stride, stride, hasBias, wgX]);
   const uniformBuf = device.createBuffer({
     size: uniformData.byteLength,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -340,7 +365,7 @@ export function dispatchConvTranspose2d(device, encoder, inputBuf, weightBuf, bi
   const pass = encoder.beginComputePass();
   pass.setPipeline(pipeline);
   pass.setBindGroup(0, bindGroup);
-  pass.dispatchWorkgroups(ceil(outC * outH * outW, 256));
+  pass.dispatchWorkgroups(wgX, wgY);
   pass.end();
 
   return { buffer: outputBuf, C: outC, H: outH, W: outW };

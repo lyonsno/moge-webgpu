@@ -26,6 +26,7 @@ struct GroupNormParams {
   W: u32,
   numGroups: u32,
   eps: f32,
+  numWorkgroupsX: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: GroupNormParams;
@@ -82,9 +83,11 @@ fn groupnorm_stats(
 // Pass 2: Normalize each element using group stats, apply scale+bias
 @compute @workgroup_size(WG_SIZE)
 fn groupnorm_normalize(
-  @builtin(global_invocation_id) gid: vec3<u32>,
+  @builtin(workgroup_id) wgid: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
-  let idx = gid.x;
+  let linearWG = wgid.x + wgid.y * params.numWorkgroupsX;
+  let idx = linearWG * WG_SIZE + lid.x;
   let totalSize = params.C * params.H * params.W;
   if (idx >= totalSize) {
     return;

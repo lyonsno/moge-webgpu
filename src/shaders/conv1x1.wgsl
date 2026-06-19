@@ -20,6 +20,7 @@ struct Conv1x1Params {
   H: u32,
   W: u32,
   hasBias: u32,
+  numWorkgroupsX: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: Conv1x1Params;
@@ -33,11 +34,14 @@ const WG_SIZE: u32 = 256;
 @compute @workgroup_size(WG_SIZE)
 fn conv1x1_main(
   @builtin(global_invocation_id) gid: vec3<u32>,
+  @builtin(workgroup_id) wgid: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
-  // Flatten: each thread handles one (outCh, spatial) pair
+  // 2D dispatch: linearize from workgroup_id.x + workgroup_id.y * numWorkgroupsX
   let spatialSize = params.H * params.W;
   let totalWork = params.outC * spatialSize;
-  let idx = gid.x;
+  let linearWG = wgid.x + wgid.y * params.numWorkgroupsX;
+  let idx = linearWG * WG_SIZE + lid.x;
 
   if (idx >= totalWork) {
     return;

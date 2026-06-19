@@ -16,6 +16,7 @@ struct PixelShuffleParams {
   inW: u32,
   outC: u32,     // C_out
   scaleFactor: u32,  // r
+  numWorkgroupsX: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: PixelShuffleParams;
@@ -26,12 +27,14 @@ const WG_SIZE: u32 = 256;
 
 @compute @workgroup_size(WG_SIZE)
 fn pixelshuffle_main(
-  @builtin(global_invocation_id) gid: vec3<u32>,
+  @builtin(workgroup_id) wgid: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
   let outH = params.inH * params.scaleFactor;
   let outW = params.inW * params.scaleFactor;
   let totalOut = params.outC * outH * outW;
-  let idx = gid.x;
+  let linearWG = wgid.x + wgid.y * params.numWorkgroupsX;
+  let idx = linearWG * WG_SIZE + lid.x;
 
   if (idx >= totalOut) {
     return;

@@ -6,6 +6,7 @@
 struct ActivationParams {
   count: u32,     // total number of elements
   op: u32,        // 0=relu, 1=silu, 2=add, 3=add_relu, 4=sigmoid
+  numWorkgroupsX: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: ActivationParams;
@@ -17,9 +18,11 @@ const WG_SIZE: u32 = 256;
 
 @compute @workgroup_size(WG_SIZE)
 fn activation_main(
-  @builtin(global_invocation_id) gid: vec3<u32>,
+  @builtin(workgroup_id) wgid: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
-  let idx = gid.x;
+  let linearWG = wgid.x + wgid.y * params.numWorkgroupsX;
+  let idx = linearWG * WG_SIZE + lid.x;
   if (idx >= params.count) {
     return;
   }
