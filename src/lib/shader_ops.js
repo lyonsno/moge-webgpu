@@ -7,6 +7,7 @@
 
 import conv2dWGSL from '../shaders/conv2d.wgsl?raw';
 import conv1x1WGSL from '../shaders/conv1x1.wgsl?raw';
+import convTranspose2dWGSL from '../shaders/conv_transpose2d.wgsl?raw';
 import activationsWGSL from '../shaders/activations.wgsl?raw';
 import groupnormWGSL from '../shaders/groupnorm.wgsl?raw';
 import pixelshuffleWGSL from '../shaders/pixelshuffle.wgsl?raw';
@@ -298,4 +299,49 @@ export function dispatchUpsample(device, encoder, inputBuf, params) {
   pass.end();
 
   return { buffer: outputBuf, C, H: outH, W: outW };
+}
+
+/**
+ * Dispatch transposed 2D convolution (deconvolution).
+ * ConvTranspose2d(inC, outC, kernel_size=stride, stride=stride)
+ */
+export function dispatchConvTranspose2d(device, encoder, inputBuf, weightBuf, biasBuf, params) {
+  const { inC, inH, inW, outC, stride } = params;
+  const kH = stride, kW = stride;
+  const outH = inH * stride;
+  const outW = inW * stride;
+  const hasBias = biasBuf ? 1 : 0;
+
+  const pipeline = getOrCreatePipeline(device, 'conv_transpose2d', convTranspose2dWGSL, 'conv_transpose2d_main');
+
+  const uniformData = new Uint32Array([inC, inH, inW, outC, outH, outW, kH, kW, stride, stride, hasBias]);
+  const uniformBuf = device.createBuffer({
+    size: uniformData.byteLength,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    mappedAtCreation: true,
+  });
+  new Uint32Array(uniformBuf.getMappedRange()).set(uniformData);
+  uniformBuf.unmap();
+
+  const dummyBias = biasBuf || createStorageBuffer(device, new Float32Array([0]));
+  const outputBuf = createEmptyBuffer(device, outC * outH * outW * 4);
+
+  const bindGroup = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuf } },
+      { binding: 1, resource: { buffer: inputBuf } },
+      { binding: 2, resource: { buffer: weightBuf } },
+      { binding: 3, resource: { buffer: dummyBias } },
+      { binding: 4, resource: { buffer: outputBuf } },
+    ],
+  });
+
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(ceil(outC * outH * outW, 256));
+  pass.end();
+
+  return { buffer: outputBuf, C: outC, H: outH, W: outW };
 }

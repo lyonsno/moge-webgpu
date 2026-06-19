@@ -1,25 +1,37 @@
 /**
  * inference.js — MoGe-2 inference pipeline in WebGPU compute.
  *
- * Architecture (from upstream MoGe-2 v2.py + modules.py):
+ * Architecture (from upstream configs/train/v2.json + modules.py):
  *
- *   1. DINOv2 ViT-Large encoder → feature map + CLS token
- *      [STUBBED: random activations until ViT kernels arrive from voxel-attention-defibrillator]
+ *   Encoder: DINOv2 ViT-Large (dinov2_vitl14)
+ *     - intermediate_layers: [5, 11, 17, 23] → sum of projected features → [1024, tokenH, tokenW]
+ *     - Also returns CLS token [1024]
+ *     [STUBBED: random features until ViT kernels arrive from voxel-attention-defibrillator]
  *
- *   2. Feature map + UV coords at 5 scales → neck ConvStack → multi-scale features
+ *   Neck ConvStack:
+ *     dim_in: [1026, 2, 2, 2, 2]  (encoder features + 2 UV channels per level)
+ *     dim_res_blocks: [1024, 256, 128, 64, 32]
+ *     num_res_blocks: [0, 2, 2, 2, 0]
+ *     resamplers: [conv_transpose, conv_transpose, conv_transpose, bilinear]
+ *     norm: none
  *
- *   3. points_head ConvStack → xyz point map (H×W×3)
- *   4. normal_head ConvStack → normal vectors (H×W×3)
- *   5. mask_head ConvStack → confidence mask (H×W×1)
- *   6. scale_head MLP → metric scale from CLS token
+ *   Points/Normal/Mask heads (each a ConvStack):
+ *     dim_in: [1024, 256, 128, 64, 32]  (from neck outputs)
+ *     dim_res_blocks: [1024, 256, 128, 64, 32]
+ *     num_res_blocks: [0, 1, 1, 1, 0]
+ *     dim_out: [null, null, null, null, 3/3/1]
+ *     resamplers: [conv_transpose, conv_transpose, conv_transpose, bilinear]
  *
- *   7. Post-processing: remap, focal recovery, mask application
+ *   Scale head: MLP [1024 → 1024 → 1024 → 1] with ReLU between layers
+ *
+ *   Post-processing: exp remap, focal recovery, force projection, mask
  */
 
 import { createStorageBuffer, createEmptyBuffer, readBuffer } from './gpu.js';
 import {
   dispatchConv2d,
   dispatchConv1x1,
+  dispatchConvTranspose2d,
   dispatchActivation,
   dispatchGroupNorm,
   dispatchPixelShuffle,
@@ -27,81 +39,140 @@ import {
 } from './shader_ops.js';
 
 
+// --- Model config from upstream v2.json ---
+const MODEL_CONFIG = {
+  encoder: {
+    backbone: 'dinov2_vitl14',
+    intermediateLayers: [5, 11, 17, 23],
+    dimOut: 1024,
+  },
+  neck: {
+    dimIn: [1026, 2, 2, 2, 2],
+    dimResBlocks: [1024, 256, 128, 64, 32],
+    dimOut: [null, null, null, null, null],
+    numResBlocks: [0, 2, 2, 2, 0],
+    resamplers: ['conv_transpose', 'conv_transpose', 'conv_transpose', 'bilinear'],
+    resBlockInNorm: 'none',
+    resBlockHiddenNorm: 'none',
+  },
+  pointsHead: {
+    dimIn: [1024, 256, 128, 64, 32],
+    dimResBlocks: [1024, 256, 128, 64, 32],
+    dimOut: [null, null, null, null, 3],
+    numResBlocks: [0, 1, 1, 1, 0],
+    resamplers: ['conv_transpose', 'conv_transpose', 'conv_transpose', 'bilinear'],
+    resBlockInNorm: 'none',
+    resBlockHiddenNorm: 'none',
+  },
+  normalHead: {
+    dimIn: [1024, 256, 128, 64, 32],
+    dimResBlocks: [1024, 256, 128, 64, 32],
+    dimOut: [null, null, null, null, 3],
+    numResBlocks: [0, 1, 1, 1, 0],
+    resamplers: ['conv_transpose', 'conv_transpose', 'conv_transpose', 'bilinear'],
+    resBlockInNorm: 'none',
+    resBlockHiddenNorm: 'none',
+  },
+  maskHead: {
+    dimIn: [1024, 256, 128, 64, 32],
+    dimResBlocks: [1024, 256, 128, 64, 32],
+    dimOut: [null, null, null, null, 1],
+    numResBlocks: [0, 1, 1, 1, 0],
+    resamplers: ['conv_transpose', 'conv_transpose', 'conv_transpose', 'bilinear'],
+    resBlockInNorm: 'none',
+    resBlockHiddenNorm: 'none',
+  },
+  scaleHead: { dims: [1024, 1024, 1024, 1] },
+  remapOutput: 'exp',
+  numTokensRange: [1200, 3600],
+  patchSize: 14,
+};
+
+
 /**
  * ResidualConvBlock dispatch:
- *   GroupNorm → ReLU → Conv3x3 → GroupNorm → ReLU → Conv3x3 + Skip
+ *   [Norm →] Activation → Conv3x3 → [Norm →] Activation → Conv3x3 + Skip
+ *
+ * When inNorm='none', the norm layers are identity (MoGe-2 default).
  */
 function dispatchResidualConvBlock(device, encoder, inputBuf, weights, params) {
-  const { C, hiddenC, H, W, normType } = params;
-  const numGroups = normType === 'group_norm' ? Math.floor(C / 32) : 1;
-  const hiddenGroups = normType === 'group_norm' ? Math.floor(hiddenC / 32) : 1;
+  const { inC, outC, hiddenC, H, W, inNorm, hiddenNorm } = params;
 
-  // GroupNorm 1
-  let x = dispatchGroupNorm(device, encoder, inputBuf, weights.norm1_scale, weights.norm1_bias,
-    { C, H, W, numGroups });
+  let x = inputBuf;
+
+  // Norm 1 (skip if 'none')
+  if (inNorm !== 'none') {
+    const numGroups = inNorm === 'group_norm' ? Math.floor(inC / 32) : 1;
+    x = dispatchGroupNorm(device, encoder, x, weights.norm1_scale, weights.norm1_bias,
+      { C: inC, H, W, numGroups });
+  }
 
   // ReLU
-  x = dispatchActivation(device, encoder, x, null, C * H * W, 0);
+  x = dispatchActivation(device, encoder, x, null, inC * H * W, 0);
 
-  // Conv3x3 (C → hiddenC)
+  // Conv3x3 (inC → hiddenC)
   let convOut = dispatchConv2d(device, encoder, x, weights.conv1_weight, weights.conv1_bias,
-    { inC: C, inH: H, inW: W, outC: hiddenC, kH: 3, kW: 3, padH: 1, padW: 1, strideH: 1, strideW: 1 });
+    { inC, inH: H, inW: W, outC: hiddenC, kH: 3, kW: 3, padH: 1, padW: 1, strideH: 1, strideW: 1 });
 
-  // GroupNorm 2
-  x = dispatchGroupNorm(device, encoder, convOut.buffer, weights.norm2_scale, weights.norm2_bias,
-    { C: hiddenC, H, W, numGroups: hiddenGroups });
+  x = convOut.buffer;
+
+  // Norm 2 (skip if 'none')
+  if (hiddenNorm !== 'none') {
+    const numGroups = hiddenNorm === 'group_norm' ? Math.floor(hiddenC / 32) : 1;
+    x = dispatchGroupNorm(device, encoder, x, weights.norm2_scale, weights.norm2_bias,
+      { C: hiddenC, H, W, numGroups });
+  }
 
   // ReLU
   x = dispatchActivation(device, encoder, x, null, hiddenC * H * W, 0);
 
-  // Conv3x3 (hiddenC → C)
+  // Conv3x3 (hiddenC → outC)
   convOut = dispatchConv2d(device, encoder, x, weights.conv2_weight, weights.conv2_bias,
-    { inC: hiddenC, inH: H, inW: W, outC: C, kH: 3, kW: 3, padH: 1, padW: 1, strideH: 1, strideW: 1 });
+    { inC: hiddenC, inH: H, inW: W, outC, kH: 3, kW: 3, padH: 1, padW: 1, strideH: 1, strideW: 1 });
 
-  // Skip connection: if in_channels != out_channels, apply 1x1 conv
+  // Skip connection
   let skip;
-  if (weights.skip_weight) {
+  if (inC !== outC && weights.skip_weight) {
     skip = dispatchConv1x1(device, encoder, inputBuf, weights.skip_weight, null,
-      { inC: C, outC: C, H, W }).buffer;
+      { inC, outC, H, W }).buffer;
   } else {
     skip = inputBuf;
   }
 
-  // Add skip connection
-  const out = dispatchActivation(device, encoder, convOut.buffer, skip, C * H * W, 2);
+  // Add
+  const out = dispatchActivation(device, encoder, convOut.buffer, skip, outC * H * W, 2);
   return out;
 }
 
 /**
- * Resampler dispatch: Conv3x3 → PixelShuffle → Conv3x3
- * (for 'pixel_shuffle' type, which is MoGe-2's default)
+ * Resampler dispatch.
+ * Type determines the upsampling method:
+ *   conv_transpose: ConvTranspose2d(inC, outC, k=2, s=2) → Conv2d(outC, outC, 3, pad=1)
+ *   bilinear: Upsample(2x, bilinear) → Conv2d(inC, outC, 3, pad=1)
  */
 function dispatchResampler(device, encoder, inputBuf, weights, params) {
-  const { inC, outC, H, W, scaleFactor, type } = params;
+  const { inC, outC, H, W, type } = params;
 
-  if (type === 'pixel_shuffle') {
-    // Conv3x3: inC → outC * scaleFactor^2
-    const expandedC = outC * scaleFactor * scaleFactor;
-    const conv1 = dispatchConv2d(device, encoder, inputBuf, weights.conv1_weight, weights.conv1_bias,
-      { inC, inH: H, inW: W, outC: expandedC, kH: 3, kW: 3, padH: 1, padW: 1, strideH: 1, strideW: 1 });
+  if (type === 'conv_transpose') {
+    // ConvTranspose2d: inC → outC, kernel=2, stride=2
+    const deconv = dispatchConvTranspose2d(device, encoder, inputBuf,
+      weights.deconv_weight, weights.deconv_bias,
+      { inC, inH: H, inW: W, outC, stride: 2 });
 
-    // PixelShuffle
-    const shuffled = dispatchPixelShuffle(device, encoder, conv1.buffer,
-      { inC: expandedC, inH: H, inW: W, scaleFactor });
+    // Conv2d: outC → outC, 3x3, pad=1
+    const conv = dispatchConv2d(device, encoder, deconv.buffer,
+      weights.conv_weight, weights.conv_bias,
+      { inC: outC, inH: deconv.H, inW: deconv.W, outC, kH: 3, kW: 3, padH: 1, padW: 1, strideH: 1, strideW: 1 });
 
-    // Conv3x3: outC → outC
-    const conv2 = dispatchConv2d(device, encoder, shuffled.buffer, weights.conv2_weight, weights.conv2_bias,
-      { inC: outC, inH: shuffled.H, inW: shuffled.W, outC, kH: 3, kW: 3, padH: 1, padW: 1, strideH: 1, strideW: 1 });
-
-    return { buffer: conv2.buffer, H: shuffled.H, W: shuffled.W };
-  } else if (type === 'bilinear' || type === 'nearest') {
-    // Upsample
-    const mode = type === 'bilinear' ? 1 : 0;
+    return { buffer: conv.buffer, H: deconv.H, W: deconv.W };
+  } else if (type === 'bilinear') {
+    // Bilinear upsample 2x
     const upsampled = dispatchUpsample(device, encoder, inputBuf,
-      { C: inC, inH: H, inW: W, outH: H * scaleFactor, outW: W * scaleFactor, mode });
+      { C: inC, inH: H, inW: W, outH: H * 2, outW: W * 2, mode: 1 });
 
-    // Conv3x3: inC → outC
-    const conv = dispatchConv2d(device, encoder, upsampled.buffer, weights.conv1_weight, weights.conv1_bias,
+    // Conv2d: inC → outC, 3x3, pad=1
+    const conv = dispatchConv2d(device, encoder, upsampled.buffer,
+      weights.conv_weight, weights.conv_bias,
       { inC, inH: upsampled.H, inW: upsampled.W, outC, kH: 3, kW: 3, padH: 1, padW: 1, strideH: 1, strideW: 1 });
 
     return { buffer: conv.buffer, H: upsampled.H, W: upsampled.W };
@@ -111,62 +182,66 @@ function dispatchResampler(device, encoder, inputBuf, weights, params) {
 }
 
 /**
- * ConvStack dispatch:
- *   For each level:
- *     1. input_block (1x1 conv to project features)
- *     2. Add to running feature (skip from previous level)
- *     3. res_blocks (N × ResidualConvBlock)
- *     4. output_block (1x1 conv to project to output dim)
- *     5. resampler (between levels)
+ * ConvStack dispatch — the core multi-scale decoder.
+ *
+ * For each level i:
+ *   1. input_block: 1x1 conv (dimIn[i] → dimResBlocks[i])
+ *   2. Add to running feature from previous level
+ *   3. res_blocks: numResBlocks[i] × ResidualConvBlock
+ *   4. output_block: 1x1 conv (dimResBlocks[i] → dimOut[i]) if dimOut[i] != null
+ *   5. resampler: upsample x2 for next level
+ *
+ * Returns list of output features per level.
  */
 function dispatchConvStack(device, encoder, inFeatures, weights, config) {
-  const { levels, resBlockCount } = config;
+  const { dimIn, dimResBlocks, dimOut, numResBlocks, resamplers, resBlockInNorm, resBlockHiddenNorm } = config;
+  const numLevels = dimResBlocks.length;
   const outFeatures = [];
   let x = null;
 
-  for (let i = 0; i < levels.length; i++) {
-    const level = levels[i];
-    const { dimIn, dimResBlock, dimOut, H, W } = level;
+  for (let i = 0; i < numLevels; i++) {
+    const H = inFeatures[i].H;
+    const W = inFeatures[i].W;
 
-    // input_block: 1x1 conv (project input to dimResBlock)
-    let projected;
-    if (dimIn != null && inFeatures[i] != null) {
-      projected = dispatchConv1x1(device, encoder, inFeatures[i],
+    // input_block: 1x1 conv
+    let projected = null;
+    if (dimIn[i] != null && inFeatures[i].buffer != null) {
+      projected = dispatchConv1x1(device, encoder, inFeatures[i].buffer,
         weights.levels[i].input_weight, weights.levels[i].input_bias,
-        { inC: dimIn, outC: dimResBlock, H, W });
+        { inC: dimIn[i], outC: dimResBlocks[i], H, W });
     }
 
-    // Add to running state
+    // Add to running state or initialize
     if (i === 0) {
       x = projected.buffer;
     } else if (projected) {
-      x = dispatchActivation(device, encoder, x, projected.buffer, dimResBlock * H * W, 2);
+      x = dispatchActivation(device, encoder, x, projected.buffer, dimResBlocks[i] * H * W, 2);
     }
 
     // res_blocks
-    const numBlocks = Array.isArray(resBlockCount) ? resBlockCount[i] : resBlockCount;
-    for (let j = 0; j < numBlocks; j++) {
+    for (let j = 0; j < numResBlocks[i]; j++) {
       x = dispatchResidualConvBlock(device, encoder, x, weights.levels[i].res_blocks[j], {
-        C: dimResBlock, hiddenC: dimResBlock, H, W, normType: 'group_norm',
+        inC: dimResBlocks[i], outC: dimResBlocks[i], hiddenC: dimResBlocks[i],
+        H, W, inNorm: resBlockInNorm, hiddenNorm: resBlockHiddenNorm,
       });
     }
 
-    // output_block: 1x1 conv
-    if (dimOut != null) {
+    // output_block: 1x1 conv if dimOut specified
+    if (dimOut[i] != null) {
       const out = dispatchConv1x1(device, encoder, x,
         weights.levels[i].output_weight, weights.levels[i].output_bias,
-        { inC: dimResBlock, outC: dimOut, H, W });
-      outFeatures.push({ buffer: out.buffer, C: dimOut, H, W });
+        { inC: dimResBlocks[i], outC: dimOut[i], H, W });
+      outFeatures.push({ buffer: out.buffer, C: dimOut[i], H, W });
     } else {
-      outFeatures.push({ buffer: x, C: dimResBlock, H, W });
+      outFeatures.push({ buffer: x, C: dimResBlocks[i], H, W });
     }
 
-    // resampler (between levels, not after last)
-    if (i < levels.length - 1) {
+    // resampler between levels
+    if (i < numLevels - 1 && resamplers[i]) {
       const resampled = dispatchResampler(device, encoder, x,
         weights.levels[i].resampler, {
-          inC: dimResBlock, outC: levels[i + 1].dimResBlock,
-          H, W, scaleFactor: 2, type: level.resamplerType || 'pixel_shuffle',
+          inC: dimResBlocks[i], outC: dimResBlocks[i + 1],
+          H, W, type: resamplers[i],
         });
       x = resampled.buffer;
     }
@@ -180,188 +255,223 @@ export class MoGeInference {
   constructor(gpu) {
     this.device = gpu.device;
     this.weights = null;
-    this.modelConfig = null;
   }
 
   async init() {
-    // For now: stub weights (random). Real weight loading comes later.
-    this.modelConfig = this._getDefaultConfig();
     this.weights = this._createStubWeights();
   }
 
-  _getDefaultConfig() {
-    // MoGe-2 ViT-Large config from upstream
-    // Encoder output dim after projection: typically 512 or 1024
-    // We'll use the actual config once weights are loaded
-    return {
-      encoderDim: 1024,
-      neckConfig: {
-        // 5 levels, progressively higher resolution
-        levels: [
-          { dimIn: 1024 + 2, dimResBlock: 512, dimOut: null, resamplerType: 'pixel_shuffle' },
-          { dimIn: 2, dimResBlock: 256, dimOut: null, resamplerType: 'pixel_shuffle' },
-          { dimIn: 2, dimResBlock: 128, dimOut: null, resamplerType: 'pixel_shuffle' },
-          { dimIn: 2, dimResBlock: 64, dimOut: null, resamplerType: 'pixel_shuffle' },
-          { dimIn: 2, dimResBlock: 32, dimOut: null, resamplerType: 'pixel_shuffle' },
-        ],
-        resBlockCount: 1,
-      },
-      pointsHeadConfig: {
-        levels: [
-          { dimIn: 512, dimResBlock: 256, dimOut: null, resamplerType: 'pixel_shuffle' },
-          { dimIn: 256, dimResBlock: 128, dimOut: null, resamplerType: 'pixel_shuffle' },
-          { dimIn: 128, dimResBlock: 64, dimOut: null, resamplerType: 'pixel_shuffle' },
-          { dimIn: 64, dimResBlock: 32, dimOut: 3, resamplerType: 'pixel_shuffle' },
-        ],
-        resBlockCount: 1,
-      },
-      inputSize: 224,
-      patchSize: 14,
-    };
-  }
-
   _createStubWeights() {
-    // Create random weight buffers matching the model architecture.
-    // This lets us validate the dispatch chain end-to-end before real weights.
     const d = this.device;
     const rand = (n) => {
       const data = new Float32Array(n);
-      for (let i = 0; i < n; i++) data[i] = (Math.random() - 0.5) * 0.1;
+      for (let i = 0; i < n; i++) data[i] = (Math.random() - 0.5) * 0.02;
       return createStorageBuffer(d, data);
     };
     const zeros = (n) => createStorageBuffer(d, new Float32Array(n));
+    const ones = (n) => {
+      const data = new Float32Array(n);
+      data.fill(1.0);
+      return createStorageBuffer(d, data);
+    };
 
-    // Helper to create ResidualConvBlock weights
     const makeResBlock = (C, hiddenC) => ({
-      norm1_scale: rand(C),
+      norm1_scale: ones(C),
       norm1_bias: zeros(C),
       conv1_weight: rand(hiddenC * C * 3 * 3),
       conv1_bias: zeros(hiddenC),
-      norm2_scale: rand(hiddenC),
+      norm2_scale: ones(hiddenC),
       norm2_bias: zeros(hiddenC),
       conv2_weight: rand(C * hiddenC * 3 * 3),
       conv2_bias: zeros(C),
       skip_weight: null,
     });
 
-    // Helper to create Resampler weights (pixel_shuffle type)
-    const makeResampler = (inC, outC, r = 2) => ({
-      conv1_weight: rand(outC * r * r * inC * 3 * 3),
-      conv1_bias: zeros(outC * r * r),
-      conv2_weight: rand(outC * outC * 3 * 3),
-      conv2_bias: zeros(outC),
-    });
-
-    // Stub: just create enough structure for the neck
-    const cfg = this.modelConfig;
-    const neckWeights = {
-      levels: cfg.neckConfig.levels.map((level, i) => {
-        const prevDim = i === 0 ? level.dimResBlock : cfg.neckConfig.levels[i - 1].dimResBlock;
+    const makeResampler = (inC, outC, type) => {
+      if (type === 'conv_transpose') {
         return {
-          input_weight: rand(level.dimResBlock * level.dimIn),
-          input_bias: zeros(level.dimResBlock),
-          res_blocks: [makeResBlock(level.dimResBlock, level.dimResBlock)],
-          output_weight: level.dimOut ? rand(level.dimOut * level.dimResBlock) : null,
-          output_bias: level.dimOut ? zeros(level.dimOut) : null,
-          resampler: i < cfg.neckConfig.levels.length - 1
-            ? makeResampler(level.dimResBlock, cfg.neckConfig.levels[i + 1].dimResBlock)
-            : null,
+          deconv_weight: rand(inC * outC * 2 * 2),  // [inC, outC, 2, 2]
+          deconv_bias: zeros(outC),
+          conv_weight: rand(outC * outC * 3 * 3),
+          conv_bias: zeros(outC),
         };
-      }),
+      } else {
+        // bilinear: no deconv, just conv after upsample
+        return {
+          conv_weight: rand(outC * inC * 3 * 3),
+          conv_bias: zeros(outC),
+        };
+      }
     };
 
-    return { neck: neckWeights };
+    const makeConvStackWeights = (config) => ({
+      levels: config.dimResBlocks.map((dimRB, i) => ({
+        input_weight: config.dimIn[i] != null ? rand(dimRB * config.dimIn[i]) : null,
+        input_bias: config.dimIn[i] != null ? zeros(dimRB) : null,
+        res_blocks: Array.from({ length: config.numResBlocks[i] },
+          () => makeResBlock(dimRB, dimRB)),
+        output_weight: config.dimOut[i] != null ? rand(config.dimOut[i] * dimRB) : null,
+        output_bias: config.dimOut[i] != null ? zeros(config.dimOut[i]) : null,
+        resampler: i < config.dimResBlocks.length - 1 && config.resamplers[i]
+          ? makeResampler(dimRB, config.dimResBlocks[i + 1], config.resamplers[i])
+          : null,
+      })),
+    });
+
+    return {
+      neck: makeConvStackWeights(MODEL_CONFIG.neck),
+      pointsHead: makeConvStackWeights(MODEL_CONFIG.pointsHead),
+      normalHead: makeConvStackWeights(MODEL_CONFIG.normalHead),
+      maskHead: makeConvStackWeights(MODEL_CONFIG.maskHead),
+    };
   }
 
   /**
-   * Run inference on an image.
-   * Returns { depth, normals, points, colors } as Float32Arrays.
+   * Run full inference.
    */
   async run(imageData) {
     const { width, height } = imageData;
     const device = this.device;
 
-    // Convert RGBA image to RGB float [0, 1] in CHW format
-    const rgbData = new Float32Array(3 * width * height);
-    for (let i = 0; i < width * height; i++) {
-      rgbData[0 * width * height + i] = imageData.data[i * 4 + 0] / 255;
-      rgbData[1 * width * height + i] = imageData.data[i * 4 + 1] / 255;
-      rgbData[2 * width * height + i] = imageData.data[i * 4 + 2] / 255;
-    }
+    const tokenH = Math.floor(height / MODEL_CONFIG.patchSize);
+    const tokenW = Math.floor(width / MODEL_CONFIG.patchSize);
 
     // --- STUB BACKBONE ---
-    // Until ViT kernels arrive, generate random features at the right shape.
-    // DINOv2 ViT-Large with patch_size=14, input 224x224 → 16x16 tokens → feature map [1024, 16, 16]
-    const tokenH = Math.floor(height / 14);
-    const tokenW = Math.floor(width / 14);
-    const encoderDim = this.modelConfig.encoderDim;
-
-    const stubFeatures = new Float32Array(encoderDim * tokenH * tokenW);
-    for (let i = 0; i < stubFeatures.length; i++) {
-      stubFeatures[i] = (Math.random() - 0.5) * 0.5;
+    // Random features at [encoderDim, tokenH, tokenW]
+    const encoderDim = MODEL_CONFIG.encoder.dimOut;
+    const stubEncoderData = new Float32Array(encoderDim * tokenH * tokenW);
+    for (let i = 0; i < stubEncoderData.length; i++) {
+      stubEncoderData[i] = (Math.random() - 0.5) * 0.5;
     }
-    const featureBuf = createStorageBuffer(device, stubFeatures);
+    const encoderFeatures = createStorageBuffer(device, stubEncoderData);
 
-    // Generate UV coordinates at each scale
-    // Level 0: tokenH × tokenW, Level 1: 2*tokenH × 2*tokenW, etc.
-    const uvFeatures = [];
+    // Build input features for neck: encoder features + UV coords concatenated
+    // Level 0: [1024 + 2, tokenH, tokenW]
+    // Levels 1-4: [2, tokenH*2^i, tokenW*2^i] (UV only)
+    const neckInputs = [];
     for (let level = 0; level < 5; level++) {
       const h = tokenH * (2 ** level);
       const w = tokenW * (2 ** level);
-      const uv = new Float32Array(2 * h * w);
-      for (let y = 0; y < h; y++) {
-        for (let x = 0; x < w; x++) {
-          uv[0 * h * w + y * w + x] = (x + 0.5) / w * 2 - 1; // u: [-1, 1]
-          uv[1 * h * w + y * w + x] = (y + 0.5) / h * 2 - 1; // v: [-1, 1]
+      const dimIn = MODEL_CONFIG.neck.dimIn[level];
+
+      const data = new Float32Array(dimIn * h * w);
+      if (level === 0) {
+        // Copy encoder features then append UV
+        for (let c = 0; c < encoderDim; c++) {
+          for (let s = 0; s < tokenH * tokenW; s++) {
+            data[c * h * w + s] = stubEncoderData[c * tokenH * tokenW + s];
+          }
+        }
+        // UV channels at end
+        const aspect = width / height;
+        for (let y = 0; y < h; y++) {
+          for (let x = 0; x < w; x++) {
+            data[encoderDim * h * w + y * w + x] = ((x + 0.5) / w * 2 - 1) * aspect;
+            data[(encoderDim + 1) * h * w + y * w + x] = (y + 0.5) / h * 2 - 1;
+          }
+        }
+      } else {
+        // UV only
+        const aspect = width / height;
+        for (let y = 0; y < h; y++) {
+          for (let x = 0; x < w; x++) {
+            data[0 * h * w + y * w + x] = ((x + 0.5) / w * 2 - 1) * aspect;
+            data[1 * h * w + y * w + x] = (y + 0.5) / h * 2 - 1;
+          }
         }
       }
-      uvFeatures.push(createStorageBuffer(device, uv));
+
+      neckInputs.push({ buffer: createStorageBuffer(device, data), H: h, W: w });
     }
 
-    // --- STUB OUTPUT ---
-    // For now, generate plausible-looking depth from the input image itself
-    // (grayscale as rough depth proxy) so we can test the visualization pipeline.
-    const depth = new Float32Array(width * height);
-    const normals = new Float32Array(3 * width * height);
-    const points = new Float32Array(3 * width * height);
-    const colors = new Float32Array(3 * width * height);
+    // --- NECK ---
+    const commandEncoder = device.createCommandEncoder();
 
-    // Simple stub: depth from luminance
-    for (let i = 0; i < width * height; i++) {
-      const r = imageData.data[i * 4 + 0] / 255;
-      const g = imageData.data[i * 4 + 1] / 255;
-      const b = imageData.data[i * 4 + 2] / 255;
+    const neckOutputs = dispatchConvStack(device, commandEncoder, neckInputs, this.weights.neck, MODEL_CONFIG.neck);
 
-      depth[i] = 1.0 + (0.299 * r + 0.587 * g + 0.114 * b) * 4.0;
+    // --- HEADS ---
+    // Points head takes neck outputs as input
+    const pointsInputs = neckOutputs.map((f, i) => ({
+      buffer: f.buffer,
+      H: f.H,
+      W: f.W,
+    }));
+    const pointsOutputs = dispatchConvStack(device, commandEncoder, pointsInputs, this.weights.pointsHead, MODEL_CONFIG.pointsHead);
 
-      const y = Math.floor(i / width);
-      const x = i % width;
+    // Normal head
+    const normalInputs = neckOutputs.map(f => ({ buffer: f.buffer, H: f.H, W: f.W }));
+    const normalOutputs = dispatchConvStack(device, commandEncoder, normalInputs, this.weights.normalHead, MODEL_CONFIG.normalHead);
 
-      // Fake normals from depth gradient
-      const idx = (cx, cy) => Math.max(0, Math.min(height - 1, cy)) * width + Math.max(0, Math.min(width - 1, cx));
-      const dzdx = (depth[idx(x + 1, y)] || depth[i]) - (depth[idx(x - 1, y)] || depth[i]);
-      const dzdy = (depth[idx(x, y + 1)] || depth[i]) - (depth[idx(x, y - 1)] || depth[i]);
-      const len = Math.sqrt(dzdx * dzdx + dzdy * dzdy + 1);
-      normals[i * 3 + 0] = -dzdx / len;
-      normals[i * 3 + 1] = -dzdy / len;
-      normals[i * 3 + 2] = 1.0 / len;
+    // Mask head
+    const maskInputs = neckOutputs.map(f => ({ buffer: f.buffer, H: f.H, W: f.W }));
+    const maskOutputs = dispatchConvStack(device, commandEncoder, maskInputs, this.weights.maskHead, MODEL_CONFIG.maskHead);
 
-      // 3D points from depth + pixel coords (simple pinhole)
-      const fx = width * 0.8;
-      const fy = height * 0.8;
-      points[i * 3 + 0] = (x - width / 2) / fx * depth[i];
-      points[i * 3 + 1] = (y - height / 2) / fy * depth[i];
-      points[i * 3 + 2] = depth[i];
+    // Submit all compute work
+    device.queue.submit([commandEncoder.finish()]);
 
-      colors[i * 3 + 0] = r;
-      colors[i * 3 + 1] = g;
-      colors[i * 3 + 2] = b;
+    // Read back the final level outputs
+    const lastPointsFeature = pointsOutputs[pointsOutputs.length - 1];
+    const lastNormalFeature = normalOutputs[normalOutputs.length - 1];
+    const lastMaskFeature = maskOutputs[maskOutputs.length - 1];
+
+    const [pointsRaw, normalsRaw, maskRaw] = await Promise.all([
+      readBuffer(device, lastPointsFeature.buffer, lastPointsFeature.C * lastPointsFeature.H * lastPointsFeature.W * 4),
+      readBuffer(device, lastNormalFeature.buffer, lastNormalFeature.C * lastNormalFeature.H * lastNormalFeature.W * 4),
+      readBuffer(device, lastMaskFeature.buffer, lastMaskFeature.C * lastMaskFeature.H * lastMaskFeature.W * 4),
+    ]);
+
+    const outH = lastPointsFeature.H;
+    const outW = lastPointsFeature.W;
+
+    // Remap points: exp remap (xy * exp(z), exp(z))
+    const points = new Float32Array(3 * outH * outW);
+    const depth = new Float32Array(outH * outW);
+    const colors = new Float32Array(3 * outH * outW);
+
+    for (let i = 0; i < outH * outW; i++) {
+      // pointsRaw is in CHW: [3, outH, outW]
+      let px = pointsRaw[0 * outH * outW + i];
+      let py = pointsRaw[1 * outH * outW + i];
+      let pz = pointsRaw[2 * outH * outW + i];
+
+      // exp remap
+      const expZ = Math.exp(Math.min(pz, 10)); // clamp to avoid overflow
+      px = px * expZ;
+      py = py * expZ;
+      pz = expZ;
+
+      points[i * 3 + 0] = px;
+      points[i * 3 + 1] = py;
+      points[i * 3 + 2] = pz;
+      depth[i] = pz;
+
+      // Color from input image (resample to output resolution)
+      const oy = Math.floor(i / outW);
+      const ox = i % outW;
+      const srcY = Math.floor(oy * height / outH);
+      const srcX = Math.floor(ox * width / outW);
+      const srcIdx = srcY * width + srcX;
+      colors[i * 3 + 0] = imageData.data[srcIdx * 4 + 0] / 255;
+      colors[i * 3 + 1] = imageData.data[srcIdx * 4 + 1] / 255;
+      colors[i * 3 + 2] = imageData.data[srcIdx * 4 + 2] / 255;
     }
 
-    // Clean up GPU buffers
-    featureBuf.destroy();
-    uvFeatures.forEach(b => b.destroy());
+    // Normals: normalize vectors (CHW → per-pixel vec3)
+    const normals = new Float32Array(3 * outH * outW);
+    for (let i = 0; i < outH * outW; i++) {
+      let nx = normalsRaw[0 * outH * outW + i];
+      let ny = normalsRaw[1 * outH * outW + i];
+      let nz = normalsRaw[2 * outH * outW + i];
+      const len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+      normals[i * 3 + 0] = nx / len;
+      normals[i * 3 + 1] = ny / len;
+      normals[i * 3 + 2] = nz / len;
+    }
 
-    return { depth, normals, points, colors, width, height };
+    // Clean up input buffers
+    encoderFeatures.destroy();
+    neckInputs.forEach(f => f.buffer.destroy());
+
+    return { depth, normals, points, colors, width: outW, height: outH };
   }
 }
