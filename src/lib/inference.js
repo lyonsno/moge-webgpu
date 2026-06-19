@@ -37,6 +37,7 @@ import {
   dispatchPixelShuffle,
   dispatchUpsample,
 } from './shader_ops.js';
+import { loadWeights } from './weights.js';
 
 
 // --- Model config from upstream v2.json ---
@@ -257,8 +258,16 @@ export class MoGeInference {
     this.weights = null;
   }
 
-  async init() {
-    this.weights = this._createStubWeights();
+  async init(onProgress) {
+    try {
+      this.weights = await loadWeights(this.device, '/weights.bin', onProgress);
+      this.useRealWeights = true;
+      console.log('Loaded real MoGe-2 weights');
+    } catch (e) {
+      console.warn('Failed to load real weights, using stubs:', e.message);
+      this.weights = this._createStubWeights();
+      this.useRealWeights = false;
+    }
   }
 
   _createStubWeights() {

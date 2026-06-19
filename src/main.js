@@ -66,11 +66,17 @@ async function handleImage(file) {
     ctx.drawImage(bitmap, 0, 0, inputSize, inputSize);
     const imageData = ctx.getImageData(0, 0, inputSize, inputSize);
 
-    setStatus('Running MoGe-2 inference...');
     if (!inference) {
       inference = new MoGeInference(gpu);
-      await inference.init();
+      setStatus('Loading MoGe-2 weights (622 MB, first load only)...');
+      await inference.init((received, total) => {
+        const mb = (received / 1024 / 1024).toFixed(0);
+        const totalMb = (total / 1024 / 1024).toFixed(0);
+        setStatus(`Loading weights: ${mb} / ${totalMb} MB`);
+      });
     }
+
+    setStatus('Running MoGe-2 inference...');
 
     const t0 = performance.now();
     const result = await inference.run(imageData);
