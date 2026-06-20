@@ -416,7 +416,7 @@ export class MoGeInference {
       console.log(`Running DINOv2 backbone: image [3, ${imgH}, ${imgW}] → tokens [${tokenH}x${tokenW}]`);
       const imageBuf = createStorageBuffer(device, normalizedImage);
 
-      const { featureBuf } = this.backbone.encode(
+      const { featureBuf } = await this.backbone.encode(
         commandEncoder, imageBuf, this.weights, tokenH, tokenW
       );
 
@@ -425,9 +425,13 @@ export class MoGeInference {
 
       const numPatches = tokenH * tokenW;
       encoderData = await readBuffer(device, featureBuf, encoderDim * numPatches * 4);
-      const backboneRange = `[${Math.min(...encoderData.slice(0, 100)).toFixed(3)}, ${Math.max(...encoderData.slice(0, 100)).toFixed(3)}]`;
+      let bMin = Infinity, bMax = -Infinity;
+      for (let i = 0; i < encoderData.length; i++) {
+        if (encoderData[i] < bMin) bMin = encoderData[i];
+        if (encoderData[i] > bMax) bMax = encoderData[i];
+      }
+      const backboneRange = `[${bMin.toFixed(3)}, ${bMax.toFixed(3)}]`;
       console.log(`Backbone output: [${encoderDim}, ${tokenH}, ${tokenW}], range=${backboneRange}`);
-      // Write diagnostics to DOM for external reading
       window.__mogeDebug = window.__mogeDebug || {};
       window.__mogeDebug.backboneRange = backboneRange;
       window.__mogeDebug.backboneShape = [encoderDim, tokenH, tokenW];

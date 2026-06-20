@@ -88,7 +88,7 @@ export class DINOv2Backbone {
    * @param {number} tokenW
    * @returns {{ featureBuf: GPUBuffer, clsTokenBuf: GPUBuffer }}
    */
-  encode(encoder, imageBuf, weights, tokenH, tokenW) {
+  async encode(encoder, imageBuf, weights, tokenH, tokenW) {
     const device = this.device;
     const D = VIT_CONFIG.dim;
     const numPatches = tokenH * tokenW;
@@ -154,6 +154,23 @@ export class DINOv2Backbone {
       const ffnResidualOut = (currentTokens === tokenBufA) ? tokenBufB : tokenBufA;
       this._encodeLayerScaleResidual(encoder, ffnOutBuf, currentTokens, ffnResidualOut, weights, `encoder.backbone.blocks.${l}.ls2`, T, D);
       currentTokens = ffnResidualOut;
+
+      // Debug: read back token state after each layer to trace where signal dies
+      if (l === 0 || l === 5 || l === 11 || l === 23) {
+        // Submit what we have so far and read back
+        device.queue.submit([encoder.finish()]);
+        const debugData = await readBuffer(device, currentTokens, Math.min(T * 4, 4096));
+        let dMin = Infinity, dMax = -Infinity;
+        for (let i = 0; i < debugData.length; i++) {
+          if (debugData[i] < dMin) dMin = debugData[i];
+          if (debugData[i] > dMax) dMax = debugData[i];
+        }
+        console.log(`Layer ${l} tokens: range=[${dMin.toFixed(4)}, ${dMax.toFixed(4)}]`);
+        window.__mogeDebug = window.__mogeDebug || {};
+        window.__mogeDebug[`layer${l}`] = `[${dMin.toFixed(4)}, ${dMax.toFixed(4)}]`;
+        // Start a new encoder for subsequent work
+        encoder = device.createCommandEncoder();
+      }
 
       // Capture intermediate features at specified layers
       if (VIT_CONFIG.intermediateLayers.includes(l)) {
