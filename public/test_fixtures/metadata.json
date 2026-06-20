@@ -1,6 +1,6 @@
 {
   "image": "/Users/noahlyons/dev/moge-standalone/example_images/04_BunnyCake.jpg",
-  "resize": 224,
+  "resize": 518,
   "tokenH": 49,
   "tokenW": 49,
   "num_tokens": 2400,
@@ -12,25 +12,25 @@
   ],
   "model": "Ruicheng/moge-2-vitl",
   "ref_points_shape": [
-    224,
-    224,
+    518,
+    518,
     3
   ],
   "ref_points_range": [
-    -0.6865339279174805,
-    3.161184787750244
+    -0.729206383228302,
+    2.9864182472229004
   ],
   "ref_depth_shape": [
-    224,
-    224
+    518,
+    518
   ],
   "ref_depth_range": [
-    1.5590660572052002,
-    3.161184787750244
+    1.4762245416641235,
+    2.9864182472229004
   ],
   "ref_mask_shape": [
-    224,
-    224
+    518,
+    518
   ],
   "ref_mask_range": [
     1.0,

@@ -474,31 +474,43 @@ export class MoGeInference {
     }
 
     // Build neck input features: encoder features + UV coords at 5 scales
+    // UV coords must match upstream normalized_view_plane_uv exactly:
+    //   span_x = aspect_ratio / sqrt(1 + aspect_ratio^2)
+    //   span_y = 1 / sqrt(1 + aspect_ratio^2)
+    //   u = linspace(-span_x * (w-1)/w, +span_x * (w-1)/w, w)
+    //   v = linspace(-span_y * (h-1)/h, +span_y * (h-1)/h, h)
     const aspect = width / height;
     const neckInputs = [];
+
+    function makeUV(h, w, aspect) {
+      const spanX = aspect / Math.sqrt(1 + aspect * aspect);
+      const spanY = 1 / Math.sqrt(1 + aspect * aspect);
+      const uv = new Float32Array(2 * h * w);
+      for (let y = 0; y < h; y++) {
+        const v = -spanY * (h - 1) / h + (2 * spanY * (h - 1) / h) * y / (h - 1 || 1);
+        for (let x = 0; x < w; x++) {
+          const u = -spanX * (w - 1) / w + (2 * spanX * (w - 1) / w) * x / (w - 1 || 1);
+          uv[0 * h * w + y * w + x] = u;
+          uv[1 * h * w + y * w + x] = v;
+        }
+      }
+      return uv;
+    }
+
     for (let level = 0; level < 5; level++) {
       const h = tokenH * (2 ** level);
       const w = tokenW * (2 ** level);
       const dimIn = MODEL_CONFIG.neck.dimIn[level];
 
       const data = new Float32Array(dimIn * h * w);
+      const uv = makeUV(h, w, aspect);
       if (level === 0) {
         // Encoder features [1024, tokenH, tokenW] + UV [2, tokenH, tokenW]
         data.set(encoderData, 0);
-        for (let y = 0; y < h; y++) {
-          for (let x = 0; x < w; x++) {
-            data[encoderDim * h * w + y * w + x] = ((x + 0.5) / w * 2 - 1) * aspect;
-            data[(encoderDim + 1) * h * w + y * w + x] = (y + 0.5) / h * 2 - 1;
-          }
-        }
+        data.set(uv, encoderDim * h * w);
       } else {
         // UV only [2, h, w]
-        for (let y = 0; y < h; y++) {
-          for (let x = 0; x < w; x++) {
-            data[0 * h * w + y * w + x] = ((x + 0.5) / w * 2 - 1) * aspect;
-            data[1 * h * w + y * w + x] = (y + 0.5) / h * 2 - 1;
-          }
-        }
+        data.set(uv, 0);
       }
       neckInputs.push({ buffer: createStorageBuffer(device, data), H: h, W: w });
 
