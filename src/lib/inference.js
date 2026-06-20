@@ -416,7 +416,7 @@ export class MoGeInference {
       console.log(`Running DINOv2 backbone: image [3, ${imgH}, ${imgW}] → tokens [${tokenH}x${tokenW}]`);
       const imageBuf = createStorageBuffer(device, normalizedImage);
 
-      const { featureBuf } = await this.backbone.encode(
+      const { featureBuf, _debugSnaps } = this.backbone.encode(
         commandEncoder, imageBuf, this.weights, tokenH, tokenW
       );
 
@@ -435,6 +435,17 @@ export class MoGeInference {
       window.__mogeDebug = window.__mogeDebug || {};
       window.__mogeDebug.backboneRange = backboneRange;
       window.__mogeDebug.backboneShape = [encoderDim, tokenH, tokenW];
+
+      // Debug: check snapshot buffers
+      if (_debugSnaps && _debugSnaps.length > 0) {
+        const snap0 = await readBuffer(device, _debugSnaps[0].buffer, 4096);
+        let s0Min = Infinity, s0Max = -Infinity;
+        for (let i = 0; i < snap0.length; i++) {
+          if (snap0[i] < s0Min) s0Min = snap0[i];
+          if (snap0[i] > s0Max) s0Max = snap0[i];
+        }
+        window.__mogeDebug.snap0 = `layer${_debugSnaps[0].layerIdx}: [${s0Min.toFixed(4)}, ${s0Max.toFixed(4)}]`;
+      }
 
       imageBuf.destroy();
     } else {
