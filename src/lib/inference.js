@@ -533,7 +533,8 @@ export class MoGeInference {
 
     // Debug: check neck output level 0
     {
-      const neckOut0 = await readBuffer(device, neckOutputs[0].buffer, 4096);
+      const neckOut0Size = neckOutputs[0].C * neckOutputs[0].H * neckOutputs[0].W * 4;
+      const neckOut0 = await readBuffer(device, neckOutputs[0].buffer, neckOut0Size);
       let n0Min = Infinity, n0Max = -Infinity;
       for (let i = 0; i < neckOut0.length; i++) {
         if (neckOut0[i] < n0Min) n0Min = neckOut0[i];
