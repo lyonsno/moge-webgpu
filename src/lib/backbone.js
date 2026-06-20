@@ -20,6 +20,7 @@ import attentionWGSL from '../shaders/attention.wgsl?raw';
 import linearWGSL from '../shaders/linear.wgsl?raw';
 import linearGeluWGSL from '../shaders/linear_gelu.wgsl?raw';
 import layerscaleWGSL from '../shaders/layerscale.wgsl?raw';
+import transposeWGSL from '../shaders/transpose_nd.wgsl?raw';
 
 const MAX_WG = 65535;
 function splitWG(total) {
@@ -75,6 +76,7 @@ export class DINOv2Backbone {
     this.pipelines.linear = make(linearWGSL, 'main');
     this.pipelines.linearGelu = make(linearGeluWGSL, 'main');
     this.pipelines.layerScale = make(layerscaleWGSL, 'main');
+    this.pipelines.transpose = make(transposeWGSL, 'main');
   }
 
   /**
@@ -167,20 +169,22 @@ export class DINOv2Backbone {
     for (let i = 0; i < intermediateFeatures.length; i++) {
       const { buffer: snapBuf } = intermediateFeatures[i];
 
-      // Extract patch tokens (skip CLS at index 0): [N, D] → [numPatches, D]
-      // Then reshape to [D, tokenH, tokenW] via 1x1 conv (output_projections)
-      // The upstream code does: proj(feat.permute(0,2,1).unflatten(2, (tokenH, tokenW)))
-      // Which is: [N-1, D] → [D, N-1] → [D, tokenH, tokenW] → 1x1 conv → [D, tokenH, tokenW]
-
-      // For now, project the patch tokens with the output projection
+      // Upstream flow:
+      //   feat [N, D] → skip CLS → [numPatches, D] → permute → [D, numPatches]
+      //   → unflatten → [D, tokenH, tokenW] → 1x1 conv → [D, tokenH, tokenW]
+      //
+      // Step 1: Linear projection on [numPatches, D] → [numPatches, D]
       const projBuf = createEmptyBuffer(device, D * numPatches * 4);
       this._encodeOutputProjection(encoder, snapBuf, projBuf, weights, i, N, numPatches);
 
+      // Step 2: Transpose [numPatches, D] → [D, numPatches] (= [D, tokenH, tokenW] in CHW)
+      const transposedBuf = createEmptyBuffer(device, D * numPatches * 4);
+      this._encodeTranspose(encoder, projBuf, transposedBuf, numPatches, D);
+
       if (sumBuf === null) {
-        sumBuf = projBuf;
+        sumBuf = transposedBuf;
       } else {
-        // Add to running sum
-        this._encodeAdd(encoder, sumBuf, projBuf, D * numPatches);
+        this._encodeAdd(encoder, sumBuf, transposedBuf, D * numPatches);
       }
     }
 
@@ -528,6 +532,31 @@ export class DINOv2Backbone {
 
     const pass = enc.beginComputePass();
     pass.setPipeline(this.pipelines.linear);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(wgX, wgY);
+    pass.end();
+  }
+
+  _encodeTranspose(enc, input, output, rows, cols) {
+    const device = this.device;
+    const total = rows * cols;
+    const totalWG = ceilDiv(total, 256);
+    const [wgX, wgY] = splitWG(totalWG);
+
+    const paramsData = new Uint32Array([rows, cols, wgX]);
+    const paramsBuf = makeUniform(device, paramsData);
+
+    const bg = device.createBindGroup({
+      layout: this.pipelines.transpose.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: paramsBuf } },
+        { binding: 1, resource: { buffer: input } },
+        { binding: 2, resource: { buffer: output } },
+      ],
+    });
+
+    const pass = enc.beginComputePass();
+    pass.setPipeline(this.pipelines.transpose);
     pass.setBindGroup(0, bg);
     pass.dispatchWorkgroups(wgX, wgY);
     pass.end();

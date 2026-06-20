@@ -99,9 +99,20 @@ async function handleImage(file) {
     pointcloudRenderer.setPoints(result.points, result.colors);
 
     outputEl.classList.add('visible');
+
+    // Write diagnostics to a visible element for external reading
+    const debugEl = document.getElementById('debug-output');
+    if (debugEl && window.__mogeDebug) {
+      debugEl.textContent = JSON.stringify(window.__mogeDebug, null, 2);
+    }
   } catch (e) {
     setError(`Error: ${e.message}`);
     console.error(e);
+    // Also write errors to debug output
+    const debugEl = document.getElementById('debug-output');
+    if (debugEl) {
+      debugEl.textContent = JSON.stringify({ error: e.message, stack: e.stack }, null, 2);
+    }
   }
 }
 

@@ -425,7 +425,12 @@ export class MoGeInference {
 
       const numPatches = tokenH * tokenW;
       encoderData = await readBuffer(device, featureBuf, encoderDim * numPatches * 4);
-      console.log(`Backbone output: [${encoderDim}, ${tokenH}, ${tokenW}], range=[${Math.min(...encoderData.slice(0, 100)).toFixed(3)}, ${Math.max(...encoderData.slice(0, 100)).toFixed(3)}]`);
+      const backboneRange = `[${Math.min(...encoderData.slice(0, 100)).toFixed(3)}, ${Math.max(...encoderData.slice(0, 100)).toFixed(3)}]`;
+      console.log(`Backbone output: [${encoderDim}, ${tokenH}, ${tokenW}], range=${backboneRange}`);
+      // Write diagnostics to DOM for external reading
+      window.__mogeDebug = window.__mogeDebug || {};
+      window.__mogeDebug.backboneRange = backboneRange;
+      window.__mogeDebug.backboneShape = [encoderDim, tokenH, tokenW];
 
       imageBuf.destroy();
     } else {
@@ -512,7 +517,10 @@ export class MoGeInference {
         pMax = Math.max(pMax, pointsRaw[i]);
       }
     }
-    console.log(`Points raw: shape=[${lastPoints.C}, ${outH}, ${outW}], range=[${pMin.toFixed(4)}, ${pMax.toFixed(4)}], NaN=${pNan}, zeros=${pZero}/${pointsRaw.length}`);
+    const pointsDiag = `shape=[${lastPoints.C}, ${outH}, ${outW}], range=[${pMin.toFixed(4)}, ${pMax.toFixed(4)}], NaN=${pNan}, zeros=${pZero}/${pointsRaw.length}`;
+    console.log(`Points raw: ${pointsDiag}`);
+    window.__mogeDebug = window.__mogeDebug || {};
+    window.__mogeDebug.pointsDiag = pointsDiag;
 
     let mMin = Infinity, mMax = -Infinity;
     for (let i = 0; i < maskRaw.length; i++) {
