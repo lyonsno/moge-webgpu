@@ -473,6 +473,86 @@ export class MoGeInference {
       }
     }
 
+    // Try loading PyTorch neck inputs for decoder validation
+    const USE_PYTORCH_NECK_INPUTS = true; // Toggle to bypass backbone+UV and use PyTorch ground truth
+    if (USE_PYTORCH_NECK_INPUTS) {
+      try {
+        const neckInputs = [];
+        for (let level = 0; level < 5; level++) {
+          const resp = await fetch(`/layer_dumps/neck_input_${level}.bin`);
+          if (!resp.ok) throw new Error(`No neck_input_${level}`);
+          const buf = await resp.arrayBuffer();
+          const data = new Float32Array(buf);
+          const h = tokenH * (2 ** level);
+          const w = tokenW * (2 ** level);
+          neckInputs.push({ buffer: createStorageBuffer(device, data), H: h, W: w });
+        }
+        console.log('Using PyTorch neck inputs from layer dumps');
+        window.__mogeDebug = window.__mogeDebug || {};
+        window.__mogeDebug.neckSource = 'pytorch_layer_dumps';
+
+        // Run decoder with PyTorch neck inputs
+        const decoderEncoder = device.createCommandEncoder();
+        const neckOutputs = dispatchConvStack(device, decoderEncoder, neckInputs, this.weights.neck, MODEL_CONFIG.neck);
+        const pointsInputs = neckOutputs.map(f => ({ buffer: f.buffer, H: f.H, W: f.W }));
+        const pointsOutputs = dispatchConvStack(device, decoderEncoder, pointsInputs, this.weights.pointsHead, MODEL_CONFIG.pointsHead);
+        const maskInputs = neckOutputs.map(f => ({ buffer: f.buffer, H: f.H, W: f.W }));
+        const maskOutputs = dispatchConvStack(device, decoderEncoder, maskInputs, this.weights.maskHead, MODEL_CONFIG.maskHead);
+        device.queue.submit([decoderEncoder.finish()]);
+
+        const lastPoints = pointsOutputs[pointsOutputs.length - 1];
+        const pointsRaw = await readBuffer(device, lastPoints.buffer, lastPoints.C * lastPoints.H * lastPoints.W * 4);
+        const outH = lastPoints.H, outW = lastPoints.W;
+
+        // Same post-processing as below
+        const points = new Float32Array(3 * outH * outW);
+        const depth = new Float32Array(outH * outW);
+        const colors = new Float32Array(3 * outH * outW);
+        const normals = new Float32Array(3 * outH * outW);
+
+        for (let i = 0; i < outH * outW; i++) {
+          let px = pointsRaw[0 * outH * outW + i];
+          let py = pointsRaw[1 * outH * outW + i];
+          let pz = pointsRaw[2 * outH * outW + i];
+          const expZ = Math.exp(Math.min(pz, 10));
+          px = px * expZ; py = py * expZ; pz = expZ;
+          points[i * 3] = px; points[i * 3 + 1] = py; points[i * 3 + 2] = pz;
+          depth[i] = pz;
+          const oy = Math.floor(i / outW), ox = i % outW;
+          const srcY = Math.min(Math.floor(oy * height / outH), height - 1);
+          const srcX = Math.min(Math.floor(ox * width / outW), width - 1);
+          const srcIdx = srcY * width + srcX;
+          colors[i * 3] = imageData.data[srcIdx * 4] / 255;
+          colors[i * 3 + 1] = imageData.data[srcIdx * 4 + 1] / 255;
+          colors[i * 3 + 2] = imageData.data[srcIdx * 4 + 2] / 255;
+        }
+        for (let y = 0; y < outH; y++) {
+          for (let x = 0; x < outW; x++) {
+            const i = y * outW + x;
+            const ir = y * outW + Math.min(x + 1, outW - 1);
+            const ib = Math.min(y + 1, outH - 1) * outW + x;
+            const dxX = points[ir*3]-points[i*3], dxY = points[ir*3+1]-points[i*3+1], dxZ = points[ir*3+2]-points[i*3+2];
+            const dyX = points[ib*3]-points[i*3], dyY = points[ib*3+1]-points[i*3+1], dyZ = points[ib*3+2]-points[i*3+2];
+            let nx = dxY*dyZ-dxZ*dyY, ny = dxZ*dyX-dxX*dyZ, nz = dxX*dyY-dxY*dyX;
+            const len = Math.sqrt(nx*nx+ny*ny+nz*nz)||1;
+            normals[i*3]=nx/len; normals[i*3+1]=ny/len; normals[i*3+2]=nz/len;
+          }
+        }
+
+        let pMin=Infinity,pMax=-Infinity;
+        for(let i=0;i<pointsRaw.length;i++){if(pointsRaw[i]<pMin)pMin=pointsRaw[i];if(pointsRaw[i]>pMax)pMax=pointsRaw[i];}
+        window.__mogeDebug.pointsDiag = `shape=[${lastPoints.C},${outH},${outW}], range=[${pMin.toFixed(4)},${pMax.toFixed(4)}]`;
+        let dMin=Infinity,dMax=-Infinity;
+        for(let i=0;i<depth.length;i++){if(depth[i]<dMin)dMin=depth[i];if(depth[i]>dMax)dMax=depth[i];}
+        window.__mogeDebug.depthRange = `[${dMin.toFixed(4)},${dMax.toFixed(4)}]`;
+
+        neckInputs.forEach(f => f.buffer.destroy());
+        return { depth, normals, points, colors, width: outW, height: outH };
+      } catch (e) {
+        console.warn('PyTorch neck inputs not available, using backbone:', e.message);
+      }
+    }
+
     // Build neck input features: encoder features + UV coords at 5 scales
     // UV coords must match upstream normalized_view_plane_uv exactly:
     //   span_x = aspect_ratio / sqrt(1 + aspect_ratio^2)
