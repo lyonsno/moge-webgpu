@@ -272,8 +272,8 @@ export async function loadWeights(device, url, onProgress) {
       'norm1.weight', 'norm1.bias',
       'norm2.weight', 'norm2.bias',
       'ls1.gamma', 'ls2.gamma',
-      'mlp.w12.weight', 'mlp.w12.bias',
-      'mlp.w3.weight', 'mlp.w3.bias',
+      'mlp.fc1.weight', 'mlp.fc1.bias',
+      'mlp.fc2.weight', 'mlp.fc2.bias',
     ]) {
       const fullName = `${prefix}.${name}`;
       const buf = getTensor(device, buffer, tensors, fullName);

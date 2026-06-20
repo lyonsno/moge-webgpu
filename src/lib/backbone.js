@@ -18,7 +18,7 @@ import patchEmbedWGSL from '../shaders/patch_embed_dinov2.wgsl?raw';
 import layerNormWGSL from '../shaders/layernorm_vit.wgsl?raw';
 import attentionWGSL from '../shaders/attention.wgsl?raw';
 import linearWGSL from '../shaders/linear.wgsl?raw';
-import swigluWGSL from '../shaders/swiglu.wgsl?raw';
+import linearGeluWGSL from '../shaders/linear_gelu.wgsl?raw';
 import layerscaleWGSL from '../shaders/layerscale.wgsl?raw';
 
 const MAX_WG = 65535;
@@ -48,9 +48,8 @@ const VIT_CONFIG = {
   patchSize: 14,
   channels: 3,
   intermediateLayers: [5, 11, 17, 23],
-  // SwiGLU hidden dim: int(dim * 4 * 2/3 / 8) * 8 = int(1024*8/3/8)*8 = 2730? Let's check
-  // mlp_ratio=4 → hidden = int(1024*4) = 4096, but SwiGLUFFNFused does: int(4096 * 2/3 + 7) // 8 * 8 = int(2730.67+7)//8*8 = 2737//8*8 = 342*8 = 2736
-  swiGLUHiddenDim: 2736,
+  // Standard GELU MLP (not SwiGLU — verified from checkpoint weights)
+  mlpHiddenDim: 4096,
   scale: 1.0 / Math.sqrt(64),
   eps: 1e-6,
 };
@@ -74,7 +73,7 @@ export class DINOv2Backbone {
     this.pipelines.attnSoftmax = make(attentionWGSL, 'softmax');
     this.pipelines.attnApply = make(attentionWGSL, 'applyAttn');
     this.pipelines.linear = make(linearWGSL, 'main');
-    this.pipelines.swigluGate = make(swigluWGSL, 'swiglu_gate');
+    this.pipelines.linearGelu = make(linearGeluWGSL, 'main');
     this.pipelines.layerScale = make(layerscaleWGSL, 'main');
   }
 
@@ -111,7 +110,7 @@ export class DINOv2Backbone {
     const scoreBuf = createEmptyBuffer(device, VIT_CONFIG.numHeads * N * N * 4);
     const attnOutBuf = createEmptyBuffer(device, T * 4);
     const projOutBuf = createEmptyBuffer(device, T * 4);
-    const hiddenBuf = createEmptyBuffer(device, N * VIT_CONFIG.swiGLUHiddenDim * 4);
+    const hiddenBuf = createEmptyBuffer(device, N * VIT_CONFIG.mlpHiddenDim * 4);
     const ffnOutBuf = createEmptyBuffer(device, T * 4);
     const lsOutBuf = createEmptyBuffer(device, T * 4);
 
@@ -142,9 +141,9 @@ export class DINOv2Backbone {
       // LayerNorm2
       this._encodeLayerNorm(encoder, currentTokens, normBuf, weights, `encoder.backbone.blocks.${l}.norm2`, N);
 
-      // SwiGLU FFN
-      this._encodeSwiGLU(encoder, normBuf, hiddenBuf, weights, l, N);
-      this._encodeLinear(encoder, hiddenBuf, ffnOutBuf, weights, `encoder.backbone.blocks.${l}.mlp.w3`, N, VIT_CONFIG.swiGLUHiddenDim, D);
+      // GELU MLP: fc1 (linear+GELU) then fc2 (linear)
+      this._encodeLinearGelu(encoder, normBuf, hiddenBuf, weights, `encoder.backbone.blocks.${l}.mlp.fc1`, N, D, VIT_CONFIG.mlpHiddenDim);
+      this._encodeLinear(encoder, hiddenBuf, ffnOutBuf, weights, `encoder.backbone.blocks.${l}.mlp.fc2`, N, VIT_CONFIG.mlpHiddenDim, D);
 
       // LayerScale2 + residual
       const newTokenBuf = createEmptyBuffer(device, T * 4);
@@ -466,38 +465,35 @@ export class DINOv2Backbone {
     pass.end();
   }
 
-  _encodeSwiGLU(enc, input, hiddenBuf, weights, layerIdx, N) {
+  _encodeLinearGelu(enc, input, output, weights, prefix, numRows, inDim, outDim) {
     const device = this.device;
-    const D = VIT_CONFIG.dim;
-    const hiddenDim = VIT_CONFIG.swiGLUHiddenDim;
-    const totalWG = ceilDiv(N * hiddenDim, 256);
+    const totalWG = ceilDiv(numRows * outDim, 256);
     const [wgX, wgY] = splitWG(totalWG);
 
-    const paramsData = new Uint32Array([N, D, hiddenDim, wgX]);
+    const paramsData = new Uint32Array([numRows, inDim, outDim, wgX]);
     const paramsBuf = makeUniform(device, paramsData);
 
-    const prefix = `encoder.backbone.blocks.${layerIdx}.mlp.w12`;
-    const w12Weight = weights.encoder.blockWeights?.[`${prefix}.weight`];
-    const w12Bias = weights.encoder.blockWeights?.[`${prefix}.bias`];
+    const weight = weights.encoder.blockWeights?.[`${prefix}.weight`];
+    const bias = weights.encoder.blockWeights?.[`${prefix}.bias`];
 
-    if (!w12Weight || !w12Bias) {
-      console.warn(`Missing SwiGLU w12 weights for layer ${layerIdx}`);
+    if (!weight || !bias) {
+      console.warn(`Missing linear+GELU weights: ${prefix}`);
       return;
     }
 
     const bg = device.createBindGroup({
-      layout: this.pipelines.swigluGate.getBindGroupLayout(0),
+      layout: this.pipelines.linearGelu.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: { buffer: paramsBuf } },
         { binding: 1, resource: { buffer: input } },
-        { binding: 2, resource: { buffer: w12Weight } },
-        { binding: 3, resource: { buffer: w12Bias } },
-        { binding: 4, resource: { buffer: hiddenBuf } },
+        { binding: 2, resource: { buffer: weight } },
+        { binding: 3, resource: { buffer: bias } },
+        { binding: 4, resource: { buffer: output } },
       ],
     });
 
     const pass = enc.beginComputePass();
-    pass.setPipeline(this.pipelines.swigluGate);
+    pass.setPipeline(this.pipelines.linearGelu);
     pass.setBindGroup(0, bg);
     pass.dispatchWorkgroups(wgX, wgY);
     pass.end();

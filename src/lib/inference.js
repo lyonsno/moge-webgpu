@@ -38,6 +38,7 @@ import {
   dispatchUpsample,
 } from './shader_ops.js';
 import { loadWeights } from './weights.js';
+import { DINOv2Backbone } from './backbone.js';
 
 
 // --- Model config from upstream v2.json ---
@@ -250,6 +251,7 @@ export class MoGeInference {
   constructor(gpu) {
     this.device = gpu.device;
     this.weights = null;
+    this.backbone = null;
   }
 
   async init(onProgress) {
@@ -257,6 +259,11 @@ export class MoGeInference {
       this.weights = await loadWeights(this.device, '/weights.bin', onProgress);
       this.useRealWeights = true;
       console.log('Loaded real MoGe-2 weights');
+
+      // Initialize backbone
+      this.backbone = new DINOv2Backbone(this.device);
+      this.backbone.init();
+      console.log('DINOv2 backbone initialized');
     } catch (e) {
       console.warn('Failed to load real weights, using stubs:', e.message);
       this.weights = this._createStubWeights();
@@ -364,26 +371,76 @@ export class MoGeInference {
     const device = this.device;
     const encoderDim = MODEL_CONFIG.encoder.dimOut;
 
-    // Try to load real encoder features from fixture
-    const fixture = await this._loadFixture();
+    // Determine token grid size
+    // MoGe-2 uses num_tokens to determine resolution: sqrt(num_tokens) ≈ tokenH = tokenW
+    const numTokens = 2400; // default resolution level 9
+    const tokenH = Math.round(Math.sqrt(numTokens));
+    const tokenW = Math.round(Math.sqrt(numTokens));
 
+    // --- Encoder ---
     let encoderData;
-    let tokenH, tokenW;
+    let useBackbone = this.backbone && this.useRealWeights;
 
-    if (fixture) {
-      encoderData = fixture.features;
-      tokenH = fixture.tokenH;
-      tokenW = fixture.tokenW;
-      console.log(`Using real encoder features: [${encoderDim}, ${tokenH}, ${tokenW}]`);
-    } else {
-      // Stub: random features
-      tokenH = Math.floor(height / MODEL_CONFIG.patchSize);
-      tokenW = Math.floor(width / MODEL_CONFIG.patchSize);
-      encoderData = new Float32Array(encoderDim * tokenH * tokenW);
-      for (let i = 0; i < encoderData.length; i++) {
-        encoderData[i] = (Math.random() - 0.5) * 0.5;
+    // Prepare image for backbone: normalize with ImageNet mean/std, resize to tokenH*14 x tokenW*14
+    const imgH = tokenH * MODEL_CONFIG.patchSize;
+    const imgW = tokenW * MODEL_CONFIG.patchSize;
+
+    // Convert input image to CHW float [0,1], then normalize
+    const imageMean = [0.485, 0.456, 0.406];
+    const imageStd = [0.229, 0.224, 0.225];
+    const normalizedImage = new Float32Array(3 * imgH * imgW);
+
+    // Resize imageData to imgH x imgW using a temp canvas
+    const tmpCanvas = document.createElement('canvas');
+    tmpCanvas.width = imgW;
+    tmpCanvas.height = imgH;
+    const tmpCtx = tmpCanvas.getContext('2d');
+    // Create ImageBitmap from the original imageData
+    const origCanvas = document.createElement('canvas');
+    origCanvas.width = width;
+    origCanvas.height = height;
+    origCanvas.getContext('2d').putImageData(imageData, 0, 0);
+    tmpCtx.drawImage(origCanvas, 0, 0, imgW, imgH);
+    const resizedData = tmpCtx.getImageData(0, 0, imgW, imgH);
+
+    for (let c = 0; c < 3; c++) {
+      for (let i = 0; i < imgH * imgW; i++) {
+        const pixel = resizedData.data[i * 4 + c] / 255.0;
+        normalizedImage[c * imgH * imgW + i] = (pixel - imageMean[c]) / imageStd[c];
       }
-      console.log(`Using stub encoder features: [${encoderDim}, ${tokenH}, ${tokenW}]`);
+    }
+
+    const commandEncoder = device.createCommandEncoder();
+
+    if (useBackbone) {
+      console.log(`Running DINOv2 backbone: image [3, ${imgH}, ${imgW}] → tokens [${tokenH}x${tokenW}]`);
+      const imageBuf = createStorageBuffer(device, normalizedImage);
+
+      const { featureBuf } = this.backbone.encode(
+        commandEncoder, imageBuf, this.weights, tokenH, tokenW
+      );
+
+      // Submit backbone compute, read back features
+      device.queue.submit([commandEncoder.finish()]);
+
+      const numPatches = tokenH * tokenW;
+      encoderData = await readBuffer(device, featureBuf, encoderDim * numPatches * 4);
+      console.log(`Backbone output: [${encoderDim}, ${tokenH}, ${tokenW}], range=[${Math.min(...encoderData.slice(0, 100)).toFixed(3)}, ${Math.max(...encoderData.slice(0, 100)).toFixed(3)}]`);
+
+      imageBuf.destroy();
+    } else {
+      // Try fixture, then fall back to random
+      const fixture = await this._loadFixture();
+      if (fixture) {
+        encoderData = fixture.features;
+        console.log(`Using fixture encoder features`);
+      } else {
+        encoderData = new Float32Array(encoderDim * tokenH * tokenW);
+        for (let i = 0; i < encoderData.length; i++) {
+          encoderData[i] = (Math.random() - 0.5) * 0.5;
+        }
+        console.log(`Using stub encoder features`);
+      }
     }
 
     // Build neck input features: encoder features + UV coords at 5 scales
@@ -416,22 +473,22 @@ export class MoGeInference {
       neckInputs.push({ buffer: createStorageBuffer(device, data), H: h, W: w });
     }
 
-    // --- Dispatch ---
-    const commandEncoder = device.createCommandEncoder();
+    // --- Decoder dispatch ---
+    const decoderEncoder = device.createCommandEncoder();
 
     // Neck
-    const neckOutputs = dispatchConvStack(device, commandEncoder, neckInputs, this.weights.neck, MODEL_CONFIG.neck);
+    const neckOutputs = dispatchConvStack(device, decoderEncoder, neckInputs, this.weights.neck, MODEL_CONFIG.neck);
 
     // Points head
     const pointsInputs = neckOutputs.map(f => ({ buffer: f.buffer, H: f.H, W: f.W }));
-    const pointsOutputs = dispatchConvStack(device, commandEncoder, pointsInputs, this.weights.pointsHead, MODEL_CONFIG.pointsHead);
+    const pointsOutputs = dispatchConvStack(device, decoderEncoder, pointsInputs, this.weights.pointsHead, MODEL_CONFIG.pointsHead);
 
     // Mask head
     const maskInputs = neckOutputs.map(f => ({ buffer: f.buffer, H: f.H, W: f.W }));
-    const maskOutputs = dispatchConvStack(device, commandEncoder, maskInputs, this.weights.maskHead, MODEL_CONFIG.maskHead);
+    const maskOutputs = dispatchConvStack(device, decoderEncoder, maskInputs, this.weights.maskHead, MODEL_CONFIG.maskHead);
 
-    // Submit
-    device.queue.submit([commandEncoder.finish()]);
+    // Submit decoder
+    device.queue.submit([decoderEncoder.finish()]);
 
     // Read back
     const lastPoints = pointsOutputs[pointsOutputs.length - 1];
