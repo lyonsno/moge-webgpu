@@ -84,11 +84,11 @@ async function handleImage(file) {
 
     setStatus(`Inference complete in ${elapsed}s`);
 
-    // Display depth map
-    displayDepthMap(result.depth, inputSize, inputSize);
+    // Display depth map (output may be different size than input)
+    displayDepthMap(result.depth, result.width, result.height);
 
     // Display normal map
-    displayNormalMap(result.normals, inputSize, inputSize);
+    displayNormalMap(result.normals, result.width, result.height);
 
     // Display pointcloud
     if (!pointcloudRenderer) {
@@ -100,10 +100,22 @@ async function handleImage(file) {
 
     outputEl.classList.add('visible');
 
-    // Write diagnostics to a visible element for external reading
+    // Write diagnostics to a visible element
     const debugEl = document.getElementById('debug-output');
-    if (debugEl && window.__mogeDebug) {
-      debugEl.textContent = JSON.stringify(window.__mogeDebug, null, 2);
+    if (debugEl) {
+      const dbg = window.__mogeDebug || {};
+      // Add depth range info
+      let dMin = Infinity, dMax = -Infinity;
+      for (let i = 0; i < result.depth.length; i++) {
+        if (isFinite(result.depth[i])) {
+          dMin = Math.min(dMin, result.depth[i]);
+          dMax = Math.max(dMax, result.depth[i]);
+        }
+      }
+      dbg.depthRange = `[${dMin.toFixed(4)}, ${dMax.toFixed(4)}]`;
+      dbg.outputSize = `${result.width}x${result.height}`;
+      dbg.elapsed = elapsed + 's';
+      debugEl.textContent = JSON.stringify(dbg, null, 2);
     }
   } catch (e) {
     setError(`Error: ${e.message}`);
@@ -123,23 +135,23 @@ function displayDepthMap(depth, w, h) {
   const ctx = canvas.getContext('2d');
   const img = ctx.createImageData(w, h);
 
-  // Find min/max for normalization (skip inf/nan)
-  let min = Infinity, max = -Infinity;
+  // Use percentile-based normalization for robust display
+  const finiteVals = [];
   for (let i = 0; i < depth.length; i++) {
-    const v = depth[i];
-    if (isFinite(v)) {
-      if (v < min) min = v;
-      if (v > max) max = v;
-    }
+    if (isFinite(depth[i])) finiteVals.push(depth[i]);
   }
-  const range = max - min || 1;
+  finiteVals.sort((a, b) => a - b);
+  const p2 = finiteVals[Math.floor(finiteVals.length * 0.02)] || 0;
+  const p98 = finiteVals[Math.floor(finiteVals.length * 0.98)] || 1;
+  const min = p2;
+  const range = (p98 - p2) || 1;
 
-  // Turbo-ish colormap
+  // Viridis-ish colormap: near=warm yellow, far=cool blue
   for (let i = 0; i < depth.length; i++) {
     const v = depth[i];
-    const t = isFinite(v) ? (v - min) / range : 0;
+    const t = isFinite(v) ? Math.max(0, Math.min(1, (v - min) / range)) : 0;
     const idx = i * 4;
-    // Simple warm colormap: near=warm, far=cool
+    // Near (low depth) = warm, far (high depth) = cool
     img.data[idx + 0] = Math.floor((1 - t) * 255);
     img.data[idx + 1] = Math.floor(Math.sin(t * Math.PI) * 200);
     img.data[idx + 2] = Math.floor(t * 255);
