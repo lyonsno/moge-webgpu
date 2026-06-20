@@ -256,8 +256,32 @@ export async function loadWeights(device, url, onProgress) {
     },
     posEmbed: get('encoder.backbone.pos_embed'),
     clsToken: get('encoder.backbone.cls_token'),
-    // ViT blocks will be loaded when backbone is implemented
+    norm: {
+      weight: get('encoder.backbone.norm.weight'),
+      bias: get('encoder.backbone.norm.bias'),
+    },
+    blockWeights: {},
   };
+
+  // Load all 24 transformer block weights
+  for (let l = 0; l < 24; l++) {
+    const prefix = `encoder.backbone.blocks.${l}`;
+    for (const name of [
+      'attn.qkv.weight', 'attn.qkv.bias',
+      'attn.proj.weight', 'attn.proj.bias',
+      'norm1.weight', 'norm1.bias',
+      'norm2.weight', 'norm2.bias',
+      'ls1.gamma', 'ls2.gamma',
+      'mlp.w12.weight', 'mlp.w12.bias',
+      'mlp.w3.weight', 'mlp.w3.bias',
+    ]) {
+      const fullName = `${prefix}.${name}`;
+      const buf = getTensor(device, buffer, tensors, fullName);
+      if (buf) {
+        encoder.blockWeights[fullName] = buf;
+      }
+    }
+  }
 
   // Build all ConvStack weights
   const MODEL_CONFIG = (await import('./inference.js')).default;
