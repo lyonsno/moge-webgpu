@@ -501,6 +501,17 @@ export class MoGeInference {
         }
       }
       neckInputs.push({ buffer: createStorageBuffer(device, data), H: h, W: w });
+
+      // Debug: check neck level 0 input range
+      if (level === 0) {
+        let nMin = Infinity, nMax = -Infinity;
+        for (let i = 0; i < Math.min(data.length, 10000); i++) {
+          if (data[i] < nMin) nMin = data[i];
+          if (data[i] > nMax) nMax = data[i];
+        }
+        window.__mogeDebug = window.__mogeDebug || {};
+        window.__mogeDebug.neckLevel0 = `[${nMin.toFixed(4)}, ${nMax.toFixed(4)}] size=${data.length}`;
+      }
     }
 
     // --- Decoder dispatch ---
@@ -519,6 +530,26 @@ export class MoGeInference {
 
     // Submit decoder
     device.queue.submit([decoderEncoder.finish()]);
+
+    // Debug: check neck output level 0
+    {
+      const neckOut0 = await readBuffer(device, neckOutputs[0].buffer, 4096);
+      let n0Min = Infinity, n0Max = -Infinity;
+      for (let i = 0; i < neckOut0.length; i++) {
+        if (neckOut0[i] < n0Min) n0Min = neckOut0[i];
+        if (neckOut0[i] > n0Max) n0Max = neckOut0[i];
+      }
+      window.__mogeDebug.neckOut0 = `C=${neckOutputs[0].C} ${neckOutputs[0].H}x${neckOutputs[0].W}: [${n0Min.toFixed(4)}, ${n0Max.toFixed(4)}]`;
+
+      // Also check final points output
+      const lastPts = await readBuffer(device, neckOutputs[neckOutputs.length - 1].buffer, 4096);
+      let pMin = Infinity, pMax = -Infinity;
+      for (let i = 0; i < lastPts.length; i++) {
+        if (lastPts[i] < pMin) pMin = lastPts[i];
+        if (lastPts[i] > pMax) pMax = lastPts[i];
+      }
+      window.__mogeDebug.neckOutLast = `C=${neckOutputs[neckOutputs.length-1].C} ${neckOutputs[neckOutputs.length-1].H}x${neckOutputs[neckOutputs.length-1].W}: [${pMin.toFixed(4)}, ${pMax.toFixed(4)}]`;
+    }
 
     // Read back
     const lastPoints = pointsOutputs[pointsOutputs.length - 1];
