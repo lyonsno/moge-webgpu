@@ -433,7 +433,17 @@ export class MoGeInference {
       const backboneRange = `[${bMin.toFixed(3)}, ${bMax.toFixed(3)}]`;
       console.log(`Backbone output: [${encoderDim}, ${tokenH}, ${tokenW}], range=${backboneRange}`);
       window.__mogeDebug = window.__mogeDebug || {};
+      // Compute std too
+      let bSum = 0, bSqSum = 0;
+      for (let i = 0; i < encoderData.length; i++) {
+        bSum += encoderData[i];
+        bSqSum += encoderData[i] * encoderData[i];
+      }
+      const bMean = bSum / encoderData.length;
+      const bStd = Math.sqrt(bSqSum / encoderData.length - bMean * bMean);
+
       window.__mogeDebug.backboneRange = backboneRange;
+      window.__mogeDebug.backboneStats = `mean=${bMean.toFixed(4)}, std=${bStd.toFixed(4)}, n=${encoderData.length}`;
       window.__mogeDebug.backboneShape = [encoderDim, tokenH, tokenW];
 
       // Debug: check snapshot buffers
