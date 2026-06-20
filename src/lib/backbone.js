@@ -114,7 +114,9 @@ export class DINOv2Backbone {
     const projOutBuf = createEmptyBuffer(device, T * 4);
     const hiddenBuf = createEmptyBuffer(device, N * VIT_CONFIG.mlpHiddenDim * 4);
     const ffnOutBuf = createEmptyBuffer(device, T * 4);
-    const lsOutBuf = createEmptyBuffer(device, T * 4);
+    // Two token buffers for ping-pong (avoid read/write race on same buffer)
+    let tokenBufA = tokenBuf;
+    let tokenBufB = createEmptyBuffer(device, T * 4);
 
     for (let l = 0; l < VIT_CONFIG.numLayers; l++) {
       // LayerNorm1
@@ -135,10 +137,11 @@ export class DINOv2Backbone {
       // Output projection
       this._encodeLinear(encoder, attnOutBuf, projOutBuf, weights, `encoder.backbone.blocks.${l}.attn.proj`, N, D, D);
 
-      // LayerScale1 + residual: currentTokens = currentTokens + ls1.gamma * projOutBuf
-      this._encodeLayerScaleResidual(encoder, projOutBuf, currentTokens, lsOutBuf, weights, `encoder.backbone.blocks.${l}.ls1`, T, D);
-      // Swap: lsOutBuf becomes current tokens
-      [currentTokens] = [lsOutBuf];
+      // LayerScale1 + residual: output = currentTokens + ls1.gamma * projOutBuf
+      // Write to the OTHER buffer to avoid read/write race
+      const attnResidualOut = (currentTokens === tokenBufA) ? tokenBufB : tokenBufA;
+      this._encodeLayerScaleResidual(encoder, projOutBuf, currentTokens, attnResidualOut, weights, `encoder.backbone.blocks.${l}.ls1`, T, D);
+      currentTokens = attnResidualOut;
 
       // LayerNorm2
       this._encodeLayerNorm(encoder, currentTokens, normBuf, weights, `encoder.backbone.blocks.${l}.norm2`, N);
@@ -147,10 +150,10 @@ export class DINOv2Backbone {
       this._encodeLinearGelu(encoder, normBuf, hiddenBuf, weights, `encoder.backbone.blocks.${l}.mlp.fc1`, N, D, VIT_CONFIG.mlpHiddenDim);
       this._encodeLinear(encoder, hiddenBuf, ffnOutBuf, weights, `encoder.backbone.blocks.${l}.mlp.fc2`, N, VIT_CONFIG.mlpHiddenDim, D);
 
-      // LayerScale2 + residual
-      const newTokenBuf = createEmptyBuffer(device, T * 4);
-      this._encodeLayerScaleResidual(encoder, ffnOutBuf, currentTokens, newTokenBuf, weights, `encoder.backbone.blocks.${l}.ls2`, T, D);
-      currentTokens = newTokenBuf;
+      // LayerScale2 + residual: write to the other buffer
+      const ffnResidualOut = (currentTokens === tokenBufA) ? tokenBufB : tokenBufA;
+      this._encodeLayerScaleResidual(encoder, ffnOutBuf, currentTokens, ffnResidualOut, weights, `encoder.backbone.blocks.${l}.ls2`, T, D);
+      currentTokens = ffnResidualOut;
 
       // Capture intermediate features at specified layers
       if (VIT_CONFIG.intermediateLayers.includes(l)) {
