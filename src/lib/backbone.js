@@ -172,13 +172,20 @@ export class DINOv2Backbone {
     for (let i = 0; i < intermediateFeatures.length; i++) {
       const { buffer: snapBuf } = intermediateFeatures[i];
 
-      // Upstream flow:
-      //   feat [N, D] → skip CLS → [numPatches, D] → permute → [D, numPatches]
-      //   → unflatten → [D, tokenH, tokenW] → 1x1 conv → [D, tokenH, tokenW]
+      // Upstream flow (from get_intermediate_layers):
+      //   1. Apply backbone final LayerNorm to intermediate block output
+      //   2. Strip CLS token → [numPatches, D]
+      //   3. Permute → [D, numPatches]
+      //   4. Unflatten → [D, tokenH, tokenW]
+      //   5. 1x1 conv projection → [D, tokenH, tokenW]
       //
-      // Step 1: Linear projection on [numPatches, D] → [numPatches, D]
+      // Step 0: Apply backbone final norm to snapshot
+      const normedBuf = createEmptyBuffer(device, T * 4);
+      this._encodeLayerNorm(encoder, snapBuf, normedBuf, weights, 'encoder.backbone.norm', N);
+
+      // Step 1: Linear projection on [numPatches, D] → [numPatches, D] (skip CLS via offset)
       const projBuf = createEmptyBuffer(device, D * numPatches * 4);
-      this._encodeOutputProjection(encoder, snapBuf, projBuf, weights, i, N, numPatches);
+      this._encodeOutputProjection(encoder, normedBuf, projBuf, weights, i, N, numPatches);
 
       // Step 2: Transpose [numPatches, D] → [D, numPatches] (= [D, tokenH, tokenW] in CHW)
       const transposedBuf = createEmptyBuffer(device, D * numPatches * 4);
@@ -249,8 +256,13 @@ export class DINOv2Backbone {
     // Get weight/bias buffers by name
     const gammaKey = `${prefix}.weight`;
     const betaKey = `${prefix}.bias`;
-    const gamma = weights.encoder.blockWeights?.[gammaKey] || weights.encoder[gammaKey];
-    const beta = weights.encoder.blockWeights?.[betaKey] || weights.encoder[betaKey];
+    let gamma = weights.encoder.blockWeights?.[gammaKey];
+    let beta = weights.encoder.blockWeights?.[betaKey];
+    // Fallback for backbone final norm
+    if (!gamma && prefix === 'encoder.backbone.norm') {
+      gamma = weights.encoder.norm?.weight;
+      beta = weights.encoder.norm?.bias;
+    }
 
     if (!gamma || !beta) {
       console.warn(`Missing LayerNorm weights: ${prefix}`);

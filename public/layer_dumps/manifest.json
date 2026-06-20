@@ -1,0 +1,640 @@
+{
+  "input_normalized": {
+    "shape": [
+      3,
+      518,
+      518
+    ],
+    "dtype": "float32",
+    "range": [
+      -2.1179039478302,
+      2.640000104904175
+    ],
+    "mean": 0.17232847213745117,
+    "std": 1.0950708389282227,
+    "file": "input_normalized.bin",
+    "size_bytes": 3219888
+  },
+  "patch_embed_output": {
+    "shape": [
+      1369,
+      1024
+    ],
+    "dtype": "float32",
+    "range": [
+      -3.5042734146118164,
+      3.145763397216797
+    ],
+    "mean": -0.004271968267858028,
+    "std": 0.12863506376743317,
+    "file": "patch_embed_output.bin",
+    "size_bytes": 5607424
+  },
+  "tokens_after_pos_embed": {
+    "shape": [
+      1370,
+      1024
+    ],
+    "dtype": "float32",
+    "range": [
+      -3.5026605129241943,
+      3.1438565254211426
+    ],
+    "mean": -0.004239298403263092,
+    "std": 0.12880602478981018,
+    "file": "tokens_after_pos_embed.bin",
+    "size_bytes": 5611520
+  },
+  "block_0_output": {
+    "shape": [
+      1370,
+      1024
+    ],
+    "dtype": "float32",
+    "range": [
+      -3.4827818870544434,
+      3.133394718170166
+    ],
+    "mean": -0.004238716326653957,
+    "std": 0.12696309387683868,
+    "file": "block_0_output.bin",
+    "size_bytes": 5611520
+  },
+  "block_5_output": {
+    "shape": [
+      1370,
+      1024
+    ],
+    "dtype": "float32",
+    "range": [
+      -1.703865647315979,
+      0.7848456501960754
+    ],
+    "mean": -0.0060241748578846455,
+    "std": 0.0595582090318203,
+    "file": "block_5_output.bin",
+    "size_bytes": 5611520
+  },
+  "block_11_output": {
+    "shape": [
+      1370,
+      1024
+    ],
+    "dtype": "float32",
+    "range": [
+      -2.292212724685669,
+      2.1775882244110107
+    ],
+    "mean": 0.0008374520693905652,
+    "std": 0.09860429912805557,
+    "file": "block_11_output.bin",
+    "size_bytes": 5611520
+  },
+  "block_17_output": {
+    "shape": [
+      1370,
+      1024
+    ],
+    "dtype": "float32",
+    "range": [
+      -63.486289978027344,
+      98.52957916259766
+    ],
+    "mean": 0.023423727601766586,
+    "std": 0.3784710168838501,
+    "file": "block_17_output.bin",
+    "size_bytes": 5611520
+  },
+  "block_23_output": {
+    "shape": [
+      1370,
+      1024
+    ],
+    "dtype": "float32",
+    "range": [
+      -126.40113830566406,
+      26.822425842285156
+    ],
+    "mean": 0.16148149967193604,
+    "std": 5.903134822845459,
+    "file": "block_23_output.bin",
+    "size_bytes": 5611520
+  },
+  "backbone_final_norm": {
+    "shape": [
+      1370,
+      1024
+    ],
+    "dtype": "float32",
+    "range": [
+      -19.996410369873047,
+      19.08711814880371
+    ],
+    "mean": 0.058057721704244614,
+    "std": 0.8907602429389954,
+    "file": "backbone_final_norm.bin",
+    "size_bytes": 5611520
+  },
+  "intermediate_layer_0_feat": {
+    "shape": [
+      1369,
+      1024
+    ],
+    "dtype": "float32",
+    "range": [
+      -41.942081451416016,
+      70.22406005859375
+    ],
+    "mean": 0.05460415035486221,
+    "std": 2.5427064895629883,
+    "file": "intermediate_layer_0_feat.bin",
+    "size_bytes": 5607424
+  },
+  "intermediate_layer_0_cls": {
+    "shape": [
+      1,
+      1024
+    ],
+    "dtype": "float32",
+    "range": [
+      -71.12787628173828,
+      18.470726013183594
+    ],
+    "mean": -0.11198043078184128,
+    "std": 3.285243511199951,
+    "file": "intermediate_layer_0_cls.bin",
+    "size_bytes": 4096
+  },
+  "intermediate_layer_1_feat": {
+    "shape": [
+      1369,
+      1024
+    ],
+    "dtype": "float32",
+    "range": [
+      -56.06476974487305,
+      69.53158569335938
+    ],
+    "mean": 0.0044242520816624165,
+    "std": 3.04445481300354,
+    "file": "intermediate_layer_1_feat.bin",
+    "size_bytes": 5607424
+  },
+  "intermediate_layer_1_cls": {
+    "shape": [
+      1,
+      1024
+    ],
+    "dtype": "float32",
+    "range": [
+      -57.4250373840332,
+      35.04306411743164
+    ],
+    "mean": -0.1135120838880539,
+    "std": 3.1685287952423096,
+    "file": "intermediate_layer_1_cls.bin",
+    "size_bytes": 4096
+  },
+  "intermediate_layer_2_feat": {
+    "shape": [
+      1369,
+      1024
+    ],
+    "dtype": "float32",
+    "range": [
+      -62.406795501708984,
+      67.29737091064453
+    ],
+    "mean": 0.014096916653215885,
+    "std": 2.707979917526245,
+    "file": "intermediate_layer_2_feat.bin",
+    "size_bytes": 5607424
+  },
+  "intermediate_layer_2_cls": {
+    "shape": [
+      1,
+      1024
+    ],
+    "dtype": "float32",
+    "range": [
+      -24.563459396362305,
+      36.784912109375
+    ],
+    "mean": -0.0033192215487360954,
+    "std": 1.8808358907699585,
+    "file": "intermediate_layer_2_cls.bin",
+    "size_bytes": 4096
+  },
+  "intermediate_layer_3_feat": {
+    "shape": [
+      1369,
+      1024
+    ],
+    "dtype": "float32",
+    "range": [
+      -19.996410369873047,
+      19.08711814880371
+    ],
+    "mean": 0.05808597430586815,
+    "std": 0.8904539942741394,
+    "file": "intermediate_layer_3_feat.bin",
+    "size_bytes": 5607424
+  },
+  "intermediate_layer_3_cls": {
+    "shape": [
+      1,
+      1024
+    ],
+    "dtype": "float32",
+    "range": [
+      -3.4179720878601074,
+      4.851077556610107
+    ],
+    "mean": 0.019377630203962326,
+    "std": 1.2405205965042114,
+    "file": "intermediate_layer_3_cls.bin",
+    "size_bytes": 4096
+  },
+  "output_proj_0": {
+    "shape": [
+      1024,
+      37,
+      37
+    ],
+    "dtype": "float32",
+    "range": [
+      -6.176982402801514,
+      6.617437362670898
+    ],
+    "mean": 0.00040260067908093333,
+    "std": 1.3391878604888916,
+    "file": "output_proj_0.bin",
+    "size_bytes": 5607424
+  },
+  "output_proj_1": {
+    "shape": [
+      1024,
+      37,
+      37
+    ],
+    "dtype": "float32",
+    "range": [
+      -7.954396724700928,
+      7.172176361083984
+    ],
+    "mean": -0.030404552817344666,
+    "std": 1.467419147491455,
+    "file": "output_proj_1.bin",
+    "size_bytes": 5607424
+  },
+  "output_proj_2": {
+    "shape": [
+      1024,
+      37,
+      37
+    ],
+    "dtype": "float32",
+    "range": [
+      -6.662070274353027,
+      8.058401107788086
+    ],
+    "mean": -0.005123043432831764,
+    "std": 1.4416658878326416,
+    "file": "output_proj_2.bin",
+    "size_bytes": 5607424
+  },
+  "output_proj_3": {
+    "shape": [
+      1024,
+      37,
+      37
+    ],
+    "dtype": "float32",
+    "range": [
+      -8.626069068908691,
+      8.860625267028809
+    ],
+    "mean": 0.008233069442212582,
+    "std": 1.735338807106018,
+    "file": "output_proj_3.bin",
+    "size_bytes": 5607424
+  },
+  "encoder_features_sum": {
+    "shape": [
+      1024,
+      37,
+      37
+    ],
+    "dtype": "float32",
+    "range": [
+      -15.49908447265625,
+      15.319117546081543
+    ],
+    "mean": -0.02689192444086075,
+    "std": 2.5959768295288086,
+    "file": "encoder_features_sum.bin",
+    "size_bytes": 5607424
+  },
+  "cls_token_final": {
+    "shape": [
+      1,
+      1024
+    ],
+    "dtype": "float32",
+    "range": [
+      -3.4179720878601074,
+      4.851077556610107
+    ],
+    "mean": 0.019377630203962326,
+    "std": 1.2405205965042114,
+    "file": "cls_token_final.bin",
+    "size_bytes": 4096
+  },
+  "neck_input_0": {
+    "shape": [
+      1026,
+      37,
+      37
+    ],
+    "dtype": "float32",
+    "range": [
+      -15.49908447265625,
+      15.319117546081543
+    ],
+    "mean": -0.02683950401842594,
+    "std": 2.593508005142212,
+    "file": "neck_input_0.bin",
+    "size_bytes": 5618376
+  },
+  "neck_input_1": {
+    "shape": [
+      2,
+      74,
+      74
+    ],
+    "dtype": "float32",
+    "range": [
+      -0.6975513100624084,
+      0.6975513100624084
+    ],
+    "mean": -1.1145938394463428e-08,
+    "std": 0.40821102261543274,
+    "file": "neck_input_1.bin",
+    "size_bytes": 43808
+  },
+  "neck_input_2": {
+    "shape": [
+      2,
+      148,
+      148
+    ],
+    "dtype": "float32",
+    "range": [
+      -0.7023290395736694,
+      0.7023290395736694
+    ],
+    "mean": 0.0,
+    "std": 0.4082389771938324,
+    "file": "neck_input_2.bin",
+    "size_bytes": 175232
+  },
+  "neck_input_3": {
+    "shape": [
+      2,
+      296,
+      296
+    ],
+    "dtype": "float32",
+    "range": [
+      -0.7047179341316223,
+      0.7047179341316223
+    ],
+    "mean": -1.6718907147605933e-08,
+    "std": 0.4082459509372711,
+    "file": "neck_input_3.bin",
+    "size_bytes": 700928
+  },
+  "neck_input_4": {
+    "shape": [
+      2,
+      592,
+      592
+    ],
+    "dtype": "float32",
+    "range": [
+      -0.7059123516082764,
+      0.7059123516082764
+    ],
+    "mean": 0.0,
+    "std": 0.408247709274292,
+    "file": "neck_input_4.bin",
+    "size_bytes": 2803712
+  },
+  "neck_output_0": {
+    "shape": [
+      1024,
+      37,
+      37
+    ],
+    "dtype": "float32",
+    "range": [
+      -19.969863891601562,
+      21.683364868164062
+    ],
+    "mean": -0.01603255607187748,
+    "std": 2.222351551055908,
+    "file": "neck_output_0.bin",
+    "size_bytes": 5607424
+  },
+  "neck_output_1": {
+    "shape": [
+      256,
+      74,
+      74
+    ],
+    "dtype": "float32",
+    "range": [
+      -19.511199951171875,
+      21.278043746948242
+    ],
+    "mean": -0.418089896440506,
+    "std": 2.3876030445098877,
+    "file": "neck_output_1.bin",
+    "size_bytes": 5607424
+  },
+  "neck_output_2": {
+    "shape": [
+      128,
+      148,
+      148
+    ],
+    "dtype": "float32",
+    "range": [
+      -3.478302240371704,
+      3.0770792961120605
+    ],
+    "mean": 0.0007162393885664642,
+    "std": 0.6208126544952393,
+    "file": "neck_output_2.bin",
+    "size_bytes": 11214848
+  },
+  "neck_output_3": {
+    "shape": [
+      64,
+      296,
+      296
+    ],
+    "dtype": "float32",
+    "range": [
+      -1.2329059839248657,
+      0.8305240869522095
+    ],
+    "mean": -0.004411946050822735,
+    "std": 0.17322082817554474,
+    "file": "neck_output_3.bin",
+    "size_bytes": 22429696
+  },
+  "neck_output_4": {
+    "shape": [
+      32,
+      592,
+      592
+    ],
+    "dtype": "float32",
+    "range": [
+      -1.5304068326950073,
+      1.1434022188186646
+    ],
+    "mean": -0.1341119110584259,
+    "std": 0.42913109064102173,
+    "file": "neck_output_4.bin",
+    "size_bytes": 44859392
+  },
+  "points_head_output_0": {
+    "shape": [
+      1024,
+      37,
+      37
+    ],
+    "dtype": "float32",
+    "range": [
+      -20.522319793701172,
+      22.94676971435547
+    ],
+    "mean": 0.0114256851375103,
+    "std": 1.7483563423156738,
+    "file": "points_head_output_0.bin",
+    "size_bytes": 5607424
+  },
+  "points_head_output_1": {
+    "shape": [
+      256,
+      74,
+      74
+    ],
+    "dtype": "float32",
+    "range": [
+      -19.65200424194336,
+      20.697879791259766
+    ],
+    "mean": -0.12056603282690048,
+    "std": 2.97123384475708,
+    "file": "points_head_output_1.bin",
+    "size_bytes": 5607424
+  },
+  "points_head_output_2": {
+    "shape": [
+      128,
+      148,
+      148
+    ],
+    "dtype": "float32",
+    "range": [
+      -8.639395713806152,
+      9.794757843017578
+    ],
+    "mean": -0.14609409868717194,
+    "std": 0.7934560775756836,
+    "file": "points_head_output_2.bin",
+    "size_bytes": 11214848
+  },
+  "points_head_output_3": {
+    "shape": [
+      64,
+      296,
+      296
+    ],
+    "dtype": "float32",
+    "range": [
+      -1.8003432750701904,
+      2.7190210819244385
+    ],
+    "mean": -0.00023677673016209155,
+    "std": 0.07043889909982681,
+    "file": "points_head_output_3.bin",
+    "size_bytes": 22429696
+  },
+  "points_head_output_4": {
+    "shape": [
+      3,
+      592,
+      592
+    ],
+    "dtype": "float32",
+    "range": [
+      -0.4189422130584717,
+      0.7233748435974121
+    ],
+    "mean": 0.07904786616563797,
+    "std": 0.2631818354129791,
+    "file": "points_head_output_4.bin",
+    "size_bytes": 4205568
+  },
+  "points_raw_final": {
+    "shape": [
+      3,
+      592,
+      592
+    ],
+    "dtype": "float32",
+    "range": [
+      -0.4189422130584717,
+      0.7233748435974121
+    ],
+    "mean": 0.07904786616563797,
+    "std": 0.2631818354129791,
+    "file": "points_raw_final.bin",
+    "size_bytes": 4205568
+  },
+  "points_remapped": {
+    "shape": [
+      518,
+      518,
+      3
+    ],
+    "dtype": "float32",
+    "range": [
+      -0.6421219110488892,
+      2.028978109359741
+    ],
+    "mean": 0.42257261276245117,
+    "std": 0.7041988372802734,
+    "file": "points_remapped.bin",
+    "size_bytes": 3219888
+  },
+  "depth_final": {
+    "shape": [
+      518,
+      518
+    ],
+    "dtype": "float32",
+    "range": [
+      0.8044707775115967,
+      2.028978109359741
+    ],
+    "mean": 1.3082541227340698,
+    "std": 0.37191709876060486,
+    "file": "depth_final.bin",
+    "size_bytes": 1073296
+  }
+}
