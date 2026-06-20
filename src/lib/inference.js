@@ -372,10 +372,10 @@ export class MoGeInference {
     const encoderDim = MODEL_CONFIG.encoder.dimOut;
 
     // Determine token grid size
-    // MoGe-2 uses num_tokens to determine resolution: sqrt(num_tokens) ≈ tokenH = tokenW
-    const numTokens = 2400; // default resolution level 9
-    const tokenH = Math.round(Math.sqrt(numTokens));
-    const tokenW = Math.round(Math.sqrt(numTokens));
+    // Use 37x37 to match the pretrained position embedding grid (1370 tokens = 1 CLS + 37*37)
+    // This avoids needing position embedding interpolation for now
+    const tokenH = 37;
+    const tokenW = 37;
 
     // --- Encoder ---
     let encoderData;

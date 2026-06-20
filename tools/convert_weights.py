@@ -73,8 +73,30 @@ def convert(checkpoint: dict, output_path: str, dtype: str = "fp32"):
     dtype_code = 0 if dtype == "fp32" else 1
     np_dtype = np.float32 if dtype == "fp32" else np.float16
 
+    # Linear weight names that need transposition from [out, in] to [in, out]
+    # This covers all backbone linear projections and scale_head MLP
+    LINEAR_WEIGHT_SUFFIXES = (
+        'attn.qkv.weight', 'attn.proj.weight',
+        'mlp.fc1.weight', 'mlp.fc2.weight',
+        'mlp.w12.weight', 'mlp.w3.weight',  # SwiGLU variant
+    )
+    SCALE_HEAD_WEIGHTS = ('scale_head.0.weight', 'scale_head.2.weight', 'scale_head.4.weight')
+    OUTPUT_PROJ_PATTERN = 'output_projections'  # 1x1 conv stored as [out, in, 1, 1]
+
     for name, tensor in sorted(state_dict.items()):
-        arr = tensor.detach().float().numpy().astype(np_dtype)
+        arr = tensor.detach().float().numpy()
+
+        # Transpose 2D linear weights: PyTorch [out, in] → shader [in, out]
+        is_linear = any(name.endswith(s) for s in LINEAR_WEIGHT_SUFFIXES)
+        is_scale_head = name in SCALE_HEAD_WEIGHTS
+        if (is_linear or is_scale_head) and arr.ndim == 2:
+            arr = arr.T.copy()
+
+        # Output projections are [out, in, 1, 1] — reshape to [in, out] and transpose
+        if OUTPUT_PROJ_PATTERN in name and name.endswith('.weight') and arr.ndim == 4:
+            arr = arr.squeeze(-1).squeeze(-1).T.copy()
+
+        arr = arr.astype(np_dtype)
         data = arr.tobytes()
 
         shape = list(arr.shape)
