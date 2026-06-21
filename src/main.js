@@ -57,14 +57,13 @@ async function handleImage(file) {
     setStatus('Loading image...');
     const bitmap = await createImageBitmap(file);
 
-    // Resize to model input size (224x224 for now)
-    const inputSize = 224;
+    // Pass original image to inference — run() handles resize to model input size
     const inputCanvas = document.getElementById('input-canvas');
-    inputCanvas.width = inputSize;
-    inputCanvas.height = inputSize;
+    inputCanvas.width = bitmap.width;
+    inputCanvas.height = bitmap.height;
     const ctx = inputCanvas.getContext('2d');
-    ctx.drawImage(bitmap, 0, 0, inputSize, inputSize);
-    const imageData = ctx.getImageData(0, 0, inputSize, inputSize);
+    ctx.drawImage(bitmap, 0, 0);
+    const imageData = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
 
     if (!inference) {
       inference = new MoGeInference(gpu);
