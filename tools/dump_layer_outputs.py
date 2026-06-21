@@ -115,8 +115,35 @@ def main():
 
         # Run blocks and capture intermediates
         for i, block in enumerate(backbone.blocks):
+            # Detailed sub-block dumps for block 0
+            if i == 0:
+                # norm1
+                norm1_out = block.norm1(x)
+                save_tensor(output_dir, "block_0_norm1", norm1_out[0], manifest)
+                # QKV
+                qkv = block.attn.qkv(norm1_out)
+                save_tensor(output_dir, "block_0_qkv", qkv[0], manifest)
+                # Attention output (full attn forward on norm1 output)
+                attn_out = block.attn(norm1_out)
+                save_tensor(output_dir, "block_0_attn_out", attn_out[0], manifest)
+                # After ls1 + residual
+                ls1_out = x + block.ls1(attn_out)
+                save_tensor(output_dir, "block_0_after_ls1", ls1_out[0], manifest)
+                # norm2
+                norm2_out = block.norm2(ls1_out)
+                save_tensor(output_dir, "block_0_norm2", norm2_out[0], manifest)
+                # MLP
+                mlp_out = block.mlp(norm2_out)
+                save_tensor(output_dir, "block_0_mlp_out", mlp_out[0], manifest)
+                # fc1 intermediate (before GELU)
+                fc1_pre = block.mlp.fc1(norm2_out)
+                save_tensor(output_dir, "block_0_fc1_pre_gelu", fc1_pre[0], manifest)
+                # fc1 after GELU
+                fc1_post = block.mlp.act(fc1_pre)
+                save_tensor(output_dir, "block_0_fc1_post_gelu", fc1_post[0], manifest)
+
             x = block(x)
-            if i in [0, 5, 11, 17, 23]:
+            if i in [0, 1, 2, 3, 4, 5, 11, 12, 13, 14, 15, 16, 17, 23]:
                 save_tensor(output_dir, f"block_{i}_output", x[0], manifest)
 
         # Final norm

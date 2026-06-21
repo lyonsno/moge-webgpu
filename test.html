@@ -1,0 +1,800 @@
+<!DOCTYPE html>
+<html>
+<head><title>Backbone Compare</title></head>
+<body>
+<pre id="output" style="font-family: monospace; font-size: 13px; padding: 1rem;"></pre>
+<script type="module">
+import { initGPU } from './src/lib/gpu.js';
+import { MoGeInference } from './src/lib/inference.js';
+
+const out = document.getElementById('output');
+function log(msg) { out.textContent += msg + '\n'; console.log(msg); }
+
+async function run() {
+  try {
+    log('Browser: ' + navigator.userAgent.split(' ').slice(-2).join(' '));
+    log('WebGPU: ' + (navigator.gpu ? 'available' : 'NOT AVAILABLE'));
+    log('Initializing WebGPU...');
+    const gpu = await initGPU();
+    log('GPU ready.');
+
+    const inference = new MoGeInference(gpu);
+    log('Loading weights...');
+    await inference.init((recv, total) => {
+      const pct = total > 0 ? Math.floor(recv / total * 100) : '?';
+      document.title = `Loading ${pct}%`;
+    });
+    log('Weights loaded.');
+
+    // Check how many tokens have large errors at each block
+    // CPU verification: read GPU buffers back and compute fc1[625,573] on CPU
+    log('CPU verification of fc1[625,573]...');
+    try {
+      const { readBuffer: rb, createStorageBuffer: csb, createEmptyBuffer: ceb } = await import('./src/lib/gpu.js');
+      const dev = gpu.device;
+      const D = 1024, N = 1370;
+
+      // Get the norm2 output from backbone block 0
+      const imgResp = await fetch('/layer_dumps/input_normalized.bin');
+      const imgBuf = csb(dev, new Float32Array(await imgResp.arrayBuffer()));
+      const T = N * D;
+      const tokA = ceb(dev, T * 4), tokB = ceb(dev, T * 4);
+      const normBuf = ceb(dev, T * 4);
+      const qBuf = ceb(dev, T * 4), kBuf = ceb(dev, T * 4), vBuf = ceb(dev, T * 4);
+      const qkvBuf = ceb(dev, N * 3 * D * 4);
+      const scoreBuf = ceb(dev, 16 * N * N * 4);
+      const attnOutBuf = ceb(dev, T * 4), projOutBuf = ceb(dev, T * 4);
+      const bb = inference.backbone, w = inference.weights;
+
+      let enc = dev.createCommandEncoder();
+      bb._encodePatchEmbed(enc, imgBuf, w, tokA, 37, 37);
+      dev.queue.submit([enc.finish()]);
+
+      enc = dev.createCommandEncoder();
+      bb._encodeLayerNorm(enc, tokA, normBuf, w, 'encoder.backbone.blocks.0.norm1', N);
+      bb._encodeQKV(enc, normBuf, qBuf, kBuf, vBuf, w, 0, N, qkvBuf);
+      bb._encodeAttnScores(enc, qBuf, kBuf, scoreBuf, N);
+      bb._encodeAttnSoftmax(enc, scoreBuf, N);
+      bb._encodeAttnApply(enc, scoreBuf, vBuf, attnOutBuf, N);
+      bb._encodeLinear(enc, attnOutBuf, projOutBuf, w, 'encoder.backbone.blocks.0.attn.proj', N, D, D);
+      bb._encodeLayerScaleResidual(enc, projOutBuf, tokA, tokB, w, 'encoder.backbone.blocks.0.ls1', T, D);
+      bb._encodeLayerNorm(enc, tokB, normBuf, w, 'encoder.backbone.blocks.0.norm2', N);
+      dev.queue.submit([enc.finish()]);
+
+      // Read norm2 for token 625 and fc1 weight column 573
+      const norm2 = await rb(dev, normBuf, T * 4);
+      const fc1wBuf = w.encoder.blockWeights['encoder.backbone.blocks.0.mlp.fc1.weight'];
+      const fc1bBuf = w.encoder.blockWeights['encoder.backbone.blocks.0.mlp.fc1.bias'];
+      const fc1w = await rb(dev, fc1wBuf, fc1wBuf.size);
+      const fc1b = await rb(dev, fc1bBuf, fc1bBuf.size);
+
+      // Compute dot product on CPU: norm2[625, :] · fc1w[:, 573] + fc1b[573]
+      let cpuVal = fc1b[573];
+      for (let k = 0; k < D; k++) {
+        cpuVal += norm2[625 * D + k] * fc1w[k * 4096 + 573];
+      }
+      log(`  CPU fc1[625,573] = ${cpuVal} (before GELU)`);
+      log(`  CPU isNaN: ${isNaN(cpuVal)}, isFinite: ${isFinite(cpuVal)}`);
+
+      // Now run fc1 on GPU and read back
+      const hidBuf = ceb(dev, N * 4096 * 4);
+      enc = dev.createCommandEncoder();
+      bb._encodeLinearGelu(enc, normBuf, hidBuf, w, 'encoder.backbone.blocks.0.mlp.fc1', N, D, 4096);
+      dev.queue.submit([enc.finish()]);
+      const fc1gpu = await rb(dev, hidBuf, N * 4096 * 4);
+      log(`  GPU fc1[625,573] = ${fc1gpu[625 * 4096 + 573]} (after GELU+guard)`);
+
+      // Check a few neighboring values
+      for (const col of [571, 572, 573, 574, 575]) {
+        let cv = fc1b[col];
+        for (let k = 0; k < D; k++) cv += norm2[625*D+k] * fc1w[k*4096+col];
+        const gv = fc1gpu[625*4096+col];
+        log(`    col ${col}: CPU=${cv.toFixed(6)} GPU=${gv.toFixed(6)} ${isNaN(gv) ? 'NaN!' : ''}`);
+      }
+
+      imgBuf.destroy(); tokA.destroy(); tokB.destroy(); normBuf.destroy();
+      qBuf.destroy(); kBuf.destroy(); vBuf.destroy(); qkvBuf.destroy();
+      scoreBuf.destroy(); attnOutBuf.destroy(); projOutBuf.destroy(); hidBuf.destroy();
+    } catch(e) { log('  CPU verification error: ' + e.message); }
+
+    // GPU debug: compute fc1[625,573] with a minimal debug shader
+    log('GPU debug shader for fc1[625,573]...');
+    try {
+      const dev = gpu.device;
+      const { readBuffer: rb, createStorageBuffer: csb, createEmptyBuffer: ceb } = await import('./src/lib/gpu.js');
+
+      // Get norm2 and fc1 weight/bias buffers (same as above, reuse if possible)
+      const imgResp2 = await fetch('/layer_dumps/input_normalized.bin');
+      const imgBuf2 = csb(dev, new Float32Array(await imgResp2.arrayBuffer()));
+      const D = 1024, N = 1370, T = N * D;
+      const tokA2 = ceb(dev, T*4), tokB2 = ceb(dev, T*4), normBuf2 = ceb(dev, T*4);
+      const qB2 = ceb(dev, T*4), kB2 = ceb(dev, T*4), vB2 = ceb(dev, T*4);
+      const qkvB2 = ceb(dev, N*3*D*4), scB2 = ceb(dev, 16*N*N*4);
+      const aoB2 = ceb(dev, T*4), poB2 = ceb(dev, T*4);
+      const bb = inference.backbone, ww = inference.weights;
+
+      let enc2 = dev.createCommandEncoder();
+      bb._encodePatchEmbed(enc2, imgBuf2, ww, tokA2, 37, 37);
+      dev.queue.submit([enc2.finish()]);
+      enc2 = dev.createCommandEncoder();
+      bb._encodeLayerNorm(enc2, tokA2, normBuf2, ww, 'encoder.backbone.blocks.0.norm1', N);
+      bb._encodeQKV(enc2, normBuf2, qB2, kB2, vB2, ww, 0, N, qkvB2);
+      bb._encodeAttnScores(enc2, qB2, kB2, scB2, N);
+      bb._encodeAttnSoftmax(enc2, scB2, N);
+      bb._encodeAttnApply(enc2, scB2, vB2, aoB2, N);
+      bb._encodeLinear(enc2, aoB2, poB2, ww, 'encoder.backbone.blocks.0.attn.proj', N, D, D);
+      bb._encodeLayerScaleResidual(enc2, poB2, tokA2, tokB2, ww, 'encoder.backbone.blocks.0.ls1', T, D);
+      bb._encodeLayerNorm(enc2, tokB2, normBuf2, ww, 'encoder.backbone.blocks.0.norm2', N);
+      dev.queue.submit([enc2.finish()]);
+
+      // Debug shader: replicate exact linear_gelu logic at workgroup_size(256)
+      const debugShader = dev.createShaderModule({ code: `
+        struct Params { numRows: u32, inDim: u32, outDim: u32, numWorkgroupsX: u32 }
+        @group(0) @binding(0) var<uniform> params: Params;
+        @group(0) @binding(1) var<storage, read> input: array<f32>;
+        @group(0) @binding(2) var<storage, read> weight: array<f32>;
+        @group(0) @binding(3) var<storage, read> bias: array<f32>;
+        @group(0) @binding(4) var<storage, read_write> output: array<f32>;
+        @group(0) @binding(5) var<storage, read_write> debug: array<f32>;
+
+        @compute @workgroup_size(256)
+        fn main(@builtin(workgroup_id) wgid: vec3u, @builtin(local_invocation_id) lid: vec3u) {
+          let linearWG = wgid.x + wgid.y * params.numWorkgroupsX;
+          let idx = linearWG * 256u + lid.x;
+          if (idx >= params.numRows * params.outDim) { return; }
+
+          let row = idx / params.outDim;
+          let col = idx % params.outDim;
+
+          var val = bias[col];
+          for (var k = 0u; k < params.inDim; k++) {
+            val += input[row * params.inDim + k] * weight[k * params.outDim + col];
+          }
+          output[idx] = val;
+
+          // Debug: capture specific element
+          if (row == 625u && col == 573u) {
+            debug[0] = val;
+            debug[1] = f32(row);
+            debug[2] = f32(col);
+            debug[3] = f32(idx);
+            debug[4] = input[row * params.inDim]; // input[625,0]
+            debug[5] = weight[573]; // weight[0,573]
+            debug[6] = bias[col];
+          }
+        }
+      `});
+      const debugPipeline = dev.createComputePipeline({
+        layout: 'auto',
+        compute: { module: debugShader, entryPoint: 'main' }
+      });
+
+      // Full-size output buffer + debug buffer
+      const N_out = N * 4096;
+      const debugFullOut = ceb(dev, N_out * 4);
+      const debugInfo = ceb(dev, 64 * 4);
+      const fc1wBuf = ww.encoder.blockWeights['encoder.backbone.blocks.0.mlp.fc1.weight'];
+      const fc1bBuf = ww.encoder.blockWeights['encoder.backbone.blocks.0.mlp.fc1.bias'];
+
+      // Params: [numRows=1370, inDim=1024, outDim=4096, wgX=21920]
+      const totalWG = Math.ceil(N_out / 256);
+      const dbgParams = dev.createBuffer({
+        size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, mappedAtCreation: true
+      });
+      new Uint32Array(dbgParams.getMappedRange()).set([N, D, 4096, totalWG]);
+      dbgParams.unmap();
+
+      const debugBG = dev.createBindGroup({
+        layout: debugPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: dbgParams } },
+          { binding: 1, resource: { buffer: normBuf2 } },
+          { binding: 2, resource: { buffer: fc1wBuf } },
+          { binding: 3, resource: { buffer: fc1bBuf } },
+          { binding: 4, resource: { buffer: debugFullOut } },
+          { binding: 5, resource: { buffer: debugInfo } },
+        ]
+      });
+
+      enc2 = dev.createCommandEncoder();
+      const pass = enc2.beginComputePass();
+      pass.setPipeline(debugPipeline);
+      pass.setBindGroup(0, debugBG);
+      pass.dispatchWorkgroups(totalWG, 1);
+      pass.end();
+      dev.queue.submit([enc2.finish()]);
+
+      const dbgInfoData = await rb(dev, debugInfo, 64 * 4);
+      log(`  Debug shader (WG256, full dispatch):`);
+      log(`    val=${dbgInfoData[0]} row=${dbgInfoData[1]} col=${dbgInfoData[2]} idx=${dbgInfoData[3]}`);
+      log(`    input[625,0]=${dbgInfoData[4]} weight[0,573]=${dbgInfoData[5]} bias[573]=${dbgInfoData[6]}`);
+      log(`    isNaN(val): ${isNaN(dbgInfoData[0])}`);
+
+      // Also check the full output at position [625, 573]
+      const dbgFullData = await rb(dev, debugFullOut, N_out * 4);
+      const targetIdx = 625 * 4096 + 573;
+      log(`    fullOut[625,573]=${dbgFullData[targetIdx]} isNaN=${isNaN(dbgFullData[targetIdx])}`);
+
+      // Count NaN in full output
+      let dbgNanCount = 0;
+      for (let i = 0; i < dbgFullData.length; i++) if (isNaN(dbgFullData[i])) dbgNanCount++;
+      log(`    Total NaN in debug full output: ${dbgNanCount}`);
+
+      // Compare with CPU readback
+      const norm2cpu = await rb(dev, normBuf2, T * 4);
+      const fc1wcpu = await rb(dev, fc1wBuf, fc1wBuf.size);
+      log(`  CPU input[625,0:4]: ${Array.from(norm2cpu.slice(625*1024, 625*1024+4)).map(v => v.toFixed(4)).join(', ')}`);
+      log(`  CPU weight[0:4,573]: ${[0,1,2,3].map(k => fc1wcpu[k*4096+573].toFixed(4)).join(', ')}`);
+
+      debugFullOut.destroy(); debugInfo.destroy(); dbgParams.destroy();
+
+      imgBuf2.destroy(); tokA2.destroy(); tokB2.destroy(); normBuf2.destroy();
+      qB2.destroy(); kB2.destroy(); vB2.destroy(); qkvB2.destroy();
+      scB2.destroy(); aoB2.destroy(); poB2.destroy(); debugOut.destroy();
+    } catch(e) { log('  Debug shader error: ' + e.message); }
+
+    // Compare intermediate layer features and output projections
+    log('Intermediate layer comparison...');
+    try {
+      const { readBuffer: rb, createStorageBuffer: csb, createEmptyBuffer: ceb } = await import('./src/lib/gpu.js');
+      const dev = gpu.device;
+      const D = 1024, N = 1370, numPatches = 1369, T = N * D;
+
+      // Run backbone
+      const imgResp3 = await fetch('/layer_dumps/input_normalized.bin');
+      const imgBuf3 = csb(dev, new Float32Array(await imgResp3.arrayBuffer()));
+      const enc3 = dev.createCommandEncoder();
+      const bbResult = inference.backbone.encode(enc3, imgBuf3, inference.weights, 37, 37);
+      dev.queue.submit([enc3.finish()]);
+
+      // Read encoder features sum
+      const featGpu = await rb(dev, bbResult.featureBuf, D * numPatches * 4);
+      const featRefResp = await fetch('/layer_dumps/encoder_features_sum.bin');
+      const featRef = new Float32Array(await featRefResp.arrayBuffer());
+
+      // Compare raw snapshots against block outputs
+      for (let i = 0; i < bbResult._debugSnaps.length; i++) {
+        const snap = bbResult._debugSnaps[i];
+        const snapData = await rb(dev, snap.buffer, T * 4);
+        const refResp = await fetch(`/layer_dumps/block_${snap.layerIdx}_output.bin`);
+        if (!refResp.ok) continue;
+        const refData = new Float32Array(await refResp.arrayBuffer());
+        let maxErr = 0, sumSq = 0;
+        for (let j = 0; j < Math.min(snapData.length, refData.length); j++) {
+          const err = Math.abs(snapData[j] - refData[j]);
+          sumSq += err * err;
+          if (err > maxErr) maxErr = err;
+        }
+        log(`  Snap ${i} (block ${snap.layerIdx}): maxErr=${maxErr.toFixed(4)} rmsErr=${Math.sqrt(sumSq/refData.length).toFixed(6)}`);
+      }
+
+      // Compare individual output projections
+      // Our backbone snaps at layers [5,11,17,23] → indices 0,1,2,3
+      // Each snap gets: LayerNorm → LinearProjection (skip CLS) → Transpose → sum
+      for (let i = 0; i < bbResult._debugSnaps.length; i++) {
+        const snap = bbResult._debugSnaps[i];
+        const snapData = await rb(dev, snap.buffer, T * 4);
+
+        // Compare against intermediate_layer_i_feat (which is after LayerNorm, CLS stripped)
+        const refFeatResp = await fetch(`/layer_dumps/intermediate_layer_${i}_feat.bin`);
+        if (!refFeatResp.ok) continue;
+        const refFeat = new Float32Array(await refFeatResp.arrayBuffer()); // [numPatches, D]
+
+        // Our snap is [N, D] including CLS. After LayerNorm + CLS strip = [numPatches, D]
+        // We can't directly compare the snap (pre-LayerNorm) against the ref (post-LayerNorm)
+        // But we can compare the output projection result
+
+        const refProjResp = await fetch(`/layer_dumps/output_proj_${i}.bin`);
+        if (!refProjResp.ok) continue;
+        const refProj = new Float32Array(await refProjResp.arrayBuffer()); // [D, tokenH, tokenW] CHW
+
+        // Run just the projection on our snap
+        const normedBuf = ceb(dev, T * 4);
+        const projBuf = ceb(dev, D * numPatches * 4);
+        const transposedBuf = ceb(dev, D * numPatches * 4);
+        const enc4 = dev.createCommandEncoder();
+        inference.backbone._encodeLayerNorm(enc4, snap.buffer, normedBuf, inference.weights, 'encoder.backbone.norm', N);
+        inference.backbone._encodeOutputProjection(enc4, normedBuf, projBuf, inference.weights, i, N, numPatches);
+        inference.backbone._encodeTranspose(enc4, projBuf, transposedBuf, numPatches, D);
+        dev.queue.submit([enc4.finish()]);
+
+        const projGpu = await rb(dev, transposedBuf, D * numPatches * 4);
+        let maxErr = 0, sumSq = 0;
+        for (let j = 0; j < projGpu.length; j++) {
+          const err = Math.abs(projGpu[j] - refProj[j]);
+          sumSq += err * err;
+          if (err > maxErr) maxErr = err;
+        }
+        log(`  Proj ${i} (layer ${snap.layerIdx}): maxErr=${maxErr.toFixed(4)} rmsErr=${Math.sqrt(sumSq/projGpu.length).toFixed(6)}`);
+        normedBuf.destroy(); projBuf.destroy(); transposedBuf.destroy();
+      }
+
+      // Final sum comparison
+      let fMaxErr = 0, fSumSq = 0;
+      for (let j = 0; j < featGpu.length; j++) {
+        const err = Math.abs(featGpu[j] - featRef[j]);
+        fSumSq += err * err;
+        if (err > fMaxErr) fMaxErr = err;
+      }
+      log(`  Features sum: maxErr=${fMaxErr.toFixed(4)} rmsErr=${Math.sqrt(fSumSq/featGpu.length).toFixed(6)}`);
+
+      imgBuf3.destroy();
+    } catch(e) { log('  Intermediate comparison error: ' + e.message); }
+
+    log('Running backbone comparison...');
+    const results = await inference.runBackboneCompare();
+
+    // Detailed error distribution for block 23
+    log('\n--- Error distribution at block 23 ---');
+    try {
+      const { readBuffer: rb, createStorageBuffer: csb, createEmptyBuffer: ceb } = await import('./src/lib/gpu.js');
+      const dev = gpu.device;
+      const tokenH = 37, tokenW = 37, D = 1024, N = 1370;
+
+      // Load reference
+      const refResp = await fetch('/layer_dumps/block_23_output.bin');
+      const ref = new Float32Array(await refResp.arrayBuffer());
+
+      // Run backbone
+      const imgResp = await fetch('/layer_dumps/input_normalized.bin');
+      const imgData = new Float32Array(await imgResp.arrayBuffer());
+      const imgBuf = csb(dev, imgData);
+      const enc = dev.createCommandEncoder();
+      const T = N * D;
+      const { featureBuf, clsTokenBuf, _debugSnaps } = inference.backbone.encode(
+        enc, imgBuf, inference.weights, tokenH, tokenW
+      );
+      dev.queue.submit([enc.finish()]);
+
+      // Read the last snapshot (block 23)
+      if (_debugSnaps && _debugSnaps.length > 0) {
+        const lastSnap = _debugSnaps[_debugSnaps.length - 1];
+        const gpu23 = await rb(dev, lastSnap.buffer, T * 4);
+
+        // Per-token max error
+        const tokenErrors = [];
+        for (let t = 0; t < N; t++) {
+          let maxErr = 0;
+          for (let d = 0; d < D; d++) {
+            const err = Math.abs(gpu23[t * D + d] - ref[t * D + d]);
+            if (err > maxErr) maxErr = err;
+          }
+          tokenErrors.push({ token: t, maxErr });
+        }
+        tokenErrors.sort((a, b) => b.maxErr - a.maxErr);
+
+        log(`  Top 20 worst tokens:`);
+        for (let i = 0; i < 20; i++) {
+          const { token, maxErr } = tokenErrors[i];
+          const row = token === 0 ? 'CLS' : `${Math.floor((token-1)/tokenW)},${(token-1)%tokenW}`;
+          log(`    token ${token} (${row}): maxErr=${maxErr.toFixed(4)}`);
+        }
+
+        // Count tokens by error threshold
+        const thresholds = [0.1, 0.5, 1.0, 5.0, 10.0, 50.0, 100.0];
+        for (const t of thresholds) {
+          const count = tokenErrors.filter(e => e.maxErr > t).length;
+          log(`    tokens with maxErr > ${t}: ${count}`);
+        }
+      }
+
+      // Also check the encoder features sum (final backbone output after projection)
+      const featGpu = await rb(dev, featureBuf, D * tokenH * tokenW * 4);
+      const featRefResp = await fetch('/layer_dumps/encoder_features_sum.bin');
+      const featRef = new Float32Array(await featRefResp.arrayBuffer());
+      let fMaxErr = 0, fSumSq = 0;
+      for (let i = 0; i < featGpu.length; i++) {
+        const err = Math.abs(featGpu[i] - featRef[i]);
+        fSumSq += err * err;
+        if (err > fMaxErr) fMaxErr = err;
+      }
+      log(`  Encoder features sum vs PyTorch: maxErr=${fMaxErr.toFixed(4)} rmsErr=${Math.sqrt(fSumSq/featGpu.length).toFixed(4)}`);
+
+      imgBuf.destroy();
+    } catch(e) { log('  Error distribution check failed: ' + e.message); }
+
+    // Run end-to-end and compare final output against PyTorch reference
+    log('\n--- End-to-end depth comparison ---');
+    try {
+      // Load PyTorch reference image (same BunnyCake used for layer dumps)
+      const refImgResp = await fetch('/layer_dumps/input_normalized.bin');
+      const refImg = new Float32Array(await refImgResp.arrayBuffer());
+
+      // Create a fake ImageData from the normalized input
+      // We need the original RGB image. Use the bunny cake test image.
+      const testImgResp = await fetch('/layer_dumps/depth_final.bin');
+      const refDepth = new Float32Array(await testImgResp.arrayBuffer());
+
+      const pointsResp = await fetch('/layer_dumps/points_raw_final.bin');
+      const refPoints = new Float32Array(await pointsResp.arrayBuffer());
+
+      // Run inference with the reference input image
+      // For now, compare the backbone features → neck → points output
+      // The actual depth depends on the input image matching exactly
+      log(`  Ref depth: shape=[518,518], range=[${Math.min(...refDepth.slice(0,1000)).toFixed(4)}, ${Math.max(...refDepth.slice(0,1000)).toFixed(4)}]`);
+      log(`  Ref points: ${refPoints.length} elements`);
+
+      // Check ref points for even/odd row checkerboard
+      // points_raw_final is [3, 592, 592]
+      const pH = 592, pW = 592;
+      const zCh = refPoints.subarray(2 * pH * pW, 3 * pH * pW); // z channel
+      let evenSum = 0, oddSum = 0, evenN = 0, oddN = 0;
+      for (let y = 10; y < pH - 10; y++) {
+        for (let x = 10; x < pW - 10; x++) {
+          const v = zCh[y * pW + x];
+          if (y % 2 === 0) { evenSum += v; evenN++; } else { oddSum += v; oddN++; }
+        }
+      }
+      log(`  Ref z even rows mean: ${(evenSum/evenN).toFixed(6)}, odd: ${(oddSum/oddN).toFixed(6)}, diff: ${Math.abs(evenSum/evenN - oddSum/oddN).toFixed(6)}`);
+
+      // Check row-to-row derivative pattern
+      let evenDiffSum = 0, oddDiffSum = 0, evenDN = 0, oddDN = 0;
+      for (let y = 10; y < pH - 11; y++) {
+        for (let x = 10; x < pW - 10; x++) {
+          const d = zCh[(y+1) * pW + x] - zCh[y * pW + x];
+          if (y % 2 === 0) { evenDiffSum += d * d; evenDN++; } else { oddDiffSum += d * d; oddDN++; }
+        }
+      }
+      log(`  Ref row-diff RMS: even=${Math.sqrt(evenDiffSum/evenDN).toFixed(6)}, odd=${Math.sqrt(oddDiffSum/oddDN).toFixed(6)}`);
+    } catch (e) {
+      log('  Depth comparison skipped: ' + e.message);
+    }
+
+    // Run decoder with PyTorch neck inputs and compare each level
+    log('\n--- Decoder level-by-level comparison (PyTorch inputs) ---');
+    try {
+      const { createStorageBuffer: csb, readBuffer: rb } = await import('./src/lib/gpu.js');
+      const dev = gpu.device;
+      const tokenH = 37, tokenW = 37;
+
+      // Load PyTorch neck inputs
+      const neckInputs = [];
+      for (let level = 0; level < 5; level++) {
+        const resp = await fetch(`/layer_dumps/neck_input_${level}.bin`);
+        const data = new Float32Array(await resp.arrayBuffer());
+        const h = tokenH * (2 ** level), w = tokenW * (2 ** level);
+        neckInputs.push({ buffer: csb(dev, data), H: h, W: w });
+      }
+
+      // Import decoder dispatch
+      const { default: _ } = await import('./src/lib/inference.js');
+
+      // Run neck through the inference pipeline
+      // We need to access dispatchConvStack — it's not exported, so we'll call inference.run
+      // and intercept. Actually, let's just run the full inference and compare the final output.
+      // The manifest has neck_output_0..4 and points_head_output_0..4
+
+      // Load all neck output references
+      const manifest = await (await fetch('/layer_dumps/manifest.json')).json();
+      for (let level = 0; level < 5; level++) {
+        const key = `neck_output_${level}`;
+        const info = manifest[key];
+        if (!info) continue;
+        const ref = new Float32Array(await (await fetch(`/layer_dumps/${info.file}`)).arrayBuffer());
+        const C = info.shape[0], H = info.shape[1], W = info.shape[2];
+
+        // Check even/odd row derivative pattern
+        let evenDiffSq = 0, oddDiffSq = 0, evenN = 0, oddN = 0;
+        for (let c = 0; c < Math.min(C, 8); c++) {
+          for (let y = 0; y < H - 1; y++) {
+            for (let x = 0; x < W; x++) {
+              const d = ref[c*H*W + (y+1)*W + x] - ref[c*H*W + y*W + x];
+              if (y % 2 === 0) { evenDiffSq += d*d; evenN++; } else { oddDiffSq += d*d; oddN++; }
+            }
+          }
+        }
+        const evenRMS = Math.sqrt(evenDiffSq/evenN);
+        const oddRMS = Math.sqrt(oddDiffSq/oddN);
+        log(`  REF neck_${level} [${C},${H},${W}]: row-diff RMS even=${evenRMS.toFixed(6)} odd=${oddRMS.toFixed(6)} ratio=${(evenRMS/oddRMS).toFixed(4)}`);
+      }
+
+      // Now compare points_head outputs
+      for (let level = 0; level < 5; level++) {
+        const key = `points_head_output_${level}`;
+        const info = manifest[key];
+        if (!info) continue;
+        const ref = new Float32Array(await (await fetch(`/layer_dumps/${info.file}`)).arrayBuffer());
+        const C = info.shape[0], H = info.shape[1], W = info.shape[2];
+
+        let evenDiffSq = 0, oddDiffSq = 0, evenN = 0, oddN = 0;
+        for (let c = 0; c < C; c++) {
+          for (let y = 0; y < H - 1; y++) {
+            for (let x = 0; x < W; x++) {
+              const d = ref[c*H*W + (y+1)*W + x] - ref[c*H*W + y*W + x];
+              if (y % 2 === 0) { evenDiffSq += d*d; evenN++; } else { oddDiffSq += d*d; oddN++; }
+            }
+          }
+        }
+        const evenRMS = Math.sqrt(evenDiffSq/evenN);
+        const oddRMS = Math.sqrt(oddDiffSq/oddN);
+        log(`  REF pts_${level} [${C},${H},${W}]: row-diff RMS even=${evenRMS.toFixed(6)} odd=${oddRMS.toFixed(6)} ratio=${(evenRMS/oddRMS).toFixed(4)}`);
+      }
+
+      // Now run the WebGPU decoder with PyTorch neck inputs and compare
+      log('\n  Running WebGPU decoder with PyTorch inputs...');
+      // We need to trigger the inference path that uses PyTorch neck inputs
+      // Create a dummy imageData to trigger inference.run()
+      const canvas = document.createElement('canvas');
+      canvas.width = 224; canvas.height = 224;
+      const ctx2 = canvas.getContext('2d');
+      ctx2.fillStyle = '#888';
+      ctx2.fillRect(0, 0, 224, 224);
+      const dummyImg = ctx2.getImageData(0, 0, 224, 224);
+
+      // Run inference (will use PyTorch neck inputs since USE_PYTORCH_NECK_INPUTS=true)
+      const result = await inference.run(dummyImg);
+      let dMin = Infinity, dMax = -Infinity;
+      for (let i = 0; i < result.depth.length; i++) { if (result.depth[i] < dMin) dMin = result.depth[i]; if (result.depth[i] > dMax) dMax = result.depth[i]; }
+      log(`  WebGPU output: ${result.width}x${result.height}, depth range [${dMin.toFixed(4)}, ${dMax.toFixed(4)}]`);
+
+      // Check even/odd row derivative pattern in WebGPU depth
+      const dH = result.height, dW = result.width;
+      let wgEvenDiffSq = 0, wgOddDiffSq = 0, wgEN = 0, wgON = 0;
+      for (let y = 10; y < dH - 11; y++) {
+        for (let x = 10; x < dW - 10; x++) {
+          const d = result.depth[(y+1) * dW + x] - result.depth[y * dW + x];
+          if (y % 2 === 0) { wgEvenDiffSq += d*d; wgEN++; } else { wgOddDiffSq += d*d; wgON++; }
+        }
+      }
+      const wgEvenRMS = Math.sqrt(wgEvenDiffSq/wgEN);
+      const wgOddRMS = Math.sqrt(wgOddDiffSq/wgON);
+      log(`  WebGPU depth row-diff: even=${wgEvenRMS.toFixed(6)} odd=${wgOddRMS.toFixed(6)} ratio=${(wgEvenRMS/wgOddRMS).toFixed(4)}`);
+
+      // Compare against PyTorch final depth reference
+      const refDepthResp = await fetch('/layer_dumps/depth_final.bin');
+      const refDepth = new Float32Array(await refDepthResp.arrayBuffer());
+      let refEvenDiffSq = 0, refOddDiffSq = 0, refEN = 0, refON = 0;
+      const rH = 518, rW = 518;
+      for (let y = 10; y < rH - 11; y++) {
+        for (let x = 10; x < rW - 10; x++) {
+          const d = refDepth[(y+1) * rW + x] - refDepth[y * rW + x];
+          if (y % 2 === 0) { refEvenDiffSq += d*d; refEN++; } else { refOddDiffSq += d*d; refON++; }
+        }
+      }
+      const refEvenRMS = Math.sqrt(refEvenDiffSq/refEN);
+      const refOddRMS = Math.sqrt(refOddDiffSq/refON);
+      log(`  PyTorch depth row-diff: even=${refEvenRMS.toFixed(6)} odd=${refOddRMS.toFixed(6)} ratio=${(refEvenRMS/refOddRMS).toFixed(4)}`);
+
+      // Check 3D point positions for checkerboard
+      // result.points is [H*W*3] interleaved: px,py,pz,px,py,pz,...
+      for (const comp of [0, 1, 2]) {
+        let eDiffSq = 0, oDiffSq = 0, eN = 0, oN = 0;
+        for (let y = 10; y < dH - 11; y++) {
+          for (let x = 10; x < dW - 10; x++) {
+            const d = result.points[((y+1)*dW+x)*3+comp] - result.points[(y*dW+x)*3+comp];
+            if (y % 2 === 0) { eDiffSq += d*d; eN++; } else { oDiffSq += d*d; oN++; }
+          }
+        }
+        const eRMS = Math.sqrt(eDiffSq/eN), oRMS = Math.sqrt(oDiffSq/oN);
+        log(`  WebGPU points[${['x','y','z'][comp]}] row-diff: even=${eRMS.toFixed(6)} odd=${oRMS.toFixed(6)} ratio=${(eRMS/oRMS).toFixed(4)}`);
+      }
+
+      // Check raw points (pre-remap) for checkerboard in the CHW output
+      // result.points is already remapped [H*W, 3] interleaved
+      // But the raw points were in CHW [3, H, W] before remap
+      // Let's check the depth (z after exp remap) for row patterns
+      const depth = result.depth; // [H*W] already exp-remapped z
+      let zEvenDiffSq = 0, zOddDiffSq = 0, zEN = 0, zON = 0;
+      for (let y = 10; y < dH - 11; y++) {
+        for (let x = 10; x < dW - 10; x++) {
+          const d = depth[(y+1)*dW+x] - depth[y*dW+x];
+          if (y % 2 === 0) { zEvenDiffSq += d*d; zEN++; } else { zOddDiffSq += d*d; zON++; }
+        }
+      }
+      log(`  WebGPU depth row-diff: even=${Math.sqrt(zEvenDiffSq/zEN).toFixed(6)} odd=${Math.sqrt(zOddDiffSq/zON).toFixed(6)} ratio=${Math.sqrt(zEvenDiffSq/zEN / (zOddDiffSq/zON)).toFixed(4)}`);
+
+      // Check higher frequency patterns in depth
+      for (const period of [2, 4, 8]) {
+        const groups = [];
+        for (let p = 0; p < period; p++) {
+          let sq = 0, n = 0;
+          for (let y = 10; y < dH - 11; y++) {
+            if (y % period !== p) continue;
+            for (let x = 10; x < dW - 10; x++) {
+              const d = depth[(y+1)*dW+x] - depth[y*dW+x];
+              sq += d*d; n++;
+            }
+          }
+          groups.push(Math.sqrt(sq/n));
+        }
+        const ratios = groups.map(g => (g/groups[0]).toFixed(4));
+        log(`  WebGPU depth period-${period}: ${ratios.join(' ')}`);
+      }
+
+      // Recompute normals from points and check
+      // This validates the normal computation itself
+      const reNormals = new Float32Array(3 * dH * dW);
+      const pts = result.points;
+      for (let y = 0; y < dH; y++) {
+        for (let x = 0; x < dW; x++) {
+          const i = y * dW + x;
+          const ir = y * dW + Math.min(x + 1, dW - 1);
+          const ib = Math.min(y + 1, dH - 1) * dW + x;
+          const dxX = pts[ir*3]-pts[i*3], dxY = pts[ir*3+1]-pts[i*3+1], dxZ = pts[ir*3+2]-pts[i*3+2];
+          const dyX = pts[ib*3]-pts[i*3], dyY = pts[ib*3+1]-pts[i*3+1], dyZ = pts[ib*3+2]-pts[i*3+2];
+          let nx = dxY*dyZ-dxZ*dyY, ny = dxZ*dyX-dxX*dyZ, nz = dxX*dyY-dxY*dyX;
+          const len = Math.sqrt(nx*nx+ny*ny+nz*nz)||1;
+          reNormals[i*3]=nx/len; reNormals[i*3+1]=ny/len; reNormals[i*3+2]=nz/len;
+        }
+      }
+
+      // Check if recomputed normals match result.normals
+      let normDiff = 0;
+      for (let i = 0; i < reNormals.length; i++) normDiff += Math.abs(reNormals[i] - result.normals[i]);
+      log(`  Normal recompute diff: ${normDiff.toFixed(6)} (should be ~0)`);
+
+      // Measure checkerboard in recomputed normals
+      let nEvenDiffSq = 0, nOddDiffSq = 0, nEN = 0, nON = 0;
+      for (let y = 10; y < dH - 11; y++) {
+        for (let x = 10; x < dW - 10; x++) {
+          for (let c = 0; c < 3; c++) {
+            const d = reNormals[((y+1)*dW+x)*3+c] - reNormals[(y*dW+x)*3+c];
+            if (y % 2 === 0) { nEvenDiffSq += d*d; nEN++; } else { nOddDiffSq += d*d; nON++; }
+          }
+        }
+      }
+      const nEvenRMS = Math.sqrt(nEvenDiffSq/nEN);
+      const nOddRMS = Math.sqrt(nOddDiffSq/nON);
+      log(`  Recomputed normal row-diff: even=${nEvenRMS.toFixed(6)} odd=${nOddRMS.toFixed(6)} ratio=${(nEvenRMS/nOddRMS).toFixed(4)}`);
+
+      // Also check the returned normals
+      let rEvenDiffSq = 0, rOddDiffSq = 0, rEN = 0, rON = 0;
+      for (let y = 10; y < dH - 11; y++) {
+        for (let x = 10; x < dW - 10; x++) {
+          for (let c = 0; c < 3; c++) {
+            const d = result.normals[((y+1)*dW+x)*3+c] - result.normals[(y*dW+x)*3+c];
+            if (y % 2 === 0) { rEvenDiffSq += d*d; rEN++; } else { rOddDiffSq += d*d; rON++; }
+          }
+        }
+      }
+      log(`  Result normal row-diff: even=${Math.sqrt(rEvenDiffSq/rEN).toFixed(6)} odd=${Math.sqrt(rOddDiffSq/rON).toFixed(6)} ratio=${Math.sqrt(rEvenDiffSq/rEN / (rOddDiffSq/rON)).toFixed(4)}`);
+
+      // Direct point map comparison against PyTorch
+      try {
+        const refPtsResp = await fetch('/layer_dumps/points_raw_final.bin');
+        const refPtsRaw = new Float32Array(await refPtsResp.arrayBuffer()); // [3, 592, 592] CHW
+        // Our pointsRaw is also [3, outH, outW] CHW (before remap)
+        // But we only have the remapped points in result.points
+        // Let's compare the remapped points
+        // PyTorch remap: xy * exp(z), exp(z)
+        const refPts3D = new Float32Array(3 * 592 * 592);
+        for (let i = 0; i < 592 * 592; i++) {
+          const rx = refPtsRaw[0 * 592 * 592 + i];
+          const ry = refPtsRaw[1 * 592 * 592 + i];
+          const rz = refPtsRaw[2 * 592 * 592 + i];
+          const ez = Math.exp(Math.min(rz, 10));
+          refPts3D[i*3] = rx * ez;
+          refPts3D[i*3+1] = ry * ez;
+          refPts3D[i*3+2] = ez;
+        }
+
+        // If our output is same size (592x592), compare directly
+        if (dH === 592 && dW === 592) {
+          let maxErr = 0, sumSq = 0;
+          for (let i = 0; i < pts.length; i++) {
+            const err = Math.abs(pts[i] - refPts3D[i]);
+            sumSq += err * err;
+            if (err > maxErr) maxErr = err;
+          }
+          const rmsErr = Math.sqrt(sumSq / pts.length);
+          log(`  Point map vs PyTorch: maxErr=${maxErr.toFixed(6)} rmsErr=${rmsErr.toFixed(6)}`);
+
+          // Check if the error has a spatial pattern
+          let errEvenSq = 0, errOddSq = 0, errEN = 0, errON = 0;
+          for (let y = 0; y < dH; y++) {
+            for (let x = 0; x < dW; x++) {
+              const i = y * dW + x;
+              const err = Math.abs(pts[i*3+2] - refPts3D[i*3+2]); // z error
+              if (y % 2 === 0) { errEvenSq += err*err; errEN++; } else { errOddSq += err*err; errON++; }
+            }
+          }
+          log(`  Z error even/odd RMS: even=${Math.sqrt(errEvenSq/errEN).toFixed(6)} odd=${Math.sqrt(errOddSq/errON).toFixed(6)} ratio=${Math.sqrt(errEvenSq/errEN / (errOddSq/errON)).toFixed(4)}`);
+        }
+        // Compute normals from PyTorch reference points using same code
+        const refNormals = new Float32Array(3 * 592 * 592);
+        for (let y = 0; y < 592; y++) {
+          for (let x = 0; x < 592; x++) {
+            const i = y * 592 + x;
+            const ir = y * 592 + Math.min(x + 1, 591);
+            const ib = Math.min(y + 1, 591) * 592 + x;
+            const dxX = refPts3D[ir*3]-refPts3D[i*3], dxY = refPts3D[ir*3+1]-refPts3D[i*3+1], dxZ = refPts3D[ir*3+2]-refPts3D[i*3+2];
+            const dyX = refPts3D[ib*3]-refPts3D[i*3], dyY = refPts3D[ib*3+1]-refPts3D[i*3+1], dyZ = refPts3D[ib*3+2]-refPts3D[i*3+2];
+            let nx = dxY*dyZ-dxZ*dyY, ny = dxZ*dyX-dxX*dyZ, nz = dxX*dyY-dxY*dyX;
+            const len = Math.sqrt(nx*nx+ny*ny+nz*nz)||1;
+            refNormals[i*3]=nx/len; refNormals[i*3+1]=ny/len; refNormals[i*3+2]=nz/len;
+          }
+        }
+        let rnEvenSq = 0, rnOddSq = 0, rnEN = 0, rnON = 0;
+        for (let y = 10; y < 581; y++) {
+          for (let x = 10; x < 582; x++) {
+            for (let c = 0; c < 3; c++) {
+              const d = refNormals[((y+1)*592+x)*3+c] - refNormals[(y*592+x)*3+c];
+              if (y % 2 === 0) { rnEvenSq += d*d; rnEN++; } else { rnOddSq += d*d; rnON++; }
+            }
+          }
+        }
+        log(`  PyTorch-ref normal row-diff (same JS code): even=${Math.sqrt(rnEvenSq/rnEN).toFixed(6)} odd=${Math.sqrt(rnOddSq/rnON).toFixed(6)} ratio=${Math.sqrt(rnEvenSq/rnEN / (rnOddSq/rnON)).toFixed(4)}`);
+
+        // Check the actual normal magnitude (not diff) for even/odd rows
+        let magEvenSq = 0, magOddSq = 0, mEN = 0, mON = 0;
+        for (let y = 10; y < dH - 10; y++) {
+          for (let x = 10; x < dW - 10; x++) {
+            const i = y * dW + x;
+            const ir = y * dW + Math.min(x + 1, dW - 1);
+            const ib = Math.min(y + 1, dH - 1) * dW + x;
+            // Compute the cross product magnitude (before normalization)
+            const dxX = pts[ir*3]-pts[i*3], dxY = pts[ir*3+1]-pts[i*3+1], dxZ = pts[ir*3+2]-pts[i*3+2];
+            const dyX = pts[ib*3]-pts[i*3], dyY = pts[ib*3+1]-pts[i*3+1], dyZ = pts[ib*3+2]-pts[i*3+2];
+            const nx = dxY*dyZ-dxZ*dyY, ny = dxZ*dyX-dxX*dyZ, nz = dxX*dyY-dxY*dyX;
+            const mag = Math.sqrt(nx*nx+ny*ny+nz*nz);
+            if (y % 2 === 0) { magEvenSq += mag; mEN++; } else { magOddSq += mag; mON++; }
+          }
+        }
+        log(`  WebGPU cross-product magnitude: even=${(magEvenSq/mEN).toFixed(8)} odd=${(magOddSq/mON).toFixed(8)} ratio=${(magEvenSq/mEN / (magOddSq/mON)).toFixed(4)}`);
+
+        // Same for PyTorch ref
+        let rMagEven = 0, rMagOdd = 0, rMEN = 0, rMON = 0;
+        for (let y = 10; y < 582; y++) {
+          for (let x = 10; x < 582; x++) {
+            const i = y * 592 + x;
+            const ir = y * 592 + Math.min(x + 1, 591);
+            const ib = Math.min(y + 1, 591) * 592 + x;
+            const dxX = refPts3D[ir*3]-refPts3D[i*3], dxY = refPts3D[ir*3+1]-refPts3D[i*3+1], dxZ = refPts3D[ir*3+2]-refPts3D[i*3+2];
+            const dyX = refPts3D[ib*3]-refPts3D[i*3], dyY = refPts3D[ib*3+1]-refPts3D[i*3+1], dyZ = refPts3D[ib*3+2]-refPts3D[i*3+2];
+            const nx = dxY*dyZ-dxZ*dyY, ny = dxZ*dyX-dxX*dyZ, nz = dxX*dyY-dxY*dyX;
+            const mag = Math.sqrt(nx*nx+ny*ny+nz*nz);
+            if (y % 2 === 0) { rMagEven += mag; rMEN++; } else { rMagOdd += mag; rMON++; }
+          }
+        }
+        log(`  PyTorch cross-product magnitude: even=${(rMagEven/rMEN).toFixed(8)} odd=${(rMagOdd/rMON).toFixed(8)} ratio=${(rMagEven/rMEN / (rMagOdd/rMON)).toFixed(4)}`);
+      } catch(e) { log('  Point comparison: ' + e.message); }
+
+      neckInputs.forEach(n => n.buffer.destroy());
+    } catch(e) { log('  Decoder comparison error: ' + e.message + '\n' + e.stack); }
+
+    // Compare neck outputs level by level
+    log('\n--- Neck output comparison ---');
+    try {
+      for (let level = 0; level < 5; level++) {
+        const resp = await fetch(`/layer_dumps/neck_output_${level}.bin`);
+        if (!resp.ok) continue;
+        const ref = new Float32Array(await resp.arrayBuffer());
+        const manifest = await (await fetch('/layer_dumps/manifest.json')).json();
+        const info = manifest[`neck_output_${level}`];
+        log(`  Level ${level}: ref shape=[${info.shape}] range=[${info.range[0].toFixed(4)}, ${info.range[1].toFixed(4)}] std=${info.std.toFixed(4)}`);
+
+        // Check even/odd row pattern in reference
+        const C = info.shape[0], H = info.shape[1], W = info.shape[2];
+        let evenSum = 0, oddSum = 0, evenN = 0, oddN = 0;
+        for (let c = 0; c < Math.min(C, 4); c++) {
+          for (let y = 1; y < H - 1; y++) {
+            for (let x = 1; x < W - 1; x++) {
+              const v = ref[c * H * W + y * W + x];
+              if (y % 2 === 0) { evenSum += v * v; evenN++; } else { oddSum += v * v; oddN++; }
+            }
+          }
+        }
+        const evenRMS = Math.sqrt(evenSum / evenN);
+        const oddRMS = Math.sqrt(oddSum / oddN);
+        log(`    RMS even=${evenRMS.toFixed(4)} odd=${oddRMS.toFixed(4)} ratio=${(evenRMS/oddRMS).toFixed(4)}`);
+      }
+    } catch(e) { log('  Neck comparison error: ' + e.message); }
+
+    log('\nDone.');
+
+    // Signal completion
+    window.__compareComplete = true;
+    window.__compareResults = results;
+    document.title = 'DONE';
+  } catch (e) {
+    log('ERROR: ' + e.message);
+    console.error(e);
+    window.__compareError = e.message;
+    document.title = 'ERROR';
+  }
+}
+
+run();
+</script>
+</body>
+</html>

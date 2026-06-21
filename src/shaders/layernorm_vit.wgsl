@@ -30,17 +30,21 @@ fn main(
 
   if (row >= params.N) { return; }
 
-  // Thread 0 computes mean and variance
+  // Thread 0 computes mean and variance (two-pass for numerical stability).
+  // The one-pass formula E[x²]-E[x]² suffers catastrophic cancellation when
+  // values are large (±20 common in ViT), losing significant precision.
   if (tid == 0u) {
     var sum = 0.0;
-    var sq_sum = 0.0;
     for (var i = 0u; i < D; i++) {
-      let val = input[base + i];
-      sum += val;
-      sq_sum += val * val;
+      sum += input[base + i];
     }
     let mean = sum / f32(D);
-    let variance = sq_sum / f32(D) - mean * mean;
+    var var_sum = 0.0;
+    for (var i = 0u; i < D; i++) {
+      let diff = input[base + i] - mean;
+      var_sum += diff * diff;
+    }
+    let variance = var_sum / f32(D);
     shared_mean = mean;
     shared_inv_std = 1.0 / sqrt(variance + params.eps);
   }

@@ -57,12 +57,25 @@ fn computeScores(
   let ki = remainder % N;
   let headOffset = head * headDim;
 
-  var dot = 0.0;
-  for (var d = 0u; d < headDim; d++) {
-    dot += qBuf[qi * D + headOffset + d] * kBuf[ki * D + headOffset + d];
+  // headDim is 64, so 4-way split gives 16-element chains.
+  var d0 = 0.0;
+  var d1 = 0.0;
+  var d2 = 0.0;
+  var d3 = 0.0;
+  let qBase = qi * D + headOffset;
+  let kBase = ki * D + headOffset;
+  let hd4 = (headDim / 4u) * 4u;
+  for (var d = 0u; d < hd4; d += 4u) {
+    d0 += qBuf[qBase + d]      * kBuf[kBase + d];
+    d1 += qBuf[qBase + d + 1u] * kBuf[kBase + d + 1u];
+    d2 += qBuf[qBase + d + 2u] * kBuf[kBase + d + 2u];
+    d3 += qBuf[qBase + d + 3u] * kBuf[kBase + d + 3u];
+  }
+  for (var d = hd4; d < headDim; d++) {
+    d0 += qBuf[qBase + d] * kBuf[kBase + d];
   }
 
-  scoreBuf[idx] = dot * scoreParams.scale;
+  scoreBuf[idx] = ((d0 + d1) + (d2 + d3)) * scoreParams.scale;
 }
 
 // --- Softmax ---
@@ -131,10 +144,22 @@ fn applyAttn(
   let head = col / headDim;
   let d = col % headDim;
 
-  var val = 0.0;
+  // N is ~1370 tokens, 4-way split gives ~342-element chains.
+  var v0 = 0.0;
+  var v1 = 0.0;
+  var v2 = 0.0;
+  var v3 = 0.0;
   let scoreBase = head * N * N + row * N;
-  for (var j = 0u; j < N; j++) {
-    val += applyScoreBuf[scoreBase + j] * vBuf[j * D + head * headDim + d];
+  let vCol = head * headDim + d;
+  let n4 = (N / 4u) * 4u;
+  for (var j = 0u; j < n4; j += 4u) {
+    v0 += applyScoreBuf[scoreBase + j]      * vBuf[(j)      * D + vCol];
+    v1 += applyScoreBuf[scoreBase + j + 1u] * vBuf[(j + 1u) * D + vCol];
+    v2 += applyScoreBuf[scoreBase + j + 2u] * vBuf[(j + 2u) * D + vCol];
+    v3 += applyScoreBuf[scoreBase + j + 3u] * vBuf[(j + 3u) * D + vCol];
   }
-  attnOutput[idx] = val;
+  for (var j = n4; j < N; j++) {
+    v0 += applyScoreBuf[scoreBase + j] * vBuf[j * D + vCol];
+  }
+  attnOutput[idx] = (v0 + v1) + (v2 + v3);
 }

@@ -53,18 +53,20 @@ fn upsample_main(
     let ix = ox * params.inW / params.outW;
     output[idx] = input[inBase + iy * params.inW + ix];
   } else {
-    // Bilinear (align_corners=False)
-    // Source coordinate: (ox + 0.5) * inW / outW - 0.5
-    let srcY = (f32(oy) + 0.5) * f32(params.inH) / f32(params.outH) - 0.5;
-    let srcX = (f32(ox) + 0.5) * f32(params.inW) / f32(params.outW) - 0.5;
+    // Bilinear (align_corners=False, matching PyTorch F.interpolate)
+    // Source coordinate, clamped to valid range before computing fractional part
+    let srcY_raw = (f32(oy) + 0.5) * f32(params.inH) / f32(params.outH) - 0.5;
+    let srcX_raw = (f32(ox) + 0.5) * f32(params.inW) / f32(params.outW) - 0.5;
+    let srcY = clamp(srcY_raw, 0.0, f32(params.inH - 1u));
+    let srcX = clamp(srcX_raw, 0.0, f32(params.inW - 1u));
 
-    let y0 = u32(max(floor(srcY), 0.0));
-    let x0 = u32(max(floor(srcX), 0.0));
-    let y1 = min(y0 + 1, params.inH - 1);
-    let x1 = min(x0 + 1, params.inW - 1);
+    let y0 = u32(floor(srcY));
+    let x0 = u32(floor(srcX));
+    let y1 = min(y0 + 1u, params.inH - 1u);
+    let x1 = min(x0 + 1u, params.inW - 1u);
 
-    let fy = srcY - floor(srcY);
-    let fx = srcX - floor(srcX);
+    let fy = srcY - f32(y0);
+    let fx = srcX - f32(x0);
 
     let v00 = input[inBase + y0 * params.inW + x0];
     let v01 = input[inBase + y0 * params.inW + x1];
