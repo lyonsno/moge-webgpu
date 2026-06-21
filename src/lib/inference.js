@@ -470,8 +470,8 @@ export class MoGeInference {
       const numPatches = tokenH * tokenW;
       encoderData = await readBuffer(device, featureBuf, encoderDim * numPatches * 4);
 
-      // Read CLS token (first row of final token buffer) for scale head
-      const clsTokenData = await readBuffer(device, clsTokenBuf, encoderDim * 4);
+      // Read CLS token (first row of normed token buffer) for scale head
+      clsTokenData = await readBuffer(device, clsTokenBuf, encoderDim * 4);
       let bMin = Infinity, bMax = -Infinity;
       for (let i = 0; i < encoderData.length; i++) {
         if (encoderData[i] < bMin) bMin = encoderData[i];
