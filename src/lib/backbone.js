@@ -77,6 +77,34 @@ export class DINOv2Backbone {
     this.pipelines.linearGelu = make(linearGeluWGSL, 'main');
     this.pipelines.layerScale = make(layerscaleWGSL, 'main');
     this.pipelines.transpose = make(transposeWGSL, 'main');
+
+    // QKV split shader
+    const splitModule = device.createShaderModule({
+      code: `
+        struct P { N: u32, D: u32, numWgX: u32 }
+        @group(0) @binding(0) var<uniform> p: P;
+        @group(0) @binding(1) var<storage, read> qkv: array<f32>;
+        @group(0) @binding(2) var<storage, read_write> q: array<f32>;
+        @group(0) @binding(3) var<storage, read_write> k: array<f32>;
+        @group(0) @binding(4) var<storage, read_write> v: array<f32>;
+
+        @compute @workgroup_size(256)
+        fn main(@builtin(workgroup_id) wgid: vec3u, @builtin(local_invocation_id) lid: vec3u) {
+          let idx = (wgid.x + wgid.y * p.numWgX) * 256u + lid.x;
+          if (idx >= p.N * p.D) { return; }
+          let row = idx / p.D;
+          let col = idx % p.D;
+          let D3 = p.D * 3u;
+          q[idx] = qkv[row * D3 + col];
+          k[idx] = qkv[row * D3 + p.D + col];
+          v[idx] = qkv[row * D3 + 2u * p.D + col];
+        }
+      `,
+    });
+    this.pipelines.splitQKV = device.createComputePipeline({
+      layout: 'auto',
+      compute: { module: splitModule, entryPoint: 'main' },
+    });
   }
 
   /**
@@ -114,6 +142,7 @@ export class DINOv2Backbone {
     const projOutBuf = createEmptyBuffer(device, T * 4);
     const hiddenBuf = createEmptyBuffer(device, N * VIT_CONFIG.mlpHiddenDim * 4);
     const ffnOutBuf = createEmptyBuffer(device, T * 4);
+    const qkvWorkBuf = createEmptyBuffer(device, N * 3 * D * 4);
     // Two token buffers for ping-pong (avoid read/write race on same buffer)
     let tokenBufA = tokenBuf;
     let tokenBufB = createEmptyBuffer(device, T * 4);
@@ -123,7 +152,7 @@ export class DINOv2Backbone {
       this._encodeLayerNorm(encoder, currentTokens, normBuf, weights, `encoder.backbone.blocks.${l}.norm1`, N);
 
       // Attention: QKV projections
-      this._encodeQKV(encoder, normBuf, qBuf, kBuf, vBuf, weights, l, N);
+      this._encodeQKV(encoder, normBuf, qBuf, kBuf, vBuf, weights, l, N, qkvWorkBuf);
 
       // Attention scores
       this._encodeAttnScores(encoder, qBuf, kBuf, scoreBuf, N);
@@ -168,6 +197,7 @@ export class DINOv2Backbone {
     // Each intermediate feature gets a 1x1 conv projection, then all are summed
     const featureBuf = createEmptyBuffer(device, D * numPatches * 4);
     let sumBuf = null;
+    let normedClsBuf = null; // Will hold the normed CLS token from the last layer
 
     for (let i = 0; i < intermediateFeatures.length; i++) {
       const { buffer: snapBuf } = intermediateFeatures[i];
@@ -182,6 +212,11 @@ export class DINOv2Backbone {
       // Step 0: Apply backbone final norm to snapshot
       const normedBuf = createEmptyBuffer(device, T * 4);
       this._encodeLayerNorm(encoder, snapBuf, normedBuf, weights, 'encoder.backbone.norm', N);
+
+      // Capture normed CLS token from last intermediate layer (for scale head)
+      if (i === intermediateFeatures.length - 1) {
+        normedClsBuf = normedBuf; // CLS token is at offset 0 (first D floats)
+      }
 
       // Step 1: Linear projection on [numPatches, D] → [numPatches, D] (skip CLS via offset)
       const projBuf = createEmptyBuffer(device, D * numPatches * 4);
@@ -202,7 +237,7 @@ export class DINOv2Backbone {
     // Return debug buffers for post-submit readback.
     return {
       featureBuf: sumBuf || featureBuf,
-      clsTokenBuf: currentTokens,
+      clsTokenBuf: normedClsBuf || currentTokens,
       tokenH,
       tokenW,
       _debugSnaps: intermediateFeatures,
@@ -287,10 +322,10 @@ export class DINOv2Backbone {
     pass.end();
   }
 
-  _encodeQKV(enc, input, qBuf, kBuf, vBuf, weights, layerIdx, N) {
+  _encodeQKV(enc, input, qBuf, kBuf, vBuf, weights, layerIdx, N, qkvWorkBuf) {
+    const device = this.device;
     const D = VIT_CONFIG.dim;
-    // QKV is stored as a single [3*D, D] weight matrix
-    // We do three separate linear projections using buffer offsets
+    const D3 = 3 * D;
     const prefix = `encoder.backbone.blocks.${layerIdx}.attn.qkv`;
     const qkvWeight = weights.encoder.blockWeights?.[`${prefix}.weight`];
     const qkvBias = weights.encoder.blockWeights?.[`${prefix}.bias`];
@@ -300,15 +335,63 @@ export class DINOv2Backbone {
       return;
     }
 
-    const wSize = D * D * 4; // bytes for one D×D weight matrix
-    const bSize = D * 4;
+    // Project to [N, 3*D] with one linear call, then split Q/K/V
+    this._encodeLinearFull(enc, input, qkvWorkBuf, qkvWeight, qkvBias, N, D, D3);
 
-    // Q
-    this._encodeLinearWithOffsets(enc, input, qkvWeight, 0, wSize, qkvBias, 0, bSize, qBuf, N, D, D);
-    // K
-    this._encodeLinearWithOffsets(enc, input, qkvWeight, wSize, wSize, qkvBias, bSize, bSize, kBuf, N, D, D);
-    // V
-    this._encodeLinearWithOffsets(enc, input, qkvWeight, 2 * wSize, wSize, qkvBias, 2 * bSize, bSize, vBuf, N, D, D);
+    // Split [N, 3*D] → Q [N, D], K [N, D], V [N, D]
+    this._encodeSplitQKV(enc, qkvWorkBuf, qBuf, kBuf, vBuf, N, D);
+  }
+
+  _encodeLinearFull(enc, input, output, weight, bias, numRows, inDim, outDim) {
+    const device = this.device;
+    const totalWG = ceilDiv(numRows * outDim, 256);
+    const [wgX, wgY] = splitWG(totalWG);
+
+    const paramsData = new Uint32Array([numRows, inDim, outDim, wgX]);
+    const paramsBuf = makeUniform(device, paramsData);
+
+    const bg = device.createBindGroup({
+      layout: this.pipelines.linear.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: paramsBuf } },
+        { binding: 1, resource: { buffer: input } },
+        { binding: 2, resource: { buffer: weight } },
+        { binding: 3, resource: { buffer: bias } },
+        { binding: 4, resource: { buffer: output } },
+      ],
+    });
+
+    const pass = enc.beginComputePass();
+    pass.setPipeline(this.pipelines.linear);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(wgX, wgY);
+    pass.end();
+  }
+
+  _encodeSplitQKV(enc, qkvBuf, qBuf, kBuf, vBuf, N, D) {
+    const device = this.device;
+    const total = N * D;
+    const totalWG = ceilDiv(total, 256);
+    const [wgX, wgY] = splitWG(totalWG);
+
+    const paramsBuf = makeUniform(device, new Uint32Array([N, D, wgX]));
+
+    const bg = device.createBindGroup({
+      layout: this.pipelines.splitQKV.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: paramsBuf } },
+        { binding: 1, resource: { buffer: qkvBuf } },
+        { binding: 2, resource: { buffer: qBuf } },
+        { binding: 3, resource: { buffer: kBuf } },
+        { binding: 4, resource: { buffer: vBuf } },
+      ],
+    });
+
+    const pass = enc.beginComputePass();
+    pass.setPipeline(this.pipelines.splitQKV);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(wgX, wgY);
+    pass.end();
   }
 
   _encodeLinear(enc, input, output, weights, prefix, numRows, inDim, outDim) {
@@ -578,6 +661,482 @@ export class DINOv2Backbone {
     pass.setBindGroup(0, bg);
     pass.dispatchWorkgroups(wgX, wgY);
     pass.end();
+  }
+
+  /**
+   * Run layer-by-layer comparison against PyTorch reference tensors.
+   * Call from browser console: await window.__mogeInference.backbone.debugCompare(...)
+   */
+  async debugCompare(imageBuf, weights, tokenH, tokenW) {
+    const device = this.device;
+    const D = VIT_CONFIG.dim;
+    const numPatches = tokenH * tokenW;
+    const N = numPatches + 1;
+    const T = N * D;
+
+    // Load reference manifest
+    const manifestResp = await fetch('/layer_dumps/manifest.json');
+    const manifest = await manifestResp.json();
+
+    async function loadRef(name) {
+      const info = manifest[name];
+      if (!info) { console.warn(`No reference for ${name}`); return null; }
+      const resp = await fetch(`/layer_dumps/${info.file}`);
+      return new Float32Array(await resp.arrayBuffer());
+    }
+
+    const results = {};
+
+    function compareArrays(label, gpu, ref) {
+      if (!ref) { console.log(`  ${label}: no reference`); return null; }
+      const n = Math.min(gpu.length, ref.length);
+      let maxErr = 0, sumErr = 0, sumSq = 0;
+      let gpuMin = Infinity, gpuMax = -Infinity, refMin = Infinity, refMax = -Infinity;
+      let gpuSum = 0, refSum = 0, gpuSqSum = 0, refSqSum = 0;
+      let worstIdx = 0, nanCount = 0, infCount = 0;
+      let firstNanIdx = -1;
+      for (let i = 0; i < n; i++) {
+        if (isNaN(gpu[i])) { nanCount++; if (firstNanIdx < 0) firstNanIdx = i; continue; }
+        if (!isFinite(gpu[i])) { infCount++; continue; }
+        const err = Math.abs(gpu[i] - ref[i]);
+        sumErr += err;
+        sumSq += err * err;
+        if (err > maxErr) { maxErr = err; worstIdx = i; }
+        if (gpu[i] < gpuMin) gpuMin = gpu[i];
+        if (gpu[i] > gpuMax) gpuMax = gpu[i];
+        if (ref[i] < refMin) refMin = ref[i];
+        if (ref[i] > refMax) refMax = ref[i];
+        gpuSum += gpu[i]; refSum += ref[i];
+        gpuSqSum += gpu[i] * gpu[i]; refSqSum += ref[i] * ref[i];
+      }
+      const finiteN = n - nanCount - infCount;
+      const gpuMean = gpuSum / finiteN, refMean = refSum / finiteN;
+      const gpuStd = Math.sqrt(Math.max(0, gpuSqSum / finiteN - gpuMean * gpuMean));
+      const refStd = Math.sqrt(Math.max(0, refSqSum / finiteN - refMean * refMean));
+      const meanErr = sumErr / finiteN;
+      const rmsErr = Math.sqrt(sumSq / finiteN);
+      const relStd = refStd > 0 ? gpuStd / refStd : NaN;
+      const worstRow = Math.floor(worstIdx / D);
+      const worstCol = worstIdx % D;
+
+      const result = {
+        label, maxErr, meanErr, rmsErr, relStd,
+        gpu: { min: gpuMin, max: gpuMax, mean: gpuMean, std: gpuStd },
+        ref: { min: refMin, max: refMax, mean: refMean, std: refStd },
+        worstIdx, worstRow, worstCol,
+        worstGpu: gpu[worstIdx], worstRef: ref[worstIdx],
+      };
+      results[label] = result;
+
+      const nanStr = nanCount > 0 ? ` NaN=${nanCount}${firstNanIdx >= 0 ? `@${firstNanIdx}` : ''}` : '';
+      const infStr = infCount > 0 ? ` Inf=${infCount}` : '';
+      console.log(`  ${label}: maxErr=${maxErr.toFixed(4)} rmsErr=${rmsErr.toFixed(4)} relStd=${relStd.toFixed(4)} | GPU std=${gpuStd.toFixed(4)} REF std=${refStd.toFixed(4)} | worst@[${worstRow},${worstCol}] gpu=${gpu[worstIdx]?.toFixed(4)} ref=${ref[worstIdx]?.toFixed(4)}${nanStr}${infStr}`);
+      return result;
+    }
+
+    console.log('\n=== BACKBONE COMPARISON ===\n');
+
+    // --- Stage 1: Patch embedding ---
+    {
+      const tokenBuf = createEmptyBuffer(device, T * 4);
+      const enc = device.createCommandEncoder();
+      this._encodePatchEmbed(enc, imageBuf, weights, tokenBuf, tokenH, tokenW);
+      device.queue.submit([enc.finish()]);
+      const gpu = await readBuffer(device, tokenBuf, T * 4);
+      const ref = await loadRef('tokens_after_pos_embed');
+      compareArrays('patch_embed', gpu, ref);
+      tokenBuf.destroy();
+    }
+
+    // --- Stage 2: Run blocks, compare at checkpoints ---
+    const checkpoints = [0, 1, 2, 3, 4, 5, 11, 12, 13, 14, 15, 16, 17, 23];
+    let tokenBufA = createEmptyBuffer(device, T * 4);
+    let tokenBufB = createEmptyBuffer(device, T * 4);
+    {
+      const enc = device.createCommandEncoder();
+      this._encodePatchEmbed(enc, imageBuf, weights, tokenBufA, tokenH, tokenW);
+      device.queue.submit([enc.finish()]);
+    }
+    let currentTokens = tokenBufA;
+
+    const normBuf = createEmptyBuffer(device, T * 4);
+    const qBuf = createEmptyBuffer(device, T * 4);
+    const kBuf = createEmptyBuffer(device, T * 4);
+    const vBuf = createEmptyBuffer(device, T * 4);
+    const scoreBuf = createEmptyBuffer(device, VIT_CONFIG.numHeads * N * N * 4);
+    const attnOutBuf = createEmptyBuffer(device, T * 4);
+    const projOutBuf = createEmptyBuffer(device, T * 4);
+    const hiddenBuf = createEmptyBuffer(device, N * VIT_CONFIG.mlpHiddenDim * 4);
+    const ffnOutBuf = createEmptyBuffer(device, T * 4);
+    const qkvWorkBuf = createEmptyBuffer(device, N * 3 * D * 4);
+
+    const DO_BLOCK0_SUBSTEPS = true;
+    for (let l = 0; l < VIT_CONFIG.numLayers; l++) {
+      // For block 0, run sub-steps individually and compare each
+      if (l === 0 && DO_BLOCK0_SUBSTEPS) {
+        console.log('\n--- Block 0 sub-steps ---');
+
+        // norm1
+        let enc = device.createCommandEncoder();
+        this._encodeLayerNorm(enc, currentTokens, normBuf, weights, `encoder.backbone.blocks.0.norm1`, N);
+        device.queue.submit([enc.finish()]);
+        const norm1Gpu = await readBuffer(device, normBuf, T * 4);
+        const norm1Ref = await loadRef('block_0_norm1');
+        compareArrays('b0_norm1', norm1Gpu, norm1Ref);
+
+        // QKV
+        enc = device.createCommandEncoder();
+        this._encodeQKV(enc, normBuf, qBuf, kBuf, vBuf, weights, 0, N, qkvWorkBuf);
+        device.queue.submit([enc.finish()]);
+        const qGpu = await readBuffer(device, qBuf, T * 4);
+        const kGpu = await readBuffer(device, kBuf, T * 4);
+        const vGpu = await readBuffer(device, vBuf, T * 4);
+        // QKV ref is [N, 3*D] — split into Q, K, V
+        const qkvRef = await loadRef('block_0_qkv');
+        if (qkvRef) {
+          const qRef = new Float32Array(N * D);
+          const kRef = new Float32Array(N * D);
+          const vRef = new Float32Array(N * D);
+          for (let i = 0; i < N; i++) {
+            for (let d = 0; d < D; d++) {
+              qRef[i * D + d] = qkvRef[i * 3 * D + d];
+              kRef[i * D + d] = qkvRef[i * 3 * D + D + d];
+              vRef[i * D + d] = qkvRef[i * 3 * D + 2 * D + d];
+            }
+          }
+          compareArrays('b0_Q', qGpu, qRef);
+          compareArrays('b0_K', kGpu, kRef);
+          compareArrays('b0_V', vGpu, vRef);
+        }
+
+        // Attention scores + softmax + apply
+        enc = device.createCommandEncoder();
+        this._encodeAttnScores(enc, qBuf, kBuf, scoreBuf, N);
+        this._encodeAttnSoftmax(enc, scoreBuf, N);
+        this._encodeAttnApply(enc, scoreBuf, vBuf, attnOutBuf, N);
+        device.queue.submit([enc.finish()]);
+
+        // Attn output projection
+        enc = device.createCommandEncoder();
+        this._encodeLinear(enc, attnOutBuf, projOutBuf, weights, `encoder.backbone.blocks.0.attn.proj`, N, D, D);
+        device.queue.submit([enc.finish()]);
+        const projGpu = await readBuffer(device, projOutBuf, T * 4);
+        const attnRef = await loadRef('block_0_attn_out');
+        compareArrays('b0_attn_proj', projGpu, attnRef);
+
+        // LayerScale1 + residual
+        enc = device.createCommandEncoder();
+        const attnResidualOut = (currentTokens === tokenBufA) ? tokenBufB : tokenBufA;
+        this._encodeLayerScaleResidual(enc, projOutBuf, currentTokens, attnResidualOut, weights, `encoder.backbone.blocks.0.ls1`, T, D);
+        device.queue.submit([enc.finish()]);
+        currentTokens = attnResidualOut;
+        const ls1Gpu = await readBuffer(device, currentTokens, T * 4);
+        const ls1Ref = await loadRef('block_0_after_ls1');
+        compareArrays('b0_after_ls1', ls1Gpu, ls1Ref);
+
+        // norm2
+        enc = device.createCommandEncoder();
+        this._encodeLayerNorm(enc, currentTokens, normBuf, weights, `encoder.backbone.blocks.0.norm2`, N);
+        device.queue.submit([enc.finish()]);
+        const norm2Gpu = await readBuffer(device, normBuf, T * 4);
+        const norm2Ref = await loadRef('block_0_norm2');
+        compareArrays('b0_norm2', norm2Gpu, norm2Ref);
+
+        // MLP fc1 (linear + GELU)
+        enc = device.createCommandEncoder();
+        this._encodeLinearGelu(enc, normBuf, hiddenBuf, weights, `encoder.backbone.blocks.0.mlp.fc1`, N, D, VIT_CONFIG.mlpHiddenDim);
+        device.queue.submit([enc.finish()]);
+        const fc1Gpu = await readBuffer(device, hiddenBuf, N * VIT_CONFIG.mlpHiddenDim * 4);
+        // Compare against post-GELU reference (our shader fuses linear+GELU)
+        const fc1Ref = await loadRef('block_0_fc1_post_gelu');
+        compareArrays('b0_fc1_gelu', fc1Gpu, fc1Ref);
+
+        // MLP fc2 (linear)
+        enc = device.createCommandEncoder();
+        this._encodeLinear(enc, hiddenBuf, ffnOutBuf, weights, `encoder.backbone.blocks.0.mlp.fc2`, N, VIT_CONFIG.mlpHiddenDim, D);
+        device.queue.submit([enc.finish()]);
+        const fc2Gpu = await readBuffer(device, ffnOutBuf, T * 4);
+        const mlpRef = await loadRef('block_0_mlp_out');
+        compareArrays('b0_mlp_out', fc2Gpu, mlpRef);
+
+        // LayerScale2 + residual → final block 0 output
+        enc = device.createCommandEncoder();
+        const ffnResidualOut = (currentTokens === tokenBufA) ? tokenBufB : tokenBufA;
+        this._encodeLayerScaleResidual(enc, ffnOutBuf, currentTokens, ffnResidualOut, weights, `encoder.backbone.blocks.0.ls2`, T, D);
+        device.queue.submit([enc.finish()]);
+        currentTokens = ffnResidualOut;
+
+        const b0Gpu = await readBuffer(device, currentTokens, T * 4);
+        const b0Ref = await loadRef('block_0_output');
+        compareArrays('block_0', b0Gpu, b0Ref);
+        continue;
+      }
+
+      // All other blocks: run as a batch
+      const enc = device.createCommandEncoder();
+
+      this._encodeLayerNorm(enc, currentTokens, normBuf, weights, `encoder.backbone.blocks.${l}.norm1`, N);
+      this._encodeQKV(enc, normBuf, qBuf, kBuf, vBuf, weights, l, N, qkvWorkBuf);
+      this._encodeAttnScores(enc, qBuf, kBuf, scoreBuf, N);
+      this._encodeAttnSoftmax(enc, scoreBuf, N);
+      this._encodeAttnApply(enc, scoreBuf, vBuf, attnOutBuf, N);
+      this._encodeLinear(enc, attnOutBuf, projOutBuf, weights, `encoder.backbone.blocks.${l}.attn.proj`, N, D, D);
+
+      const attnResidualOut = (currentTokens === tokenBufA) ? tokenBufB : tokenBufA;
+      this._encodeLayerScaleResidual(enc, projOutBuf, currentTokens, attnResidualOut, weights, `encoder.backbone.blocks.${l}.ls1`, T, D);
+      currentTokens = attnResidualOut;
+
+      this._encodeLayerNorm(enc, currentTokens, normBuf, weights, `encoder.backbone.blocks.${l}.norm2`, N);
+      this._encodeLinearGelu(enc, normBuf, hiddenBuf, weights, `encoder.backbone.blocks.${l}.mlp.fc1`, N, D, VIT_CONFIG.mlpHiddenDim);
+      this._encodeLinear(enc, hiddenBuf, ffnOutBuf, weights, `encoder.backbone.blocks.${l}.mlp.fc2`, N, VIT_CONFIG.mlpHiddenDim, D);
+
+      const ffnResidualOut = (currentTokens === tokenBufA) ? tokenBufB : tokenBufA;
+      this._encodeLayerScaleResidual(enc, ffnOutBuf, currentTokens, ffnResidualOut, weights, `encoder.backbone.blocks.${l}.ls2`, T, D);
+      currentTokens = ffnResidualOut;
+
+      device.queue.submit([enc.finish()]);
+
+      if (checkpoints.includes(l)) {
+        const gpu = await readBuffer(device, currentTokens, T * 4);
+        const ref = await loadRef(`block_${l}_output`);
+        if (ref) {
+          compareArrays(`block_${l}`, gpu, ref);
+        } else {
+          let gMin = Infinity, gMax = -Infinity, gSum = 0, gSqSum = 0;
+          for (let i = 0; i < gpu.length; i++) {
+            if (gpu[i] < gMin) gMin = gpu[i];
+            if (gpu[i] > gMax) gMax = gpu[i];
+            gSum += gpu[i]; gSqSum += gpu[i] * gpu[i];
+          }
+          const gMean = gSum / gpu.length;
+          const gStd = Math.sqrt(Math.max(0, gSqSum / gpu.length - gMean * gMean));
+          console.log(`  block_${l}: GPU only | [${gMin.toFixed(4)}, ${gMax.toFixed(4)}] std=${gStd.toFixed(4)} (no ref dump)`);
+          results[`block_${l}`] = { label: `block_${l}`, gpu: { min: gMin, max: gMax, mean: gMean, std: gStd } };
+        }
+      }
+    }
+
+    normBuf.destroy(); qBuf.destroy(); kBuf.destroy(); vBuf.destroy();
+    scoreBuf.destroy(); attnOutBuf.destroy(); projOutBuf.destroy();
+    hiddenBuf.destroy(); ffnOutBuf.destroy();
+    tokenBufA.destroy(); tokenBufB.destroy();
+
+    console.log('\n=== COMPARISON COMPLETE ===');
+    window.__backboneCompareResults = results;
+    return results;
+  }
+
+  /**
+   * Detailed sub-block comparison for a single transformer block.
+   * Runs block l step-by-step and compares each intermediate against PyTorch.
+   * Requires PyTorch sub-block dumps (block_X_norm1, block_X_attn_qkv, etc.)
+   * For now, compares within WebGPU at block 0 to isolate the divergence stage.
+   */
+  async debugBlock0(imageBuf, weights, tokenH, tokenW) {
+    const device = this.device;
+    const D = VIT_CONFIG.dim;
+    const numPatches = tokenH * tokenW;
+    const N = numPatches + 1;
+    const T = N * D;
+    const l = 0;
+
+    function stats(label, arr, refArr) {
+      let min = Infinity, max = -Infinity, sum = 0, sqSum = 0;
+      for (let i = 0; i < arr.length; i++) {
+        if (arr[i] < min) min = arr[i];
+        if (arr[i] > max) max = arr[i];
+        sum += arr[i]; sqSum += arr[i] * arr[i];
+      }
+      const mean = sum / arr.length;
+      const std = Math.sqrt(sqSum / arr.length - mean * mean);
+      let errStr = '';
+      if (refArr) {
+        let maxErr = 0, worstIdx = 0;
+        for (let i = 0; i < Math.min(arr.length, refArr.length); i++) {
+          const err = Math.abs(arr[i] - refArr[i]);
+          if (err > maxErr) { maxErr = err; worstIdx = i; }
+        }
+        const row = worstIdx % D === worstIdx ? worstIdx : Math.floor(worstIdx / D);
+        const col = worstIdx % D;
+        errStr = ` maxErr=${maxErr.toFixed(6)}@[${row},${col}] gpu=${arr[worstIdx]?.toFixed(6)} ref=${refArr[worstIdx]?.toFixed(6)}`;
+      }
+      console.log(`  ${label}: [${min.toFixed(4)}, ${max.toFixed(4)}] mean=${mean.toFixed(6)} std=${std.toFixed(6)}${errStr}`);
+    }
+
+    // Initialize from patch embed
+    let tokenBufA = createEmptyBuffer(device, T * 4);
+    let tokenBufB = createEmptyBuffer(device, T * 4);
+    {
+      const enc = device.createCommandEncoder();
+      this._encodePatchEmbed(enc, imageBuf, weights, tokenBufA, tokenH, tokenW);
+      device.queue.submit([enc.finish()]);
+    }
+    let currentTokens = tokenBufA;
+
+    const normBuf = createEmptyBuffer(device, T * 4);
+    const qBuf = createEmptyBuffer(device, T * 4);
+    const kBuf = createEmptyBuffer(device, T * 4);
+    const vBuf = createEmptyBuffer(device, T * 4);
+    const scoreBuf = createEmptyBuffer(device, VIT_CONFIG.numHeads * N * N * 4);
+    const attnOutBuf = createEmptyBuffer(device, T * 4);
+    const projOutBuf = createEmptyBuffer(device, T * 4);
+    const hiddenBuf = createEmptyBuffer(device, N * VIT_CONFIG.mlpHiddenDim * 4);
+    const ffnOutBuf = createEmptyBuffer(device, T * 4);
+    const qkvWorkBuf = createEmptyBuffer(device, N * 3 * D * 4);
+
+    console.log('\n=== BLOCK 0 SUB-STEP COMPARISON ===\n');
+
+    // Step 1: LayerNorm1
+    {
+      const enc = device.createCommandEncoder();
+      this._encodeLayerNorm(enc, currentTokens, normBuf, weights, `encoder.backbone.blocks.${l}.norm1`, N);
+      device.queue.submit([enc.finish()]);
+      const norm1 = await readBuffer(device, normBuf, T * 4);
+      stats('norm1_output', norm1);
+      // Check dim 538 specifically across a few tokens
+      console.log(`    dim538 samples: token0=${norm1[0*D+538]?.toFixed(6)}, token276=${norm1[276*D+538]?.toFixed(6)}`);
+    }
+
+    // Step 2: QKV
+    {
+      const enc = device.createCommandEncoder();
+      this._encodeQKV(enc, normBuf, qBuf, kBuf, vBuf, weights, l, N, qkvWorkBuf);
+      device.queue.submit([enc.finish()]);
+      const q = await readBuffer(device, qBuf, T * 4);
+      const k = await readBuffer(device, kBuf, T * 4);
+      const v = await readBuffer(device, vBuf, T * 4);
+      stats('Q', q);
+      stats('K', k);
+      stats('V', v);
+      // Check dim 538 = head 8, offset 26
+      console.log(`    Q dim538: token0=${q[538]?.toFixed(6)}, token276=${q[276*D+538]?.toFixed(6)}`);
+      console.log(`    K dim538: token0=${k[538]?.toFixed(6)}, token276=${k[276*D+538]?.toFixed(6)}`);
+      console.log(`    V dim538: token0=${v[538]?.toFixed(6)}, token276=${v[276*D+538]?.toFixed(6)}`);
+    }
+
+    // Step 3: Attention scores (just stats, huge tensor)
+    {
+      const enc = device.createCommandEncoder();
+      this._encodeAttnScores(enc, qBuf, kBuf, scoreBuf, N);
+      device.queue.submit([enc.finish()]);
+      const scores = await readBuffer(device, scoreBuf, VIT_CONFIG.numHeads * N * N * 4);
+      // Just check head 8 scores for token 276
+      const headBase = 8 * N * N;
+      const rowBase = headBase + 276 * N;
+      let sMin = Infinity, sMax = -Infinity;
+      for (let j = 0; j < N; j++) {
+        if (scores[rowBase + j] < sMin) sMin = scores[rowBase + j];
+        if (scores[rowBase + j] > sMax) sMax = scores[rowBase + j];
+      }
+      console.log(`  attn_scores head8 token276: [${sMin.toFixed(4)}, ${sMax.toFixed(4)}]`);
+    }
+
+    // Step 4: Softmax
+    {
+      const enc = device.createCommandEncoder();
+      this._encodeAttnSoftmax(enc, scoreBuf, N);
+      device.queue.submit([enc.finish()]);
+      const softmax = await readBuffer(device, scoreBuf, VIT_CONFIG.numHeads * N * N * 4);
+      const headBase = 8 * N * N;
+      const rowBase = headBase + 276 * N;
+      let sSum = 0, sMax = -Infinity;
+      for (let j = 0; j < N; j++) {
+        sSum += softmax[rowBase + j];
+        if (softmax[rowBase + j] > sMax) sMax = softmax[rowBase + j];
+      }
+      console.log(`  softmax head8 token276: sum=${sSum.toFixed(6)}, max=${sMax.toFixed(6)}`);
+    }
+
+    // Step 5: Apply attention
+    {
+      const enc = device.createCommandEncoder();
+      this._encodeAttnApply(enc, scoreBuf, vBuf, attnOutBuf, N);
+      device.queue.submit([enc.finish()]);
+      const attnOut = await readBuffer(device, attnOutBuf, T * 4);
+      stats('attn_apply_output', attnOut);
+      console.log(`    attn_out dim538: token276=${attnOut[276*D+538]?.toFixed(6)}`);
+    }
+
+    // Step 6: Output projection
+    {
+      const enc = device.createCommandEncoder();
+      this._encodeLinear(enc, attnOutBuf, projOutBuf, weights, `encoder.backbone.blocks.${l}.attn.proj`, N, D, D);
+      device.queue.submit([enc.finish()]);
+      const proj = await readBuffer(device, projOutBuf, T * 4);
+      stats('proj_output', proj);
+      console.log(`    proj dim538: token276=${proj[276*D+538]?.toFixed(6)}`);
+    }
+
+    // Step 7: LayerScale1 + residual
+    {
+      const enc = device.createCommandEncoder();
+      const outBuf = (currentTokens === tokenBufA) ? tokenBufB : tokenBufA;
+      this._encodeLayerScaleResidual(enc, projOutBuf, currentTokens, outBuf, weights, `encoder.backbone.blocks.${l}.ls1`, T, D);
+      device.queue.submit([enc.finish()]);
+      const ls1 = await readBuffer(device, outBuf, T * 4);
+      stats('after_ls1_residual', ls1);
+      console.log(`    ls1_res dim538: token276=${ls1[276*D+538]?.toFixed(6)}`);
+      currentTokens = outBuf;
+    }
+
+    // Step 8: LayerNorm2
+    {
+      const enc = device.createCommandEncoder();
+      this._encodeLayerNorm(enc, currentTokens, normBuf, weights, `encoder.backbone.blocks.${l}.norm2`, N);
+      device.queue.submit([enc.finish()]);
+      const norm2 = await readBuffer(device, normBuf, T * 4);
+      stats('norm2_output', norm2);
+    }
+
+    // Step 9: MLP fc1 (linear + GELU)
+    {
+      const enc = device.createCommandEncoder();
+      this._encodeLinearGelu(enc, normBuf, hiddenBuf, weights, `encoder.backbone.blocks.${l}.mlp.fc1`, N, D, VIT_CONFIG.mlpHiddenDim);
+      device.queue.submit([enc.finish()]);
+      const fc1 = await readBuffer(device, hiddenBuf, N * VIT_CONFIG.mlpHiddenDim * 4);
+      let fMin = Infinity, fMax = -Infinity, fSum = 0, fSqSum = 0;
+      for (let i = 0; i < fc1.length; i++) {
+        if (fc1[i] < fMin) fMin = fc1[i];
+        if (fc1[i] > fMax) fMax = fc1[i];
+        fSum += fc1[i]; fSqSum += fc1[i] * fc1[i];
+      }
+      const fMean = fSum / fc1.length, fStd = Math.sqrt(fSqSum / fc1.length - fMean * fMean);
+      console.log(`  fc1_output (GELU): [${fMin.toFixed(4)}, ${fMax.toFixed(4)}] mean=${fMean.toFixed(6)} std=${fStd.toFixed(6)}`);
+    }
+
+    // Step 10: MLP fc2 (linear)
+    {
+      const enc = device.createCommandEncoder();
+      this._encodeLinear(enc, hiddenBuf, ffnOutBuf, weights, `encoder.backbone.blocks.${l}.mlp.fc2`, N, VIT_CONFIG.mlpHiddenDim, D);
+      device.queue.submit([enc.finish()]);
+      const fc2 = await readBuffer(device, ffnOutBuf, T * 4);
+      stats('fc2_output', fc2);
+      console.log(`    fc2 dim538: token276=${fc2[276*D+538]?.toFixed(6)}`);
+    }
+
+    // Step 11: LayerScale2 + residual → final block 0 output
+    {
+      const enc = device.createCommandEncoder();
+      const outBuf = (currentTokens === tokenBufA) ? tokenBufB : tokenBufA;
+      this._encodeLayerScaleResidual(enc, ffnOutBuf, currentTokens, outBuf, weights, `encoder.backbone.blocks.${l}.ls2`, T, D);
+      device.queue.submit([enc.finish()]);
+      const final = await readBuffer(device, outBuf, T * 4);
+      stats('block0_final', final);
+      console.log(`    final dim538: token276=${final[276*D+538]?.toFixed(6)}`);
+    }
+
+    // Load reference for comparison
+    const refResp = await fetch('/layer_dumps/block_0_output.bin');
+    const ref = new Float32Array(await refResp.arrayBuffer());
+    console.log(`\n  Reference block0 dim538 token276: ${ref[276*D+538]?.toFixed(6)}`);
+
+    // Clean up
+    normBuf.destroy(); qBuf.destroy(); kBuf.destroy(); vBuf.destroy();
+    scoreBuf.destroy(); attnOutBuf.destroy(); projOutBuf.destroy();
+    hiddenBuf.destroy(); ffnOutBuf.destroy();
+    tokenBufA.destroy(); tokenBufB.destroy();
+
+    console.log('\n=== BLOCK 0 ANALYSIS COMPLETE ===\n');
   }
 
   _encodeAdd(enc, dst, src, count) {
