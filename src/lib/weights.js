@@ -110,6 +110,23 @@ function fp16ToFp32(h) {
 }
 
 /**
+ * Extract tensor data as CPU Float32Array (no GPU upload).
+ */
+function extractTensorCPU(buffer, tensorInfo) {
+  const { dtype, offset, size } = tensorInfo;
+  if (dtype === 0) {
+    return new Float32Array(buffer.slice(offset, offset + size));
+  } else {
+    const fp16 = new Uint16Array(buffer, offset, size / 2);
+    const fp32 = new Float32Array(fp16.length);
+    for (let i = 0; i < fp16.length; i++) {
+      fp32[i] = fp16ToFp32(fp16[i]);
+    }
+    return fp32;
+  }
+}
+
+/**
  * Get a tensor by name, or return null if not found.
  */
 function getTensor(device, buffer, tensors, name) {
@@ -316,9 +333,9 @@ export async function loadWeights(device, url, onProgress) {
     }),
     scaleHead: {
       layers: [
-        { weight: get('scale_head.0.weight'), bias: get('scale_head.0.bias') },
-        { weight: get('scale_head.2.weight'), bias: get('scale_head.2.bias') },
-        { weight: get('scale_head.4.weight'), bias: get('scale_head.4.bias') },
+        { weight: extractTensorCPU(buffer, tensors.get('scale_head.0.weight')), bias: extractTensorCPU(buffer, tensors.get('scale_head.0.bias')), inDim: 1024, outDim: 1024 },
+        { weight: extractTensorCPU(buffer, tensors.get('scale_head.2.weight')), bias: extractTensorCPU(buffer, tensors.get('scale_head.2.bias')), inDim: 1024, outDim: 1024 },
+        { weight: extractTensorCPU(buffer, tensors.get('scale_head.4.weight')), bias: extractTensorCPU(buffer, tensors.get('scale_head.4.bias')), inDim: 1024, outDim: 1 },
       ],
     },
   };

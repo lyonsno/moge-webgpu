@@ -264,6 +264,9 @@ export class MoGeInference {
       this.backbone = new DINOv2Backbone(this.device);
       this.backbone.init();
       console.log('DINOv2 backbone initialized');
+
+      // Expose for console debugging
+      window.__mogeInference = this;
     } catch (e) {
       console.warn('Failed to load real weights, using stubs:', e.message);
       this.weights = this._createStubWeights();
@@ -364,6 +367,46 @@ export class MoGeInference {
   }
 
   /**
+   * Run backbone comparison against PyTorch reference tensors.
+   * Usage from console: await window.__mogeInference.runBackboneCompare()
+   */
+  async runBackboneCompare() {
+    if (!this.backbone || !this.useRealWeights) {
+      console.error('Backbone not initialized or using stub weights');
+      return;
+    }
+    const device = this.device;
+    const tokenH = 37, tokenW = 37;
+
+    // Load normalized input from layer dumps (same image used for PyTorch reference)
+    const resp = await fetch('/layer_dumps/input_normalized.bin');
+    const inputData = new Float32Array(await resp.arrayBuffer());
+    console.log(`Loaded reference input: [3, ${tokenH * 14}, ${tokenW * 14}], ${inputData.length} floats`);
+
+    const imageBuf = createStorageBuffer(device, inputData);
+    await this.backbone.debugCompare(imageBuf, this.weights, tokenH, tokenW);
+    imageBuf.destroy();
+  }
+
+  /**
+   * Detailed sub-block analysis of transformer block 0.
+   * Usage from console: await window.__mogeInference.runBlock0Compare()
+   */
+  async runBlock0Compare() {
+    if (!this.backbone || !this.useRealWeights) {
+      console.error('Backbone not initialized');
+      return;
+    }
+    const device = this.device;
+    const tokenH = 37, tokenW = 37;
+    const resp = await fetch('/layer_dumps/input_normalized.bin');
+    const inputData = new Float32Array(await resp.arrayBuffer());
+    const imageBuf = createStorageBuffer(device, inputData);
+    await this.backbone.debugBlock0(imageBuf, this.weights, tokenH, tokenW);
+    imageBuf.destroy();
+  }
+
+  /**
    * Run full inference.
    */
   async run(imageData) {
@@ -379,6 +422,7 @@ export class MoGeInference {
 
     // --- Encoder ---
     let encoderData;
+    let clsTokenData = null;
     let useBackbone = this.backbone && this.useRealWeights;
 
     // Prepare image for backbone: normalize with ImageNet mean/std, resize to tokenH*14 x tokenW*14
@@ -416,15 +460,18 @@ export class MoGeInference {
       console.log(`Running DINOv2 backbone: image [3, ${imgH}, ${imgW}] → tokens [${tokenH}x${tokenW}]`);
       const imageBuf = createStorageBuffer(device, normalizedImage);
 
-      const { featureBuf, _debugSnaps } = this.backbone.encode(
+      const { featureBuf, clsTokenBuf, _debugSnaps } = this.backbone.encode(
         commandEncoder, imageBuf, this.weights, tokenH, tokenW
       );
 
-      // Submit backbone compute, read back features
+      // Submit backbone compute, read back features and CLS token
       device.queue.submit([commandEncoder.finish()]);
 
       const numPatches = tokenH * tokenW;
       encoderData = await readBuffer(device, featureBuf, encoderDim * numPatches * 4);
+
+      // Read CLS token (first row of final token buffer) for scale head
+      const clsTokenData = await readBuffer(device, clsTokenBuf, encoderDim * 4);
       let bMin = Infinity, bMax = -Infinity;
       for (let i = 0; i < encoderData.length; i++) {
         if (encoderData[i] < bMin) bMin = encoderData[i];
@@ -474,7 +521,7 @@ export class MoGeInference {
     }
 
     // Try loading PyTorch neck inputs for decoder validation
-    const USE_PYTORCH_NECK_INPUTS = true; // Toggle to bypass backbone+UV and use PyTorch ground truth
+    const USE_PYTORCH_NECK_INPUTS = false; // Set true to bypass backbone for decoder-only validation
     if (USE_PYTORCH_NECK_INPUTS) {
       try {
         const neckInputs = [];
@@ -499,6 +546,72 @@ export class MoGeInference {
         const maskInputs = neckOutputs.map(f => ({ buffer: f.buffer, H: f.H, W: f.W }));
         const maskOutputs = dispatchConvStack(device, decoderEncoder, maskInputs, this.weights.maskHead, MODEL_CONFIG.maskHead);
         device.queue.submit([decoderEncoder.finish()]);
+
+        // Compare each decoder level against PyTorch reference
+        for (let i = 0; i < neckOutputs.length; i++) {
+          const no = neckOutputs[i];
+          const gpuData = await readBuffer(device, no.buffer, no.C * no.H * no.W * 4);
+          try {
+            const refResp = await fetch(`/layer_dumps/neck_output_${i}.bin`);
+            if (!refResp.ok) continue;
+            const refData = new Float32Array(await refResp.arrayBuffer());
+            let maxErr = 0, sumSq = 0, nanCount = 0;
+            const n = Math.min(gpuData.length, refData.length);
+            for (let j = 0; j < n; j++) {
+              if (isNaN(gpuData[j])) { nanCount++; continue; }
+              const err = Math.abs(gpuData[j] - refData[j]);
+              sumSq += err * err;
+              if (err > maxErr) maxErr = err;
+            }
+            console.log(`Neck ${i} [${no.C},${no.H},${no.W}]: maxErr=${maxErr.toFixed(4)} rmsErr=${Math.sqrt(sumSq/n).toFixed(4)} NaN=${nanCount}`);
+          } catch(e) {}
+        }
+        // Compare bilinear upsample intermediate
+        try {
+          const upRefResp = await fetch('/layer_dumps/neck_resampler3_upsampled.bin');
+          if (upRefResp.ok) {
+            const upRef = new Float32Array(await upRefResp.arrayBuffer());
+            console.log(`Bilinear upsample ref: ${upRef.length} elements, range=[${Math.min(...Array.from(upRef.slice(0,1000))).toFixed(4)}, ${Math.max(...Array.from(upRef.slice(0,1000))).toFixed(4)}]`);
+            // We need to read our upsample output before the conv2d... but the resampler combines them.
+            // Instead, let's run a standalone upsample on neck_output_3 and compare
+            const neck3Resp = await fetch('/layer_dumps/neck_output_3.bin');
+            const neck3Data = new Float32Array(await neck3Resp.arrayBuffer());
+            const neck3Buf = createStorageBuffer(device, neck3Data);
+            const testEncoder = device.createCommandEncoder();
+            const upResult = dispatchUpsample(device, testEncoder, neck3Buf,
+              { C: 64, inH: 296, inW: 296, outH: 592, outW: 592, mode: 1 });
+            device.queue.submit([testEncoder.finish()]);
+            const upGpu = await readBuffer(device, upResult.buffer, 64 * 592 * 592 * 4);
+            let upMaxErr = 0, upSumSq = 0;
+            for (let j = 0; j < upGpu.length; j++) {
+              const err = Math.abs(upGpu[j] - upRef[j]);
+              upSumSq += err * err;
+              if (err > upMaxErr) upMaxErr = err;
+            }
+            console.log(`Bilinear upsample comparison: maxErr=${upMaxErr.toFixed(6)} rmsErr=${Math.sqrt(upSumSq/upGpu.length).toFixed(6)}`);
+            neck3Buf.destroy();
+            upResult.buffer.destroy();
+          }
+        } catch(e) { console.log('Upsample comparison skipped:', e.message); }
+
+        for (let i = 0; i < pointsOutputs.length; i++) {
+          const po = pointsOutputs[i];
+          const gpuData = await readBuffer(device, po.buffer, po.C * po.H * po.W * 4);
+          try {
+            const refResp = await fetch(`/layer_dumps/points_head_output_${i}.bin`);
+            if (!refResp.ok) continue;
+            const refData = new Float32Array(await refResp.arrayBuffer());
+            let maxErr = 0, sumSq = 0, nanCount = 0;
+            const n = Math.min(gpuData.length, refData.length);
+            for (let j = 0; j < n; j++) {
+              if (isNaN(gpuData[j])) { nanCount++; continue; }
+              const err = Math.abs(gpuData[j] - refData[j]);
+              sumSq += err * err;
+              if (err > maxErr) maxErr = err;
+            }
+            console.log(`Points ${i} [${po.C},${po.H},${po.W}]: maxErr=${maxErr.toFixed(4)} rmsErr=${Math.sqrt(sumSq/n).toFixed(4)} NaN=${nanCount}`);
+          } catch(e) {}
+        }
 
         const lastPoints = pointsOutputs[pointsOutputs.length - 1];
         const pointsRaw = await readBuffer(device, lastPoints.buffer, lastPoints.C * lastPoints.H * lastPoints.W * 4);
@@ -680,6 +793,27 @@ export class MoGeInference {
     }
     console.log(`Mask raw: range=[${mMin.toFixed(4)}, ${mMax.toFixed(4)}]`);
 
+    // Scale head: CLS token → metric scale via MLP (1024→1024→1024→1) + exp
+    let metricScale = 1.0;
+    if (clsTokenData && this.weights.scaleHead) {
+      let x = clsTokenData;
+      for (let li = 0; li < this.weights.scaleHead.layers.length; li++) {
+        const { weight, bias, inDim, outDim } = this.weights.scaleHead.layers[li];
+        const out = new Float32Array(outDim);
+        for (let o = 0; o < outDim; o++) {
+          let sum = bias[o];
+          for (let k = 0; k < inDim; k++) {
+            sum += x[k] * weight[k * outDim + o];
+          }
+          // ReLU between layers (not after the last)
+          out[o] = (li < this.weights.scaleHead.layers.length - 1) ? Math.max(0, sum) : sum;
+        }
+        x = out;
+      }
+      metricScale = Math.exp(x[0]);
+      console.log(`Scale head: raw=${x[0].toFixed(4)}, metric_scale=${metricScale.toFixed(4)}`);
+    }
+
     // Post-processing: exp remap
     const points = new Float32Array(3 * outH * outW);
     const depth = new Float32Array(outH * outW);
@@ -742,9 +876,15 @@ export class MoGeInference {
       }
     }
 
+    // Apply metric scale
+    if (metricScale !== 1.0) {
+      for (let i = 0; i < points.length; i++) points[i] *= metricScale;
+      for (let i = 0; i < depth.length; i++) depth[i] *= metricScale;
+    }
+
     // Clean up
     neckInputs.forEach(f => f.buffer.destroy());
 
-    return { depth, normals, points, colors, width: outW, height: outH };
+    return { depth, normals, points, colors, width: outW, height: outH, metricScale };
   }
 }
