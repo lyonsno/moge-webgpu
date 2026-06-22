@@ -1083,6 +1083,7 @@ export class MoGeInference {
     const dsXY = []; // [N, 2]
     const dsZ = [];  // [N]
     const dsUV = []; // [N, 2]
+    const aspect = width / height;
     const spanX = aspect / Math.sqrt(1 + aspect * aspect);
     const spanY = 1 / Math.sqrt(1 + aspect * aspect);
     for (let dy = 0; dy < dsH; dy++) {
