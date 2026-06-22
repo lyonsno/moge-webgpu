@@ -407,6 +407,248 @@ export class MoGeInference {
   }
 
   /**
+   * Step-by-step decoder comparison against PyTorch intermediates.
+   * Runs neck ConvStack with readbacks at each level boundary.
+   */
+  async runDecoderCompare() {
+    const device = this.device;
+    const weights = this.weights;
+
+    async function loadRef(name) {
+      try {
+        const resp = await fetch(`/layer_dumps/${name}.bin`);
+        if (!resp.ok) return null;
+        return new Float32Array(await resp.arrayBuffer());
+      } catch { return null; }
+    }
+
+    function compare(label, gpu, ref) {
+      if (!ref) { console.log(`  ${label}: no ref`); return; }
+      const n = Math.min(gpu.length, ref.length);
+      let maxErr = 0, sumSq = 0, worstIdx = 0;
+      for (let i = 0; i < n; i++) {
+        const e = Math.abs(gpu[i] - ref[i]);
+        sumSq += e * e;
+        if (e > maxErr) { maxErr = e; worstIdx = i; }
+      }
+      const rmsErr = Math.sqrt(sumSq / n);
+      console.log(`  ${label}: maxErr=${maxErr.toFixed(6)} rmsErr=${rmsErr.toFixed(6)} worst@${worstIdx} gpu=${gpu[worstIdx]?.toFixed(4)} ref=${ref[worstIdx]?.toFixed(4)}`);
+      return { maxErr, rmsErr };
+    }
+
+    // Load neck inputs (PyTorch reference)
+    const neckInputs = [];
+    const config = MODEL_CONFIG.neck;
+    const tokenH = 37, tokenW = 37;
+    for (let i = 0; i < 5; i++) {
+      const data = await loadRef(`neck_input_${i}`);
+      const h = tokenH * (2 ** i);
+      const w = tokenW * (2 ** i);
+      neckInputs.push({ buffer: createStorageBuffer(device, data), H: h, W: w, data });
+    }
+
+    console.log('\n=== DECODER NECK COMPARISON ===\n');
+
+    let x = null;
+    for (let i = 0; i < 5; i++) {
+      const H = neckInputs[i].H;
+      const W = neckInputs[i].W;
+      const dimRB = config.dimResBlocks[i];
+      const dimIn = config.dimIn[i];
+
+      console.log(`--- Level ${i} (${dimRB}ch, ${H}x${W}) ---`);
+
+      // input_block: 1x1 conv
+      let enc = device.createCommandEncoder();
+      let projected = null;
+      if (dimIn != null) {
+        projected = dispatchConv1x1(device, enc, neckInputs[i].buffer,
+          weights.neck.levels[i].input_weight, weights.neck.levels[i].input_bias,
+          { inC: dimIn, outC: dimRB, H, W });
+      }
+
+      // Add to running state
+      if (i === 0) {
+        x = projected.buffer;
+      } else if (projected) {
+        x = dispatchActivation(device, enc, x, projected.buffer, dimRB * H * W, 2);
+      }
+      device.queue.submit([enc.finish()]);
+
+      // Compare post-add
+      const postAdd = await readBuffer(device, x, dimRB * H * W * 4);
+      const postAddRef = await loadRef(`decoder_neck_level${i}_post_add`);
+      compare(`post_add`, postAdd, postAddRef);
+
+      // res_blocks
+      for (let j = 0; j < config.numResBlocks[i]; j++) {
+        enc = device.createCommandEncoder();
+        x = dispatchResidualConvBlock(device, enc, x, weights.neck.levels[i].res_blocks[j], {
+          inC: dimRB, outC: dimRB, hiddenC: dimRB,
+          H, W, inNorm: config.resBlockInNorm, hiddenNorm: config.resBlockHiddenNorm,
+        });
+        device.queue.submit([enc.finish()]);
+
+        const rbData = await readBuffer(device, x, dimRB * H * W * 4);
+        const rbRef = await loadRef(`decoder_neck_level${i}_resblock${j}`);
+        compare(`resblock_${j}`, rbData, rbRef);
+      }
+
+      // resampler
+      if (i < 4 && config.resamplers[i]) {
+        // First dispatch just the deconv/upsample step
+        enc = device.createCommandEncoder();
+        let midBuf;
+        const nextC = config.dimResBlocks[i + 1];
+        if (config.resamplers[i] === 'conv_transpose') {
+          const deconv = dispatchConvTranspose2d(device, enc, x,
+            weights.neck.levels[i].resampler.deconv_weight,
+            weights.neck.levels[i].resampler.deconv_bias,
+            { inC: dimRB, inH: H, inW: W, outC: nextC, stride: 2 });
+          midBuf = deconv.buffer;
+        } else {
+          const up = dispatchUpsample(device, enc, x,
+            { C: dimRB, inH: H, inW: W, outH: H * 2, outW: W * 2, mode: 1 });
+          midBuf = up.buffer;
+        }
+        device.queue.submit([enc.finish()]);
+
+        const midC = config.resamplers[i] === 'conv_transpose' ? nextC : dimRB;
+        const midData = await readBuffer(device, midBuf, midC * H * 2 * W * 2 * 4);
+        const midRef = await loadRef(`decoder_neck_level${i}_resampler_mid`);
+        compare(`resampler_mid`, midData, midRef);
+
+        // Then the full resampler (deconv + conv)
+        enc = device.createCommandEncoder();
+        const resampled = dispatchResampler(device, enc, x,
+          weights.neck.levels[i].resampler, {
+            inC: dimRB, outC: nextC,
+            H, W, type: config.resamplers[i],
+          });
+        x = resampled.buffer;
+        device.queue.submit([enc.finish()]);
+
+        const resData = await readBuffer(device, x, nextC * H * 2 * W * 2 * 4);
+        const resRef = await loadRef(`decoder_neck_level${i}_post_resampler`);
+        compare(`resampler_out`, resData, resRef);
+      }
+    }
+
+    // Final neck output comparison
+    const finalRef = await loadRef('neck_output_4');
+    const finalData = await readBuffer(device, x, 32 * 592 * 592 * 4);
+    compare('neck_output_4', finalData, finalRef);
+
+    // --- Points head comparison ---
+    console.log('\n--- Points Head ---\n');
+
+    // Use the WebGPU neck outputs (which we just validated) as inputs to points_head
+    // But we need the neck outputs at each level. Let's re-run the neck to collect them,
+    // or use the PyTorch neck outputs directly (since neck error is < 0.001).
+    // Using PyTorch neck outputs isolates points_head errors.
+    const ptsConfig = MODEL_CONFIG.pointsHead;
+    const neckOuts = [];
+    const neckDims = [1024, 256, 128, 64, 32];
+    for (let i = 0; i < 5; i++) {
+      const h = tokenH * (2 ** i);
+      const w = tokenW * (2 ** i);
+      const data = await loadRef(`neck_output_${i}`);
+      neckOuts.push({ buffer: createStorageBuffer(device, data), H: h, W: w });
+    }
+
+    let px = null;
+    for (let i = 0; i < 5; i++) {
+      const H = neckOuts[i].H;
+      const W = neckOuts[i].W;
+      const dimRB = ptsConfig.dimResBlocks[i];
+      const dimIn = ptsConfig.dimIn[i];
+
+      console.log(`--- pts level ${i} (${dimRB}ch, ${H}x${W}) ---`);
+
+      let enc = device.createCommandEncoder();
+      let projected = null;
+      if (dimIn != null) {
+        projected = dispatchConv1x1(device, enc, neckOuts[i].buffer,
+          weights.pointsHead.levels[i].input_weight, weights.pointsHead.levels[i].input_bias,
+          { inC: dimIn, outC: dimRB, H, W });
+      }
+
+      if (i === 0) {
+        px = projected.buffer;
+      } else if (projected) {
+        px = dispatchActivation(device, enc, px, projected.buffer, dimRB * H * W, 2);
+      }
+      device.queue.submit([enc.finish()]);
+
+      const paData = await readBuffer(device, px, dimRB * H * W * 4);
+      compare(`post_add`, paData, await loadRef(`decoder_pts_level${i}_post_add`));
+
+      for (let j = 0; j < ptsConfig.numResBlocks[i]; j++) {
+        enc = device.createCommandEncoder();
+        px = dispatchResidualConvBlock(device, enc, px, weights.pointsHead.levels[i].res_blocks[j], {
+          inC: dimRB, outC: dimRB, hiddenC: dimRB,
+          H, W, inNorm: ptsConfig.resBlockInNorm, hiddenNorm: ptsConfig.resBlockHiddenNorm,
+        });
+        device.queue.submit([enc.finish()]);
+        const rbData = await readBuffer(device, px, dimRB * H * W * 4);
+        compare(`resblock_${j}`, rbData, await loadRef(`decoder_pts_level${i}_resblock${j}`));
+      }
+
+      // output_block
+      if (ptsConfig.dimOut[i] != null) {
+        enc = device.createCommandEncoder();
+        const out = dispatchConv1x1(device, enc, px,
+          weights.pointsHead.levels[i].output_weight, weights.pointsHead.levels[i].output_bias,
+          { inC: dimRB, outC: ptsConfig.dimOut[i], H, W });
+        device.queue.submit([enc.finish()]);
+        const outData = await readBuffer(device, out.buffer, ptsConfig.dimOut[i] * H * W * 4);
+        compare(`output`, outData, await loadRef(`decoder_pts_level${i}_output`));
+      }
+
+      if (i < 4 && ptsConfig.resamplers[i]) {
+        const nextC = ptsConfig.dimResBlocks[i + 1];
+
+        // Resampler mid
+        enc = device.createCommandEncoder();
+        let midBuf;
+        if (ptsConfig.resamplers[i] === 'conv_transpose') {
+          const deconv = dispatchConvTranspose2d(device, enc, px,
+            weights.pointsHead.levels[i].resampler.deconv_weight,
+            weights.pointsHead.levels[i].resampler.deconv_bias,
+            { inC: dimRB, inH: H, inW: W, outC: nextC, stride: 2 });
+          midBuf = deconv.buffer;
+        } else {
+          const up = dispatchUpsample(device, enc, px,
+            { C: dimRB, inH: H, inW: W, outH: H * 2, outW: W * 2, mode: 1 });
+          midBuf = up.buffer;
+        }
+        device.queue.submit([enc.finish()]);
+        const midC = ptsConfig.resamplers[i] === 'conv_transpose' ? nextC : dimRB;
+        const midData = await readBuffer(device, midBuf, midC * H * 2 * W * 2 * 4);
+        compare(`resampler_mid`, midData, await loadRef(`decoder_pts_level${i}_resampler_mid`));
+
+        // Full resampler
+        enc = device.createCommandEncoder();
+        const resampled = dispatchResampler(device, enc, px,
+          weights.pointsHead.levels[i].resampler, {
+            inC: dimRB, outC: nextC,
+            H, W, type: ptsConfig.resamplers[i],
+          });
+        px = resampled.buffer;
+        device.queue.submit([enc.finish()]);
+        const resData = await readBuffer(device, px, nextC * H * 2 * W * 2 * 4);
+        compare(`resampler_out`, resData, await loadRef(`decoder_pts_level${i}_post_resampler`));
+      }
+    }
+
+    console.log('\n=== DECODER COMPARISON COMPLETE ===\n');
+
+    neckOuts.forEach(n => n.buffer.destroy());
+
+    neckInputs.forEach(n => n.buffer.destroy());
+  }
+
+  /**
    * Run full inference.
    */
   async run(imageData) {
@@ -814,40 +1056,129 @@ export class MoGeInference {
       console.log(`Scale head: raw=${x[0].toFixed(4)}, metric_scale=${metricScale.toFixed(4)}`);
     }
 
-    // Post-processing: exp remap
-    const points = new Float32Array(3 * outH * outW);
-    const depth = new Float32Array(outH * outW);
-    const colors = new Float32Array(3 * outH * outW);
+    // Post-processing: exp remap → recover focal/shift → force projection → normals
+    // Matches upstream MoGe infer() post-processing pipeline.
 
+    // Step 1: Exp remap — raw affine point map to camera-ish space
+    const rawPts = new Float32Array(outH * outW * 3); // [H, W, 3] interleaved
     for (let i = 0; i < outH * outW; i++) {
-      let px = pointsRaw[0 * outH * outW + i];
-      let py = pointsRaw[1 * outH * outW + i];
-      let pz = pointsRaw[2 * outH * outW + i];
-
-      // exp remap: xy = xy * exp(z), z = exp(z)
+      const px = pointsRaw[0 * outH * outW + i];
+      const py = pointsRaw[1 * outH * outW + i];
+      const pz = pointsRaw[2 * outH * outW + i];
       const expZ = Math.exp(Math.min(pz, 10));
-      px = px * expZ;
-      py = py * expZ;
-      pz = expZ;
-
-      points[i * 3 + 0] = px;
-      points[i * 3 + 1] = py;
-      points[i * 3 + 2] = pz;
-      depth[i] = pz;
-
-      // Color from input image
-      const oy = Math.floor(i / outW);
-      const ox = i % outW;
-      const srcY = Math.min(Math.floor(oy * height / outH), height - 1);
-      const srcX = Math.min(Math.floor(ox * width / outW), width - 1);
-      const srcIdx = srcY * width + srcX;
-      colors[i * 3 + 0] = imageData.data[srcIdx * 4 + 0] / 255;
-      colors[i * 3 + 1] = imageData.data[srcIdx * 4 + 1] / 255;
-      colors[i * 3 + 2] = imageData.data[srcIdx * 4 + 2] / 255;
+      rawPts[i * 3 + 0] = px * expZ;
+      rawPts[i * 3 + 1] = py * expZ;
+      rawPts[i * 3 + 2] = expZ;
     }
 
-    // Compute normals from point map via finite differences (cross product)
-    // No normal_head in moge-2-vitl — normals are derived from geometry
+    // Step 2: Sigmoid mask
+    const maskBinary = new Uint8Array(outH * outW);
+    for (let i = 0; i < outH * outW; i++) {
+      maskBinary[i] = (1 / (1 + Math.exp(-maskRaw[i]))) > 0.5 ? 1 : 0;
+    }
+
+    // Step 3: Recover focal length and z-shift from the raw point map
+    // Downsample to 64x64 for the optimization (matching upstream)
+    const dsH = 64, dsW = 64;
+    const dsXY = []; // [N, 2]
+    const dsZ = [];  // [N]
+    const dsUV = []; // [N, 2]
+    const aspect = width / height;
+    const spanX = aspect / Math.sqrt(1 + aspect * aspect);
+    const spanY = 1 / Math.sqrt(1 + aspect * aspect);
+    for (let dy = 0; dy < dsH; dy++) {
+      for (let dx = 0; dx < dsW; dx++) {
+        const sy = Math.round(dy * (outH - 1) / (dsH - 1));
+        const sx = Math.round(dx * (outW - 1) / (dsW - 1));
+        const idx = sy * outW + sx;
+        if (!maskBinary[idx]) continue;
+        dsXY.push([rawPts[idx * 3], rawPts[idx * 3 + 1]]);
+        dsZ.push(rawPts[idx * 3 + 2]);
+        // UV in normalized view plane coordinates
+        const u = -spanX * (outW - 1) / outW + (2 * spanX * (outW - 1) / outW) * sx / (outW - 1);
+        const v = -spanY * (outH - 1) / outH + (2 * spanY * (outH - 1) / outH) * sy / (outH - 1);
+        dsUV.push([u, v]);
+      }
+    }
+
+    // Solve for shift: min |focal * xy / (z + shift) - uv| using simple iteration
+    // Start with shift=0, solve for focal, then iterate
+    let shift = 0;
+    let focal = 1;
+    for (let iter = 0; iter < 20; iter++) {
+      // Given shift, solve for focal: focal = sum(xy_proj * uv) / sum(xy_proj^2)
+      let num = 0, den = 0;
+      for (let i = 0; i < dsXY.length; i++) {
+        const invZ = 1 / (dsZ[i] + shift);
+        const xp = dsXY[i][0] * invZ;
+        const yp = dsXY[i][1] * invZ;
+        num += xp * dsUV[i][0] + yp * dsUV[i][1];
+        den += xp * xp + yp * yp;
+      }
+      focal = den > 0 ? num / den : 1;
+
+      // Given focal, solve for shift via gradient step
+      // Error: focal * xy / (z + shift) - uv
+      // d(err)/d(shift) = -focal * xy / (z + shift)^2
+      let grad = 0, hess = 0;
+      for (let i = 0; i < dsXY.length; i++) {
+        const zs = dsZ[i] + shift;
+        const invZs = 1 / zs;
+        const invZs2 = invZs * invZs;
+        for (let c = 0; c < 2; c++) {
+          const err = focal * dsXY[i][c] * invZs - dsUV[i][c];
+          const deriv = -focal * dsXY[i][c] * invZs2;
+          grad += 2 * err * deriv;
+          hess += 2 * deriv * deriv;
+        }
+      }
+      if (Math.abs(hess) > 1e-10) {
+        shift -= grad / hess;
+      }
+    }
+    console.log(`Focal recovery: focal=${focal.toFixed(6)}, shift=${shift.toFixed(6)}`);
+
+    // Step 4: Compute depth = z + shift
+    const depth = new Float32Array(outH * outW);
+    for (let i = 0; i < outH * outW; i++) {
+      depth[i] = rawPts[i * 3 + 2] + shift;
+    }
+
+    // Step 5: Force projection — recompute point map from depth + intrinsics
+    // intrinsics: fx = focal/2 * sqrt(1+ar^2) / ar, fy = focal/2 * sqrt(1+ar^2)
+    // uv_map: pixel centers at (0.5/W, 0.5/H) to (1-0.5/W, 1-0.5/H)
+    // unproject: point = inv(K) * [u * d, v * d, d, 1]
+    // Simplified: px = (u - cx) * d / fx, py = (v - cy) * d / fy, pz = d
+    const diag = Math.sqrt(1 + aspect * aspect);
+    const fx = focal / 2 * diag / aspect;
+    const fy = focal / 2 * diag;
+    const cx = 0.5, cy = 0.5;
+
+    const points = new Float32Array(3 * outH * outW);
+    const colors = new Float32Array(3 * outH * outW);
+    for (let y = 0; y < outH; y++) {
+      for (let x = 0; x < outW; x++) {
+        const i = y * outW + x;
+        const d = depth[i];
+        // UV in [0,1] — pixel center coordinates
+        const u = (x + 0.5) / outW;
+        const v = (y + 0.5) / outH;
+        // Unproject
+        points[i * 3 + 0] = (u - cx) / fx * d;
+        points[i * 3 + 1] = (v - cy) / fy * d;
+        points[i * 3 + 2] = d;
+
+        // Color from input image
+        const srcY = Math.min(Math.floor(y * height / outH), height - 1);
+        const srcX = Math.min(Math.floor(x * width / outW), width - 1);
+        const srcIdx = srcY * width + srcX;
+        colors[i * 3 + 0] = imageData.data[srcIdx * 4 + 0] / 255;
+        colors[i * 3 + 1] = imageData.data[srcIdx * 4 + 1] / 255;
+        colors[i * 3 + 2] = imageData.data[srcIdx * 4 + 2] / 255;
+      }
+    }
+
+    // Step 6: Compute normals from reprojected point map via finite differences
     const normals = new Float32Array(3 * outH * outW);
     for (let y = 0; y < outH; y++) {
       for (let x = 0; x < outW; x++) {
@@ -857,7 +1188,6 @@ export class MoGeInference {
         const ir = y * outW + x1;
         const ib = y1 * outW + x;
 
-        // dP/dx and dP/dy
         const dxX = points[ir * 3 + 0] - points[i * 3 + 0];
         const dxY = points[ir * 3 + 1] - points[i * 3 + 1];
         const dxZ = points[ir * 3 + 2] - points[i * 3 + 2];
@@ -865,7 +1195,6 @@ export class MoGeInference {
         const dyY = points[ib * 3 + 1] - points[i * 3 + 1];
         const dyZ = points[ib * 3 + 2] - points[i * 3 + 2];
 
-        // Cross product
         let nx = dxY * dyZ - dxZ * dyY;
         let ny = dxZ * dyX - dxX * dyZ;
         let nz = dxX * dyY - dxY * dyX;
@@ -876,7 +1205,7 @@ export class MoGeInference {
       }
     }
 
-    // Apply metric scale
+    // Step 7: Apply metric scale
     if (metricScale !== 1.0) {
       for (let i = 0; i < points.length; i++) points[i] *= metricScale;
       for (let i = 0; i < depth.length; i++) depth[i] *= metricScale;
@@ -885,6 +1214,6 @@ export class MoGeInference {
     // Clean up
     neckInputs.forEach(f => f.buffer.destroy());
 
-    return { depth, normals, points, colors, width: outW, height: outH, metricScale };
+    return { depth, normals, points, colors, pointsRaw, width: outW, height: outH, metricScale };
   }
 }

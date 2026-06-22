@@ -79,6 +79,7 @@ async function handleImage(file) {
 
     const t0 = performance.now();
     const result = await inference.run(imageData);
+    window.__lastInferenceResult = result;
     const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
 
     setStatus(`Inference complete in ${elapsed}s`);
