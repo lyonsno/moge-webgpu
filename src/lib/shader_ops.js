@@ -55,16 +55,13 @@ export function dispatchConv2d(device, encoder, inputBuf, weightBuf, biasBuf, pa
   const pipeline = getOrCreatePipeline(device, 'conv2d', conv2dWGSL, 'conv2d_main');
 
   const uniformData = new Uint32Array([inC, inH, inW, outC, outH, outW, kH, kW, padH, padW, strideH, strideW, hasBias]);
-  const uniformBuf = createStorageBuffer(device, uniformData, GPUBufferUsage.UNIFORM);
-  // Override usage for uniform
-  const uniformBuf2 = device.createBuffer({
+  const uniformBuf = device.createBuffer({
     size: uniformData.byteLength,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     mappedAtCreation: true,
   });
-  new Uint32Array(uniformBuf2.getMappedRange()).set(uniformData);
-  uniformBuf2.unmap();
-  uniformBuf.destroy();
+  new Uint32Array(uniformBuf.getMappedRange()).set(uniformData);
+  uniformBuf.unmap();
 
   const dummyBias = biasBuf || createStorageBuffer(device, new Float32Array([0]));
   const outputBuf = createEmptyBuffer(device, outC * outH * outW * 4);
@@ -72,7 +69,7 @@ export function dispatchConv2d(device, encoder, inputBuf, weightBuf, biasBuf, pa
   const bindGroup = device.createBindGroup({
     layout: pipeline.getBindGroupLayout(0),
     entries: [
-      { binding: 0, resource: { buffer: uniformBuf2 } },
+      { binding: 0, resource: { buffer: uniformBuf } },
       { binding: 1, resource: { buffer: inputBuf } },
       { binding: 2, resource: { buffer: weightBuf } },
       { binding: 3, resource: { buffer: dummyBias } },

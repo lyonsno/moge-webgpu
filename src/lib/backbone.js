@@ -105,6 +105,27 @@ export class DINOv2Backbone {
       layout: 'auto',
       compute: { module: splitModule, entryPoint: 'main' },
     });
+
+    // Element-wise add shader (for summing intermediate feature projections)
+    const addModule = device.createShaderModule({
+      code: `
+        @group(0) @binding(0) var<storage, read_write> dst: array<f32>;
+        @group(0) @binding(1) var<storage, read> src: array<f32>;
+        struct P { count: u32, numWgX: u32 }
+        @group(0) @binding(2) var<uniform> p: P;
+
+        @compute @workgroup_size(256)
+        fn main(@builtin(workgroup_id) wgid: vec3u, @builtin(local_invocation_id) lid: vec3u) {
+          let idx = (wgid.x + wgid.y * p.numWgX) * 256u + lid.x;
+          if (idx >= p.count) { return; }
+          dst[idx] = dst[idx] + src[idx];
+        }
+      `,
+    });
+    this.pipelines.add = device.createComputePipeline({
+      layout: 'auto',
+      compute: { module: addModule, entryPoint: 'main' },
+    });
   }
 
   /**
@@ -1147,33 +1168,10 @@ export class DINOv2Backbone {
     const totalWG = ceilDiv(count, 256);
     const [wgX, wgY] = splitWG(totalWG);
 
-    // Use layerScale with gamma=all ones? No, that creates a dependency.
-    // Just dispatch activation add (op=2)
-    // Import not available here, so let's create a simple add inline
-    const addModule = device.createShaderModule({
-      code: `
-        @group(0) @binding(0) var<storage, read_write> dst: array<f32>;
-        @group(0) @binding(1) var<storage, read> src: array<f32>;
-        struct P { count: u32, numWgX: u32 }
-        @group(0) @binding(2) var<uniform> p: P;
-
-        @compute @workgroup_size(256)
-        fn main(@builtin(workgroup_id) wgid: vec3u, @builtin(local_invocation_id) lid: vec3u) {
-          let idx = (wgid.x + wgid.y * p.numWgX) * 256u + lid.x;
-          if (idx >= p.count) { return; }
-          dst[idx] = dst[idx] + src[idx];
-        }
-      `,
-    });
-    const addPipeline = device.createComputePipeline({
-      layout: 'auto',
-      compute: { module: addModule, entryPoint: 'main' },
-    });
-
     const paramsBuf = makeUniform(device, new Uint32Array([count, wgX]));
 
     const bg = device.createBindGroup({
-      layout: addPipeline.getBindGroupLayout(0),
+      layout: this.pipelines.add.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: { buffer: dst } },
         { binding: 1, resource: { buffer: src } },
@@ -1182,7 +1180,7 @@ export class DINOv2Backbone {
     });
 
     const pass = enc.beginComputePass();
-    pass.setPipeline(addPipeline);
+    pass.setPipeline(this.pipelines.add);
     pass.setBindGroup(0, bg);
     pass.dispatchWorkgroups(wgX, wgY);
     pass.end();

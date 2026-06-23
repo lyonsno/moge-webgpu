@@ -72,6 +72,10 @@ function parseHeader(buffer) {
 function extractTensor(device, buffer, tensorInfo) {
   const { dtype, offset, size } = tensorInfo;
 
+  if (offset + size > buffer.byteLength) {
+    throw new Error(`Tensor at offset ${offset} with size ${size} exceeds buffer length ${buffer.byteLength}`);
+  }
+
   if (dtype === 0) {
     // fp32
     const data = new Float32Array(buffer, offset, size / 4);
@@ -114,6 +118,9 @@ function fp16ToFp32(h) {
  */
 function extractTensorCPU(buffer, tensorInfo) {
   const { dtype, offset, size } = tensorInfo;
+  if (offset + size > buffer.byteLength) {
+    throw new Error(`Tensor at offset ${offset} with size ${size} exceeds buffer length ${buffer.byteLength}`);
+  }
   if (dtype === 0) {
     return new Float32Array(buffer.slice(offset, offset + size));
   } else {
@@ -301,8 +308,6 @@ export async function loadWeights(device, url, onProgress) {
   }
 
   // Build all ConvStack weights
-  const MODEL_CONFIG = (await import('./inference.js')).default;
-
   // Import config directly
   const neckConfig = {
     dimIn: [1026, 2, 2, 2, 2],

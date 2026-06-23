@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "test": "node tests/run.mjs"
+    "test": "echo \"See tools/compare_backbone.mjs and tools/visual_smoke.mjs for test harnesses\""
   },
   "devDependencies": {
     "puppeteer-core": "^25.1.0",

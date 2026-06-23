@@ -1,6 +1,7 @@
 node_modules/
 dist/
 .vite/
+.DS_Store
 
 # Weights (large, generated locally via tools/convert_weights.py)
 public/weights.bin
