@@ -1,5 +1,19 @@
 node_modules/
 dist/
 .vite/
+
+# Weights (large, generated locally via tools/convert_weights.py)
 public/weights.bin
 public/weights.json
+public/weights_fp32.bin
+public/weights_fp32.json
+
+# PyTorch layer dumps (debug artifacts)
+public/layer_dumps/*.bin
+public/layer_dumps_evil_orb/
+
+# Test fixtures (local only)
+public/test_fixtures/
+
+# Comparison results
+tools/compare_results.json
