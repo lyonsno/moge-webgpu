@@ -40,6 +40,11 @@ function parseHeader(buffer) {
   const numTensors = view.getUint32(8, true);
   const headerSize = view.getUint32(12, true);
 
+  const expectedHeaderSize = 16 + numTensors * ENTRY_SIZE;
+  if (expectedHeaderSize > buffer.byteLength) {
+    throw new Error(`Corrupt weight file: header claims ${numTensors} tensors (${expectedHeaderSize} bytes) but file is only ${buffer.byteLength} bytes`);
+  }
+
   const tensors = new Map();
   for (let i = 0; i < numTensors; i++) {
     const entryOffset = 16 + i * ENTRY_SIZE;
@@ -179,6 +184,13 @@ export async function loadWeights(device, url, onProgress) {
   }
 
   const { tensors } = parseHeader(buffer);
+
+  // Helper: get tensor info or throw (for CPU extraction)
+  const getInfo = (name) => {
+    const info = tensors.get(name);
+    if (!info) throw new Error(`Missing weight: ${name}`);
+    return info;
+  };
 
   // Helper: get tensor or throw
   const get = (name) => {
@@ -341,9 +353,9 @@ export async function loadWeights(device, url, onProgress) {
     }),
     scaleHead: {
       layers: [
-        { weight: extractTensorCPU(buffer, tensors.get('scale_head.0.weight')), bias: extractTensorCPU(buffer, tensors.get('scale_head.0.bias')), inDim: 1024, outDim: 1024 },
-        { weight: extractTensorCPU(buffer, tensors.get('scale_head.2.weight')), bias: extractTensorCPU(buffer, tensors.get('scale_head.2.bias')), inDim: 1024, outDim: 1024 },
-        { weight: extractTensorCPU(buffer, tensors.get('scale_head.4.weight')), bias: extractTensorCPU(buffer, tensors.get('scale_head.4.bias')), inDim: 1024, outDim: 1 },
+        { weight: extractTensorCPU(buffer, getInfo('scale_head.0.weight')), bias: extractTensorCPU(buffer, getInfo('scale_head.0.bias')), inDim: 1024, outDim: 1024 },
+        { weight: extractTensorCPU(buffer, getInfo('scale_head.2.weight')), bias: extractTensorCPU(buffer, getInfo('scale_head.2.bias')), inDim: 1024, outDim: 1024 },
+        { weight: extractTensorCPU(buffer, getInfo('scale_head.4.weight')), bias: extractTensorCPU(buffer, getInfo('scale_head.4.bias')), inDim: 1024, outDim: 1 },
       ],
     },
   };

@@ -5,7 +5,7 @@
  *   1. Patch embedding: image → [N+1, 1024] tokens (14×14 patches + CLS)
  *   2. 24 transformer blocks, each:
  *      a. LayerNorm1 → Attention (QKV → scores → softmax → apply → proj) → LayerScale1 + residual
- *      b. LayerNorm2 → SwiGLU FFN (w12 → gate → w3) → LayerScale2 + residual
+ *      b. LayerNorm2 → GELU MLP (fc1 → GELU → fc2) → LayerScale2 + residual
  *   3. Extract intermediate features at layers [5, 11, 17, 23]
  *   4. Project each intermediate feature with 1x1 conv and sum
  *
