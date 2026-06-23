@@ -66,9 +66,15 @@ const MODEL_CONFIG = {
     resBlockInNorm: 'none',
     resBlockHiddenNorm: 'none',
   },
-  // NOTE: moge-2-vitl does NOT have a normal_head.
-  // Normals are computed from the point map via finite differences.
-  // moge-2-vits-normal has a normal_head but we're targeting vitl.
+  normalHead: {
+    dimIn: [1024, 256, 128, 64, 32],
+    dimResBlocks: [1024, 256, 128, 64, 32],
+    dimOut: [null, null, null, null, 3],
+    numResBlocks: [0, 1, 1, 1, 0],
+    resamplers: ['conv_transpose', 'conv_transpose', 'conv_transpose', 'bilinear'],
+    resBlockInNorm: 'none',
+    resBlockHiddenNorm: 'none',
+  },
   maskHead: {
     dimIn: [1024, 256, 128, 64, 32],
     dimResBlocks: [1024, 256, 128, 64, 32],
@@ -334,6 +340,7 @@ export class MoGeInference {
     return {
       neck: makeConvStackWeights(MODEL_CONFIG.neck),
       pointsHead: makeConvStackWeights(MODEL_CONFIG.pointsHead),
+      normalHead: makeConvStackWeights(MODEL_CONFIG.normalHead),
       maskHead: makeConvStackWeights(MODEL_CONFIG.maskHead),
     };
   }
@@ -729,6 +736,10 @@ export class MoGeInference {
     const pointsInputs = neckOutputs.map(f => ({ buffer: f.buffer, H: f.H, W: f.W }));
     const pointsOutputs = dispatchConvStack(device, decoderEncoder, pointsInputs, this.weights.pointsHead, MODEL_CONFIG.pointsHead);
 
+    // Normal head
+    const normalInputs = neckOutputs.map(f => ({ buffer: f.buffer, H: f.H, W: f.W }));
+    const normalOutputs = dispatchConvStack(device, decoderEncoder, normalInputs, this.weights.normalHead, MODEL_CONFIG.normalHead);
+
     // Mask head
     const maskInputs = neckOutputs.map(f => ({ buffer: f.buffer, H: f.H, W: f.W }));
     const maskOutputs = dispatchConvStack(device, decoderEncoder, maskInputs, this.weights.maskHead, MODEL_CONFIG.maskHead);
@@ -759,10 +770,12 @@ export class MoGeInference {
 
     // Read back
     const lastPoints = pointsOutputs[pointsOutputs.length - 1];
+    const lastNormals = normalOutputs[normalOutputs.length - 1];
     const lastMask = maskOutputs[maskOutputs.length - 1];
 
-    const [pointsRaw, maskRaw] = await Promise.all([
+    const [pointsRaw, normalsRaw, maskRaw] = await Promise.all([
       readBuffer(device, lastPoints.buffer, lastPoints.C * lastPoints.H * lastPoints.W * 4),
+      readBuffer(device, lastNormals.buffer, lastNormals.C * lastNormals.H * lastNormals.W * 4),
       readBuffer(device, lastMask.buffer, lastMask.C * lastMask.H * lastMask.W * 4),
     ]);
 
@@ -846,34 +859,17 @@ export class MoGeInference {
       colors[i * 3 + 2] = imageData.data[srcIdx * 4 + 2] / 255;
     }
 
-    // Compute normals from point map via finite differences (cross product)
-    // No normal_head in moge-2-vitl — normals are derived from geometry
+    // Normals from normal_head (moge-2-vitl-normal model)
+    // normalsRaw is CHW planar [3, outH, outW], needs L2 normalization per pixel
     const normals = new Float32Array(3 * outH * outW);
-    for (let y = 0; y < outH; y++) {
-      for (let x = 0; x < outW; x++) {
-        const i = y * outW + x;
-        const x1 = Math.min(x + 1, outW - 1);
-        const y1 = Math.min(y + 1, outH - 1);
-        const ir = y * outW + x1;
-        const ib = y1 * outW + x;
-
-        // dP/dx and dP/dy
-        const dxX = points[ir * 3 + 0] - points[i * 3 + 0];
-        const dxY = points[ir * 3 + 1] - points[i * 3 + 1];
-        const dxZ = points[ir * 3 + 2] - points[i * 3 + 2];
-        const dyX = points[ib * 3 + 0] - points[i * 3 + 0];
-        const dyY = points[ib * 3 + 1] - points[i * 3 + 1];
-        const dyZ = points[ib * 3 + 2] - points[i * 3 + 2];
-
-        // Cross product
-        let nx = dxY * dyZ - dxZ * dyY;
-        let ny = dxZ * dyX - dxX * dyZ;
-        let nz = dxX * dyY - dxY * dyX;
-        const len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
-        normals[i * 3 + 0] = nx / len;
-        normals[i * 3 + 1] = ny / len;
-        normals[i * 3 + 2] = nz / len;
-      }
+    for (let i = 0; i < outH * outW; i++) {
+      let nx = normalsRaw[0 * outH * outW + i];
+      let ny = normalsRaw[1 * outH * outW + i];
+      let nz = normalsRaw[2 * outH * outW + i];
+      const len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+      normals[i * 3 + 0] = nx / len;
+      normals[i * 3 + 1] = ny / len;
+      normals[i * 3 + 2] = nz / len;
     }
 
     // Apply metric scale
