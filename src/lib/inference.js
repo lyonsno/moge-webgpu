@@ -463,10 +463,12 @@ export class MoGeInference {
 
     let backboneFeatureBuf = null;
     let backboneClsTokenBuf = null;
+    let imageBuf = null;
+    const tempUploadBuffers = [];
     const commandEncoder = device.createCommandEncoder();
 
     if (useBackbone) {
-      const imageBuf = createStorageBuffer(device, normalizedImage);
+      imageBuf = createStorageBuffer(device, normalizedImage);
 
       const { featureBuf, clsTokenBuf } = this.backbone.encode(
         commandEncoder, imageBuf, this.weights, tokenH, tokenW
@@ -475,7 +477,6 @@ export class MoGeInference {
       // Keep feature and CLS buffers on GPU — no readback here
       backboneFeatureBuf = featureBuf;
       backboneClsTokenBuf = clsTokenBuf;
-      // imageBuf will be cleaned up at the end
     } else {
       // Try fixture, then fall back to random
       const fixture = await this._loadFixture();
@@ -672,6 +673,7 @@ export class MoGeInference {
         const uv = makeUV(h, w, aspect);
         const uvBuf = createStorageBuffer(device, uv);
         commandEncoder.copyBufferToBuffer(uvBuf, 0, combinedBuf, featureBytes, uv.byteLength);
+        tempUploadBuffers.push(uvBuf);
         neckInputs.push({ buffer: combinedBuf, H: h, W: w });
       } else if (level === 0 && encoderData) {
         // CPU fallback path (stub/fixture features)
@@ -708,6 +710,8 @@ export class MoGeInference {
 
     // Submit entire pipeline (backbone + decoder in one encoder)
     device.queue.submit([decoderEncoder.finish()]);
+    if (imageBuf) imageBuf.destroy();
+    tempUploadBuffers.forEach(buf => buf.destroy());
 
     // Read back final outputs (only the necessary ones)
     const lastPoints = pointsOutputs[pointsOutputs.length - 1];

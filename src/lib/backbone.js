@@ -29,23 +29,43 @@ function splitWG(total) {
 }
 function ceilDiv(a, b) { return Math.ceil(a / b); }
 
+function byteView(data) {
+  if (ArrayBuffer.isView(data)) {
+    return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  }
+  return new Uint8Array(data);
+}
+
 function makeUniform(device, data) {
+  const bytes = byteView(data);
   const buf = device.createBuffer({
-    size: Math.max(data.byteLength, 16),
+    size: Math.max(bytes.byteLength, 16),
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     mappedAtCreation: true,
   });
-  new Uint8Array(buf.getMappedRange()).set(new Uint8Array(data.buffer || data));
+  new Uint8Array(buf.getMappedRange()).set(bytes);
   buf.unmap();
   return buf;
 }
 
 // Cache key from typed array contents
 function uniformKey(data) {
-  const bytes = new Uint8Array(data.buffer || data);
+  const bytes = byteView(data);
   let h = 0;
   for (let i = 0; i < bytes.length; i++) h = (h * 31 + bytes[i]) | 0;
   return `u_${bytes.length}_${h}`;
+}
+
+const bindGroupBufferIds = new WeakMap();
+let nextBindGroupBufferId = 1;
+
+function bindGroupBufferId(buffer) {
+  let id = bindGroupBufferIds.get(buffer);
+  if (!id) {
+    id = nextBindGroupBufferId++;
+    bindGroupBufferIds.set(buffer, id);
+  }
+  return id;
 }
 
 // DINOv2 ViT-Large config
@@ -305,14 +325,12 @@ export class DINOv2Backbone {
   }
 
   _cachedBindGroup(tag, layout, entries) {
-    // Build cache key from tag + all bound buffer identities
+    // Build cache key from tag + all resource identity/range metadata.
     let key = tag;
     for (const e of entries) {
       const r = e.resource;
       const buf = r.buffer;
-      if (!buf._bgId) buf._bgId = ++DINOv2Backbone._bgIdCounter;
-      key += `_${buf._bgId}`;
-      if (r.offset !== undefined) key += `@${r.offset}`;
+      key += `|b${e.binding}:${bindGroupBufferId(buf)}@${r.offset || 0}+${r.size || 'all'}`;
     }
     if (this._bindGroupCache.has(key)) return this._bindGroupCache.get(key);
     const bg = this.device.createBindGroup({ layout, entries });
@@ -1189,7 +1207,5 @@ export class DINOv2Backbone {
     pass.end();
   }
 }
-
-DINOv2Backbone._bgIdCounter = 0;
 
 export { VIT_CONFIG };

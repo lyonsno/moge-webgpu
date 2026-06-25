@@ -15,15 +15,33 @@ import upsampleWGSL from '../shaders/upsample.wgsl?raw';
 
 import { createStorageBuffer, createEmptyBuffer } from './gpu.js';
 
-const pipelineCache = new Map();
-const uniformCache = new Map();
+const pipelineCaches = new WeakMap();
+const uniformCaches = new WeakMap();
+const dummyBiasBuffers = new WeakMap();
 const MAX_WG_DIM = 65535;
 
+function cacheFor(device, caches) {
+  let cache = caches.get(device);
+  if (!cache) {
+    cache = new Map();
+    caches.set(device, cache);
+  }
+  return cache;
+}
+
+function byteView(data) {
+  if (ArrayBuffer.isView(data)) {
+    return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  }
+  return new Uint8Array(data);
+}
+
 function cachedUniform(device, data) {
-  const bytes = new Uint8Array(data.buffer || data);
+  const bytes = byteView(data);
   let h = 0;
   for (let i = 0; i < bytes.length; i++) h = (h * 31 + bytes[i]) | 0;
   const key = `u_${bytes.length}_${h}`;
+  const uniformCache = cacheFor(device, uniformCaches);
   if (uniformCache.has(key)) return uniformCache.get(key);
   const buf = device.createBuffer({
     size: Math.max(bytes.byteLength, 16),
@@ -37,10 +55,11 @@ function cachedUniform(device, data) {
 }
 
 // Cache for dummy bias buffers (one per device)
-let dummyBiasBuf = null;
 function getDummyBias(device) {
+  let dummyBiasBuf = dummyBiasBuffers.get(device);
   if (!dummyBiasBuf) {
     dummyBiasBuf = createStorageBuffer(device, new Float32Array([0]));
+    dummyBiasBuffers.set(device, dummyBiasBuf);
   }
   return dummyBiasBuf;
 }
@@ -57,6 +76,7 @@ function splitWorkgroups(totalWG) {
 }
 
 function getOrCreatePipeline(device, key, code, entryPoint) {
+  const pipelineCache = cacheFor(device, pipelineCaches);
   if (pipelineCache.has(key)) return pipelineCache.get(key);
   const module = device.createShaderModule({ code });
   const pipeline = device.createComputePipeline({
