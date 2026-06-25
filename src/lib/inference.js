@@ -461,57 +461,21 @@ export class MoGeInference {
       }
     }
 
+    let backboneFeatureBuf = null;
+    let backboneClsTokenBuf = null;
     const commandEncoder = device.createCommandEncoder();
 
     if (useBackbone) {
-      console.log(`Running DINOv2 backbone: image [3, ${imgH}, ${imgW}] → tokens [${tokenH}x${tokenW}]`);
       const imageBuf = createStorageBuffer(device, normalizedImage);
 
-      const { featureBuf, clsTokenBuf, _debugSnaps } = this.backbone.encode(
+      const { featureBuf, clsTokenBuf } = this.backbone.encode(
         commandEncoder, imageBuf, this.weights, tokenH, tokenW
       );
 
-      // Submit backbone compute, read back features and CLS token
-      device.queue.submit([commandEncoder.finish()]);
-
-      const numPatches = tokenH * tokenW;
-      encoderData = await readBuffer(device, featureBuf, encoderDim * numPatches * 4);
-
-      // Read CLS token (first row of normed token buffer) for scale head
-      clsTokenData = await readBuffer(device, clsTokenBuf, encoderDim * 4);
-      let bMin = Infinity, bMax = -Infinity;
-      for (let i = 0; i < encoderData.length; i++) {
-        if (encoderData[i] < bMin) bMin = encoderData[i];
-        if (encoderData[i] > bMax) bMax = encoderData[i];
-      }
-      const backboneRange = `[${bMin.toFixed(3)}, ${bMax.toFixed(3)}]`;
-      console.log(`Backbone output: [${encoderDim}, ${tokenH}, ${tokenW}], range=${backboneRange}`);
-      window.__mogeDebug = window.__mogeDebug || {};
-      // Compute std too
-      let bSum = 0, bSqSum = 0;
-      for (let i = 0; i < encoderData.length; i++) {
-        bSum += encoderData[i];
-        bSqSum += encoderData[i] * encoderData[i];
-      }
-      const bMean = bSum / encoderData.length;
-      const bStd = Math.sqrt(bSqSum / encoderData.length - bMean * bMean);
-
-      window.__mogeDebug.backboneRange = backboneRange;
-      window.__mogeDebug.backboneStats = `mean=${bMean.toFixed(4)}, std=${bStd.toFixed(4)}, n=${encoderData.length}`;
-      window.__mogeDebug.backboneShape = [encoderDim, tokenH, tokenW];
-
-      // Debug: check snapshot buffers
-      if (_debugSnaps && _debugSnaps.length > 0) {
-        const snap0 = await readBuffer(device, _debugSnaps[0].buffer, 4096);
-        let s0Min = Infinity, s0Max = -Infinity;
-        for (let i = 0; i < snap0.length; i++) {
-          if (snap0[i] < s0Min) s0Min = snap0[i];
-          if (snap0[i] > s0Max) s0Max = snap0[i];
-        }
-        window.__mogeDebug.snap0 = `layer${_debugSnaps[0].layerIdx}: [${s0Min.toFixed(4)}, ${s0Max.toFixed(4)}]`;
-      }
-
-      imageBuf.destroy();
+      // Keep feature and CLS buffers on GPU — no readback here
+      backboneFeatureBuf = featureBuf;
+      backboneClsTokenBuf = clsTokenBuf;
+      // imageBuf will be cleaned up at the end
     } else {
       // Try fixture, then fall back to random
       const fixture = await this._loadFixture();
@@ -674,11 +638,6 @@ export class MoGeInference {
     }
 
     // Build neck input features: encoder features + UV coords at 5 scales
-    // UV coords must match upstream normalized_view_plane_uv exactly:
-    //   span_x = aspect_ratio / sqrt(1 + aspect_ratio^2)
-    //   span_y = 1 / sqrt(1 + aspect_ratio^2)
-    //   u = linspace(-span_x * (w-1)/w, +span_x * (w-1)/w, w)
-    //   v = linspace(-span_y * (h-1)/h, +span_y * (h-1)/h, h)
     const aspect = width / height;
     const neckInputs = [];
 
@@ -702,32 +661,35 @@ export class MoGeInference {
       const w = tokenW * (2 ** level);
       const dimIn = MODEL_CONFIG.neck.dimIn[level];
 
-      const data = new Float32Array(dimIn * h * w);
-      const uv = makeUV(h, w, aspect);
-      if (level === 0) {
-        // Encoder features [1024, tokenH, tokenW] + UV [2, tokenH, tokenW]
+      if (level === 0 && backboneFeatureBuf) {
+        // Zero-copy: concatenate backbone GPU buffer with UV on GPU
+        const totalSize = dimIn * h * w * 4;
+        const combinedBuf = createEmptyBuffer(device, totalSize);
+        // Copy backbone features [1024, tokenH, tokenW] from GPU buffer
+        const featureBytes = encoderDim * h * w * 4;
+        commandEncoder.copyBufferToBuffer(backboneFeatureBuf, 0, combinedBuf, 0, featureBytes);
+        // Upload UV coords to the remaining 2*h*w region
+        const uv = makeUV(h, w, aspect);
+        const uvBuf = createStorageBuffer(device, uv);
+        commandEncoder.copyBufferToBuffer(uvBuf, 0, combinedBuf, featureBytes, uv.byteLength);
+        neckInputs.push({ buffer: combinedBuf, H: h, W: w });
+      } else if (level === 0 && encoderData) {
+        // CPU fallback path (stub/fixture features)
+        const data = new Float32Array(dimIn * h * w);
+        const uv = makeUV(h, w, aspect);
         data.set(encoderData, 0);
         data.set(uv, encoderDim * h * w);
+        neckInputs.push({ buffer: createStorageBuffer(device, data), H: h, W: w });
       } else {
         // UV only [2, h, w]
-        data.set(uv, 0);
-      }
-      neckInputs.push({ buffer: createStorageBuffer(device, data), H: h, W: w });
-
-      // Debug: check neck level 0 input range
-      if (level === 0) {
-        let nMin = Infinity, nMax = -Infinity;
-        for (let i = 0; i < Math.min(data.length, 10000); i++) {
-          if (data[i] < nMin) nMin = data[i];
-          if (data[i] > nMax) nMax = data[i];
-        }
-        window.__mogeDebug = window.__mogeDebug || {};
-        window.__mogeDebug.neckLevel0 = `[${nMin.toFixed(4)}, ${nMax.toFixed(4)}] size=${data.length}`;
+        const uv = makeUV(h, w, aspect);
+        neckInputs.push({ buffer: createStorageBuffer(device, uv), H: h, W: w });
       }
     }
 
-    // --- Decoder dispatch ---
-    const decoderEncoder = device.createCommandEncoder();
+    // Submit backbone (if used) and start decoder in one encoder
+    // No separate submit — backbone and decoder buffer copies share this encoder
+    const decoderEncoder = commandEncoder;
 
     // Neck
     const neckOutputs = dispatchConvStack(device, decoderEncoder, neckInputs, this.weights.neck, MODEL_CONFIG.neck);
@@ -744,31 +706,10 @@ export class MoGeInference {
     const maskInputs = neckOutputs.map(f => ({ buffer: f.buffer, H: f.H, W: f.W }));
     const maskOutputs = dispatchConvStack(device, decoderEncoder, maskInputs, this.weights.maskHead, MODEL_CONFIG.maskHead);
 
-    // Submit decoder
+    // Submit entire pipeline (backbone + decoder in one encoder)
     device.queue.submit([decoderEncoder.finish()]);
 
-    // Debug: check neck output level 0
-    {
-      const neckOut0Size = neckOutputs[0].C * neckOutputs[0].H * neckOutputs[0].W * 4;
-      const neckOut0 = await readBuffer(device, neckOutputs[0].buffer, neckOut0Size);
-      let n0Min = Infinity, n0Max = -Infinity;
-      for (let i = 0; i < neckOut0.length; i++) {
-        if (neckOut0[i] < n0Min) n0Min = neckOut0[i];
-        if (neckOut0[i] > n0Max) n0Max = neckOut0[i];
-      }
-      window.__mogeDebug.neckOut0 = `C=${neckOutputs[0].C} ${neckOutputs[0].H}x${neckOutputs[0].W}: [${n0Min.toFixed(4)}, ${n0Max.toFixed(4)}]`;
-
-      // Also check final points output
-      const lastPts = await readBuffer(device, neckOutputs[neckOutputs.length - 1].buffer, 4096);
-      let pMin = Infinity, pMax = -Infinity;
-      for (let i = 0; i < lastPts.length; i++) {
-        if (lastPts[i] < pMin) pMin = lastPts[i];
-        if (lastPts[i] > pMax) pMax = lastPts[i];
-      }
-      window.__mogeDebug.neckOutLast = `C=${neckOutputs[neckOutputs.length-1].C} ${neckOutputs[neckOutputs.length-1].H}x${neckOutputs[neckOutputs.length-1].W}: [${pMin.toFixed(4)}, ${pMax.toFixed(4)}]`;
-    }
-
-    // Read back
+    // Read back final outputs (only the necessary ones)
     const lastPoints = pointsOutputs[pointsOutputs.length - 1];
     const lastNormals = normalOutputs[normalOutputs.length - 1];
     const lastMask = maskOutputs[maskOutputs.length - 1];
@@ -805,6 +746,11 @@ export class MoGeInference {
       }
     }
     console.log(`Mask raw: range=[${mMin.toFixed(4)}, ${mMax.toFixed(4)}]`);
+
+    // Read CLS token for scale head (deferred from backbone to avoid mid-pipeline sync)
+    if (backboneClsTokenBuf && !clsTokenData) {
+      clsTokenData = await readBuffer(device, backboneClsTokenBuf, encoderDim * 4);
+    }
 
     // Scale head: CLS token → metric scale via MLP (1024→1024→1024→1) + exp
     let metricScale = 1.0;

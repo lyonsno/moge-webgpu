@@ -40,6 +40,14 @@ function makeUniform(device, data) {
   return buf;
 }
 
+// Cache key from typed array contents
+function uniformKey(data) {
+  const bytes = new Uint8Array(data.buffer || data);
+  let h = 0;
+  for (let i = 0; i < bytes.length; i++) h = (h * 31 + bytes[i]) | 0;
+  return `u_${bytes.length}_${h}`;
+}
+
 // DINOv2 ViT-Large config
 const VIT_CONFIG = {
   dim: 1024,
@@ -59,6 +67,8 @@ export class DINOv2Backbone {
   constructor(device) {
     this.device = device;
     this.pipelines = {};
+    this._uniformCache = new Map();
+    this._bindGroupCache = new Map();
   }
 
   init() {
@@ -137,6 +147,38 @@ export class DINOv2Backbone {
    * @param {number} tokenW
    * @returns {{ featureBuf: GPUBuffer, clsTokenBuf: GPUBuffer }}
    */
+  _ensureWorkBuffers(tokenH, tokenW) {
+    if (this._workBufs && this._workTokenH === tokenH && this._workTokenW === tokenW) return;
+    const device = this.device;
+    const D = VIT_CONFIG.dim;
+    const numPatches = tokenH * tokenW;
+    const N = numPatches + 1;
+    const T = N * D;
+
+    // Destroy old buffers if grid size changed
+    if (this._workBufs) {
+      for (const buf of Object.values(this._workBufs)) buf.destroy();
+      this._bindGroupCache.clear();
+    }
+
+    this._workBufs = {
+      tokenBufA: createEmptyBuffer(device, T * 4),
+      tokenBufB: createEmptyBuffer(device, T * 4),
+      normBuf: createEmptyBuffer(device, T * 4),
+      qBuf: createEmptyBuffer(device, T * 4),
+      kBuf: createEmptyBuffer(device, T * 4),
+      vBuf: createEmptyBuffer(device, T * 4),
+      scoreBuf: createEmptyBuffer(device, VIT_CONFIG.numHeads * N * N * 4),
+      attnOutBuf: createEmptyBuffer(device, T * 4),
+      projOutBuf: createEmptyBuffer(device, T * 4),
+      hiddenBuf: createEmptyBuffer(device, N * VIT_CONFIG.mlpHiddenDim * 4),
+      ffnOutBuf: createEmptyBuffer(device, T * 4),
+      qkvWorkBuf: createEmptyBuffer(device, N * 3 * D * 4),
+    };
+    this._workTokenH = tokenH;
+    this._workTokenW = tokenW;
+  }
+
   encode(encoder, imageBuf, weights, tokenH, tokenW) {
     const device = this.device;
     const D = VIT_CONFIG.dim;
@@ -144,29 +186,18 @@ export class DINOv2Backbone {
     const N = numPatches + 1; // +1 for CLS
     const T = N * D; // total token elements
 
+    this._ensureWorkBuffers(tokenH, tokenW);
+    const wb = this._workBufs;
+
     // --- Patch embedding ---
-    const tokenBuf = createEmptyBuffer(device, T * 4);
-    this._encodePatchEmbed(encoder, imageBuf, weights, tokenBuf, tokenH, tokenW);
+    // tokenBufA is the initial token buffer
+    this._encodePatchEmbed(encoder, imageBuf, weights, wb.tokenBufA, tokenH, tokenW);
 
     // --- Transformer blocks ---
-    // Intermediate feature buffers for extraction
     const intermediateFeatures = [];
-    let currentTokens = tokenBuf;
+    let currentTokens = wb.tokenBufA;
 
-    // Working buffers (reused across layers)
-    const normBuf = createEmptyBuffer(device, T * 4);
-    const qBuf = createEmptyBuffer(device, T * 4);
-    const kBuf = createEmptyBuffer(device, T * 4);
-    const vBuf = createEmptyBuffer(device, T * 4);
-    const scoreBuf = createEmptyBuffer(device, VIT_CONFIG.numHeads * N * N * 4);
-    const attnOutBuf = createEmptyBuffer(device, T * 4);
-    const projOutBuf = createEmptyBuffer(device, T * 4);
-    const hiddenBuf = createEmptyBuffer(device, N * VIT_CONFIG.mlpHiddenDim * 4);
-    const ffnOutBuf = createEmptyBuffer(device, T * 4);
-    const qkvWorkBuf = createEmptyBuffer(device, N * 3 * D * 4);
-    // Two token buffers for ping-pong (avoid read/write race on same buffer)
-    let tokenBufA = tokenBuf;
-    let tokenBufB = createEmptyBuffer(device, T * 4);
+    const { normBuf, qBuf, kBuf, vBuf, scoreBuf, attnOutBuf, projOutBuf, hiddenBuf, ffnOutBuf, qkvWorkBuf, tokenBufA, tokenBufB } = wb;
 
     for (let l = 0; l < VIT_CONFIG.numLayers; l++) {
       // LayerNorm1
@@ -265,6 +296,30 @@ export class DINOv2Backbone {
     };
   }
 
+  _cachedUniform(data) {
+    const key = uniformKey(data);
+    if (this._uniformCache.has(key)) return this._uniformCache.get(key);
+    const buf = makeUniform(this.device, data);
+    this._uniformCache.set(key, buf);
+    return buf;
+  }
+
+  _cachedBindGroup(tag, layout, entries) {
+    // Build cache key from tag + all bound buffer identities
+    let key = tag;
+    for (const e of entries) {
+      const r = e.resource;
+      const buf = r.buffer;
+      if (!buf._bgId) buf._bgId = ++DINOv2Backbone._bgIdCounter;
+      key += `_${buf._bgId}`;
+      if (r.offset !== undefined) key += `@${r.offset}`;
+    }
+    if (this._bindGroupCache.has(key)) return this._bindGroupCache.get(key);
+    const bg = this.device.createBindGroup({ layout, entries });
+    this._bindGroupCache.set(key, bg);
+    return bg;
+  }
+
   // --- Private dispatch methods ---
 
   _encodePatchEmbed(encoder, imageBuf, weights, outputBuf, tokenH, tokenW) {
@@ -276,7 +331,7 @@ export class DINOv2Backbone {
     const [wgX, wgY] = splitWG(totalWG);
 
     const paramsData = new Uint32Array([tokenH * ps, tokenW * ps, ps, tokenH, tokenW, 3, D, numTokens, wgX]);
-    const paramsBuf = makeUniform(device, paramsData);
+    const paramsBuf = this._cachedUniform(paramsData);
 
     const bg = device.createBindGroup({
       layout: this.pipelines.patchEmbed.getBindGroupLayout(0),
@@ -307,39 +362,30 @@ export class DINOv2Backbone {
     v.setUint32(0, N, true);
     v.setUint32(4, D, true);
     v.setFloat32(8, VIT_CONFIG.eps, true);
-    const paramsBuf = makeUniform(device, new Uint8Array(paramsData));
+    const paramsBuf = this._cachedUniform(new Uint8Array(paramsData));
 
-    // Get weight/bias buffers by name
     const gammaKey = `${prefix}.weight`;
     const betaKey = `${prefix}.bias`;
     let gamma = weights.encoder.blockWeights?.[gammaKey];
     let beta = weights.encoder.blockWeights?.[betaKey];
-    // Fallback for backbone final norm
     if (!gamma && prefix === 'encoder.backbone.norm') {
       gamma = weights.encoder.norm?.weight;
       beta = weights.encoder.norm?.bias;
     }
+    if (!gamma || !beta) { console.warn(`Missing LayerNorm weights: ${prefix}`); return; }
 
-    if (!gamma || !beta) {
-      console.warn(`Missing LayerNorm weights: ${prefix}`);
-      return;
-    }
-
-    const bg = device.createBindGroup({
-      layout: this.pipelines.layerNorm.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: paramsBuf } },
-        { binding: 1, resource: { buffer: input } },
-        { binding: 2, resource: { buffer: gamma } },
-        { binding: 3, resource: { buffer: beta } },
-        { binding: 4, resource: { buffer: output } },
-      ],
-    });
+    const bg = this._cachedBindGroup(`ln_${prefix}`, this.pipelines.layerNorm.getBindGroupLayout(0), [
+      { binding: 0, resource: { buffer: paramsBuf } },
+      { binding: 1, resource: { buffer: input } },
+      { binding: 2, resource: { buffer: gamma } },
+      { binding: 3, resource: { buffer: beta } },
+      { binding: 4, resource: { buffer: output } },
+    ]);
 
     const pass = enc.beginComputePass();
     pass.setPipeline(this.pipelines.layerNorm);
     pass.setBindGroup(0, bg);
-    pass.dispatchWorkgroups(N); // one workgroup per token
+    pass.dispatchWorkgroups(N);
     pass.end();
   }
 
@@ -369,18 +415,16 @@ export class DINOv2Backbone {
     const [wgX, wgY] = splitWG(totalWG);
 
     const paramsData = new Uint32Array([numRows, inDim, outDim, wgX]);
-    const paramsBuf = makeUniform(device, paramsData);
+    const paramsBuf = this._cachedUniform(paramsData);
 
-    const bg = device.createBindGroup({
-      layout: this.pipelines.linear.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: paramsBuf } },
-        { binding: 1, resource: { buffer: input } },
-        { binding: 2, resource: { buffer: weight } },
-        { binding: 3, resource: { buffer: bias } },
-        { binding: 4, resource: { buffer: output } },
-      ],
-    });
+    const entries = [
+      { binding: 0, resource: { buffer: paramsBuf } },
+      { binding: 1, resource: { buffer: input } },
+      { binding: 2, resource: { buffer: weight } },
+      { binding: 3, resource: { buffer: bias } },
+      { binding: 4, resource: { buffer: output } },
+    ];
+    const bg = this._cachedBindGroup('linFull', this.pipelines.linear.getBindGroupLayout(0), entries);
 
     const pass = enc.beginComputePass();
     pass.setPipeline(this.pipelines.linear);
@@ -395,18 +439,15 @@ export class DINOv2Backbone {
     const totalWG = ceilDiv(total, 256);
     const [wgX, wgY] = splitWG(totalWG);
 
-    const paramsBuf = makeUniform(device, new Uint32Array([N, D, wgX]));
+    const paramsBuf = this._cachedUniform(new Uint32Array([N, D, wgX]));
 
-    const bg = device.createBindGroup({
-      layout: this.pipelines.splitQKV.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: paramsBuf } },
-        { binding: 1, resource: { buffer: qkvBuf } },
-        { binding: 2, resource: { buffer: qBuf } },
-        { binding: 3, resource: { buffer: kBuf } },
-        { binding: 4, resource: { buffer: vBuf } },
-      ],
-    });
+    const bg = this._cachedBindGroup('splitQKV', this.pipelines.splitQKV.getBindGroupLayout(0), [
+      { binding: 0, resource: { buffer: paramsBuf } },
+      { binding: 1, resource: { buffer: qkvBuf } },
+      { binding: 2, resource: { buffer: qBuf } },
+      { binding: 3, resource: { buffer: kBuf } },
+      { binding: 4, resource: { buffer: vBuf } },
+    ]);
 
     const pass = enc.beginComputePass();
     pass.setPipeline(this.pipelines.splitQKV);
@@ -421,7 +462,7 @@ export class DINOv2Backbone {
     const [wgX, wgY] = splitWG(totalWG);
 
     const paramsData = new Uint32Array([numRows, inDim, outDim, wgX]);
-    const paramsBuf = makeUniform(device, paramsData);
+    const paramsBuf = this._cachedUniform(paramsData);
 
     const weight = weights.encoder.blockWeights?.[`${prefix}.weight`];
     const bias = weights.encoder.blockWeights?.[`${prefix}.bias`];
@@ -431,16 +472,13 @@ export class DINOv2Backbone {
       return;
     }
 
-    const bg = device.createBindGroup({
-      layout: this.pipelines.linear.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: paramsBuf } },
-        { binding: 1, resource: { buffer: input } },
-        { binding: 2, resource: { buffer: weight } },
-        { binding: 3, resource: { buffer: bias } },
-        { binding: 4, resource: { buffer: output } },
-      ],
-    });
+    const bg = this._cachedBindGroup('lin', this.pipelines.linear.getBindGroupLayout(0), [
+      { binding: 0, resource: { buffer: paramsBuf } },
+      { binding: 1, resource: { buffer: input } },
+      { binding: 2, resource: { buffer: weight } },
+      { binding: 3, resource: { buffer: bias } },
+      { binding: 4, resource: { buffer: output } },
+    ]);
 
     const pass = enc.beginComputePass();
     pass.setPipeline(this.pipelines.linear);
@@ -455,18 +493,15 @@ export class DINOv2Backbone {
     const [wgX, wgY] = splitWG(totalWG);
 
     const paramsData = new Uint32Array([numRows, inDim, outDim, wgX]);
-    const paramsBuf = makeUniform(device, paramsData);
+    const paramsBuf = this._cachedUniform(paramsData);
 
-    const bg = device.createBindGroup({
-      layout: this.pipelines.linear.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: paramsBuf } },
-        { binding: 1, resource: { buffer: input } },
-        { binding: 2, resource: { buffer: weight, offset: wOffset, size: wSize } },
-        { binding: 3, resource: { buffer: bias, offset: bOffset, size: bSize } },
-        { binding: 4, resource: { buffer: output } },
-      ],
-    });
+    const bg = this._cachedBindGroup('linOff', this.pipelines.linear.getBindGroupLayout(0), [
+      { binding: 0, resource: { buffer: paramsBuf } },
+      { binding: 1, resource: { buffer: input } },
+      { binding: 2, resource: { buffer: weight, offset: wOffset, size: wSize } },
+      { binding: 3, resource: { buffer: bias, offset: bOffset, size: bSize } },
+      { binding: 4, resource: { buffer: output } },
+    ]);
 
     const pass = enc.beginComputePass();
     pass.setPipeline(this.pipelines.linear);
@@ -490,17 +525,14 @@ export class DINOv2Backbone {
     v.setUint32(12, headDim, true);
     v.setFloat32(16, scale, true);
     v.setUint32(20, wgX, true);
-    const paramsBuf = makeUniform(device, new Uint8Array(paramsData));
+    const paramsBuf = this._cachedUniform(new Uint8Array(paramsData));
 
-    const bg = device.createBindGroup({
-      layout: this.pipelines.attnScores.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: paramsBuf } },
-        { binding: 1, resource: { buffer: qBuf } },
-        { binding: 2, resource: { buffer: kBuf } },
-        { binding: 3, resource: { buffer: scoreBuf } },
-      ],
-    });
+    const bg = this._cachedBindGroup('attnS', this.pipelines.attnScores.getBindGroupLayout(0), [
+      { binding: 0, resource: { buffer: paramsBuf } },
+      { binding: 1, resource: { buffer: qBuf } },
+      { binding: 2, resource: { buffer: kBuf } },
+      { binding: 3, resource: { buffer: scoreBuf } },
+    ]);
 
     const pass = enc.beginComputePass();
     pass.setPipeline(this.pipelines.attnScores);
@@ -516,15 +548,12 @@ export class DINOv2Backbone {
     const [wgX, wgY] = splitWG(totalWG);
 
     const paramsData = new Uint32Array([N, VIT_CONFIG.numHeads, wgX]);
-    const paramsBuf = makeUniform(device, paramsData);
+    const paramsBuf = this._cachedUniform(paramsData);
 
-    const bg = device.createBindGroup({
-      layout: this.pipelines.attnSoftmax.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: paramsBuf } },
-        { binding: 1, resource: { buffer: scoreBuf } },
-      ],
-    });
+    const bg = this._cachedBindGroup('smx', this.pipelines.attnSoftmax.getBindGroupLayout(0), [
+      { binding: 0, resource: { buffer: paramsBuf } },
+      { binding: 1, resource: { buffer: scoreBuf } },
+    ]);
 
     const pass = enc.beginComputePass();
     pass.setPipeline(this.pipelines.attnSoftmax);
@@ -540,17 +569,14 @@ export class DINOv2Backbone {
     const [wgX, wgY] = splitWG(totalWG);
 
     const paramsData = new Uint32Array([N, D, VIT_CONFIG.numHeads, VIT_CONFIG.headDim, wgX]);
-    const paramsBuf = makeUniform(device, paramsData);
+    const paramsBuf = this._cachedUniform(paramsData);
 
-    const bg = device.createBindGroup({
-      layout: this.pipelines.attnApply.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: paramsBuf } },
-        { binding: 1, resource: { buffer: scoreBuf } },
-        { binding: 2, resource: { buffer: vBuf } },
-        { binding: 3, resource: { buffer: output } },
-      ],
-    });
+    const bg = this._cachedBindGroup('attnA', this.pipelines.attnApply.getBindGroupLayout(0), [
+      { binding: 0, resource: { buffer: paramsBuf } },
+      { binding: 1, resource: { buffer: scoreBuf } },
+      { binding: 2, resource: { buffer: vBuf } },
+      { binding: 3, resource: { buffer: output } },
+    ]);
 
     const pass = enc.beginComputePass();
     pass.setPipeline(this.pipelines.attnApply);
@@ -565,24 +591,18 @@ export class DINOv2Backbone {
     const [wgX, wgY] = splitWG(totalWG);
 
     const paramsData = new Uint32Array([count, D, wgX]);
-    const paramsBuf = makeUniform(device, paramsData);
+    const paramsBuf = this._cachedUniform(paramsData);
 
     const gamma = weights.encoder.blockWeights?.[`${prefix}.gamma`];
-    if (!gamma) {
-      console.warn(`Missing LayerScale gamma: ${prefix}`);
-      return;
-    }
+    if (!gamma) { console.warn(`Missing LayerScale gamma: ${prefix}`); return; }
 
-    const bg = device.createBindGroup({
-      layout: this.pipelines.layerScale.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: paramsBuf } },
-        { binding: 1, resource: { buffer: input } },
-        { binding: 2, resource: { buffer: gamma } },
-        { binding: 3, resource: { buffer: residual } },
-        { binding: 4, resource: { buffer: output } },
-      ],
-    });
+    const bg = this._cachedBindGroup('ls', this.pipelines.layerScale.getBindGroupLayout(0), [
+      { binding: 0, resource: { buffer: paramsBuf } },
+      { binding: 1, resource: { buffer: input } },
+      { binding: 2, resource: { buffer: gamma } },
+      { binding: 3, resource: { buffer: residual } },
+      { binding: 4, resource: { buffer: output } },
+    ]);
 
     const pass = enc.beginComputePass();
     pass.setPipeline(this.pipelines.layerScale);
@@ -597,26 +617,19 @@ export class DINOv2Backbone {
     const [wgX, wgY] = splitWG(totalWG);
 
     const paramsData = new Uint32Array([numRows, inDim, outDim, wgX]);
-    const paramsBuf = makeUniform(device, paramsData);
+    const paramsBuf = this._cachedUniform(paramsData);
 
     const weight = weights.encoder.blockWeights?.[`${prefix}.weight`];
     const bias = weights.encoder.blockWeights?.[`${prefix}.bias`];
+    if (!weight || !bias) { console.warn(`Missing linear+GELU weights: ${prefix}`); return; }
 
-    if (!weight || !bias) {
-      console.warn(`Missing linear+GELU weights: ${prefix}`);
-      return;
-    }
-
-    const bg = device.createBindGroup({
-      layout: this.pipelines.linearGelu.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: paramsBuf } },
-        { binding: 1, resource: { buffer: input } },
-        { binding: 2, resource: { buffer: weight } },
-        { binding: 3, resource: { buffer: bias } },
-        { binding: 4, resource: { buffer: output } },
-      ],
-    });
+    const bg = this._cachedBindGroup('linG', this.pipelines.linearGelu.getBindGroupLayout(0), [
+      { binding: 0, resource: { buffer: paramsBuf } },
+      { binding: 1, resource: { buffer: input } },
+      { binding: 2, resource: { buffer: weight } },
+      { binding: 3, resource: { buffer: bias } },
+      { binding: 4, resource: { buffer: output } },
+    ]);
 
     const pass = enc.beginComputePass();
     pass.setPipeline(this.pipelines.linearGelu);
@@ -636,21 +649,17 @@ export class DINOv2Backbone {
     const [wgX, wgY] = splitWG(totalWG);
 
     const paramsData = new Uint32Array([numPatches, D, D, wgX]);
-    const paramsBuf = makeUniform(device, paramsData);
+    const paramsBuf = this._cachedUniform(paramsData);
 
     const proj = weights.encoder.outputProjections[projIdx];
 
-    const bg = device.createBindGroup({
-      layout: this.pipelines.linear.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: paramsBuf } },
-        // Skip CLS token (offset by D*4 bytes)
-        { binding: 1, resource: { buffer: tokensBuf, offset: D * 4, size: numPatches * D * 4 } },
-        { binding: 2, resource: { buffer: proj.weight } },
-        { binding: 3, resource: { buffer: proj.bias } },
-        { binding: 4, resource: { buffer: outputBuf } },
-      ],
-    });
+    const bg = this._cachedBindGroup(`outProj${projIdx}`, this.pipelines.linear.getBindGroupLayout(0), [
+      { binding: 0, resource: { buffer: paramsBuf } },
+      { binding: 1, resource: { buffer: tokensBuf, offset: D * 4, size: numPatches * D * 4 } },
+      { binding: 2, resource: { buffer: proj.weight } },
+      { binding: 3, resource: { buffer: proj.bias } },
+      { binding: 4, resource: { buffer: outputBuf } },
+    ]);
 
     const pass = enc.beginComputePass();
     pass.setPipeline(this.pipelines.linear);
@@ -666,16 +675,13 @@ export class DINOv2Backbone {
     const [wgX, wgY] = splitWG(totalWG);
 
     const paramsData = new Uint32Array([rows, cols, wgX]);
-    const paramsBuf = makeUniform(device, paramsData);
+    const paramsBuf = this._cachedUniform(paramsData);
 
-    const bg = device.createBindGroup({
-      layout: this.pipelines.transpose.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: paramsBuf } },
-        { binding: 1, resource: { buffer: input } },
-        { binding: 2, resource: { buffer: output } },
-      ],
-    });
+    const bg = this._cachedBindGroup('trans', this.pipelines.transpose.getBindGroupLayout(0), [
+      { binding: 0, resource: { buffer: paramsBuf } },
+      { binding: 1, resource: { buffer: input } },
+      { binding: 2, resource: { buffer: output } },
+    ]);
 
     const pass = enc.beginComputePass();
     pass.setPipeline(this.pipelines.transpose);
@@ -1168,16 +1174,13 @@ export class DINOv2Backbone {
     const totalWG = ceilDiv(count, 256);
     const [wgX, wgY] = splitWG(totalWG);
 
-    const paramsBuf = makeUniform(device, new Uint32Array([count, wgX]));
+    const paramsBuf = this._cachedUniform(new Uint32Array([count, wgX]));
 
-    const bg = device.createBindGroup({
-      layout: this.pipelines.add.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: dst } },
-        { binding: 1, resource: { buffer: src } },
-        { binding: 2, resource: { buffer: paramsBuf } },
-      ],
-    });
+    const bg = this._cachedBindGroup('add', this.pipelines.add.getBindGroupLayout(0), [
+      { binding: 0, resource: { buffer: dst } },
+      { binding: 1, resource: { buffer: src } },
+      { binding: 2, resource: { buffer: paramsBuf } },
+    ]);
 
     const pass = enc.beginComputePass();
     pass.setPipeline(this.pipelines.add);
@@ -1186,5 +1189,7 @@ export class DINOv2Backbone {
     pass.end();
   }
 }
+
+DINOv2Backbone._bgIdCounter = 0;
 
 export { VIT_CONFIG };

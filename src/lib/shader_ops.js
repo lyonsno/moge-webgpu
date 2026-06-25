@@ -16,7 +16,34 @@ import upsampleWGSL from '../shaders/upsample.wgsl?raw';
 import { createStorageBuffer, createEmptyBuffer } from './gpu.js';
 
 const pipelineCache = new Map();
+const uniformCache = new Map();
 const MAX_WG_DIM = 65535;
+
+function cachedUniform(device, data) {
+  const bytes = new Uint8Array(data.buffer || data);
+  let h = 0;
+  for (let i = 0; i < bytes.length; i++) h = (h * 31 + bytes[i]) | 0;
+  const key = `u_${bytes.length}_${h}`;
+  if (uniformCache.has(key)) return uniformCache.get(key);
+  const buf = device.createBuffer({
+    size: Math.max(bytes.byteLength, 16),
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    mappedAtCreation: true,
+  });
+  new Uint8Array(buf.getMappedRange()).set(bytes);
+  buf.unmap();
+  uniformCache.set(key, buf);
+  return buf;
+}
+
+// Cache for dummy bias buffers (one per device)
+let dummyBiasBuf = null;
+function getDummyBias(device) {
+  if (!dummyBiasBuf) {
+    dummyBiasBuf = createStorageBuffer(device, new Float32Array([0]));
+  }
+  return dummyBiasBuf;
+}
 
 /**
  * Split a total workgroup count into 2D dispatch (x, y) to stay within limits.
@@ -55,15 +82,9 @@ export function dispatchConv2d(device, encoder, inputBuf, weightBuf, biasBuf, pa
   const pipeline = getOrCreatePipeline(device, 'conv2d', conv2dWGSL, 'conv2d_main');
 
   const uniformData = new Uint32Array([inC, inH, inW, outC, outH, outW, kH, kW, padH, padW, strideH, strideW, hasBias]);
-  const uniformBuf = device.createBuffer({
-    size: uniformData.byteLength,
-    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    mappedAtCreation: true,
-  });
-  new Uint32Array(uniformBuf.getMappedRange()).set(uniformData);
-  uniformBuf.unmap();
+  const uniformBuf = cachedUniform(device, uniformData);
 
-  const dummyBias = biasBuf || createStorageBuffer(device, new Float32Array([0]));
+  const dummyBias = biasBuf || getDummyBias(device);
   const outputBuf = createEmptyBuffer(device, outC * outH * outW * 4);
 
   const bindGroup = device.createBindGroup({
@@ -98,15 +119,9 @@ export function dispatchConv1x1(device, encoder, inputBuf, weightBuf, biasBuf, p
   const totalWG = ceil(outC * H * W, 256);
   const [wgX, wgY] = splitWorkgroups(totalWG);
   const uniformData = new Uint32Array([inC, outC, H, W, hasBias, wgX]);
-  const uniformBuf = device.createBuffer({
-    size: uniformData.byteLength,
-    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    mappedAtCreation: true,
-  });
-  new Uint32Array(uniformBuf.getMappedRange()).set(uniformData);
-  uniformBuf.unmap();
+  const uniformBuf = cachedUniform(device, uniformData);
 
-  const dummyBias = biasBuf || createStorageBuffer(device, new Float32Array([0]));
+  const dummyBias = biasBuf || getDummyBias(device);
   const outputBuf = createEmptyBuffer(device, outC * H * W * 4);
 
   const bindGroup = device.createBindGroup({
@@ -139,15 +154,9 @@ export function dispatchActivation(device, encoder, inputA, inputB, count, op) {
   const totalWG = ceil(count, 256);
   const [wgX, wgY] = splitWorkgroups(totalWG);
   const uniformData = new Uint32Array([count, op, wgX]);
-  const uniformBuf = device.createBuffer({
-    size: uniformData.byteLength,
-    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    mappedAtCreation: true,
-  });
-  new Uint32Array(uniformBuf.getMappedRange()).set(uniformData);
-  uniformBuf.unmap();
+  const uniformBuf = cachedUniform(device, uniformData);
 
-  const dummyB = inputB || createStorageBuffer(device, new Float32Array([0]));
+  const dummyB = inputB || getDummyBias(device);
   const outputBuf = createEmptyBuffer(device, count * 4);
 
   const bindGroup = device.createBindGroup({
@@ -188,13 +197,7 @@ export function dispatchGroupNorm(device, encoder, inputBuf, scaleBuf, biasBuf, 
   f32View[4] = eps;
   u32View[5] = normWgX;
 
-  const uniformBuf = device.createBuffer({
-    size: 24,
-    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    mappedAtCreation: true,
-  });
-  new Uint8Array(uniformBuf.getMappedRange()).set(new Uint8Array(uniformArr));
-  uniformBuf.unmap();
+  const uniformBuf = cachedUniform(device, new Uint8Array(uniformArr));
 
   const statsBuf = createEmptyBuffer(device, numGroups * 2 * 4);
   const outputBuf = createEmptyBuffer(device, C * H * W * 4);
@@ -254,13 +257,7 @@ export function dispatchPixelShuffle(device, encoder, inputBuf, params) {
   const totalWG = ceil(outC * outH * outW, 256);
   const [wgX, wgY] = splitWorkgroups(totalWG);
   const uniformData = new Uint32Array([inC, inH, inW, outC, scaleFactor, wgX]);
-  const uniformBuf = device.createBuffer({
-    size: uniformData.byteLength,
-    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    mappedAtCreation: true,
-  });
-  new Uint32Array(uniformBuf.getMappedRange()).set(uniformData);
-  uniformBuf.unmap();
+  const uniformBuf = cachedUniform(device, uniformData);
 
   const outputBuf = createEmptyBuffer(device, outC * outH * outW * 4);
 
@@ -293,13 +290,7 @@ export function dispatchUpsample(device, encoder, inputBuf, params) {
   const totalWG = ceil(C * outH * outW, 256);
   const [wgX, wgY] = splitWorkgroups(totalWG);
   const uniformData = new Uint32Array([C, inH, inW, outH, outW, mode, wgX]);
-  const uniformBuf = device.createBuffer({
-    size: uniformData.byteLength,
-    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    mappedAtCreation: true,
-  });
-  new Uint32Array(uniformBuf.getMappedRange()).set(uniformData);
-  uniformBuf.unmap();
+  const uniformBuf = cachedUniform(device, uniformData);
 
   const outputBuf = createEmptyBuffer(device, C * outH * outW * 4);
 
@@ -337,15 +328,9 @@ export function dispatchConvTranspose2d(device, encoder, inputBuf, weightBuf, bi
   const totalWG = ceil(outC * outH * outW, 256);
   const [wgX, wgY] = splitWorkgroups(totalWG);
   const uniformData = new Uint32Array([inC, inH, inW, outC, outH, outW, kH, kW, stride, stride, hasBias, wgX]);
-  const uniformBuf = device.createBuffer({
-    size: uniformData.byteLength,
-    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    mappedAtCreation: true,
-  });
-  new Uint32Array(uniformBuf.getMappedRange()).set(uniformData);
-  uniformBuf.unmap();
+  const uniformBuf = cachedUniform(device, uniformData);
 
-  const dummyBias = biasBuf || createStorageBuffer(device, new Float32Array([0]));
+  const dummyBias = biasBuf || getDummyBias(device);
   const outputBuf = createEmptyBuffer(device, outC * outH * outW * 4);
 
   const bindGroup = device.createBindGroup({
