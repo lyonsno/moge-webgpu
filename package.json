@@ -7,6 +7,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "test:fused-relu-conv2d": "node tools/test_fused_relu_conv2d.mjs",
     "test": "echo \"See tools/compare_backbone.mjs and tools/visual_smoke.mjs for test harnesses\""
   },
   "devDependencies": {

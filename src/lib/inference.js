@@ -30,6 +30,7 @@
 import { createStorageBuffer, createEmptyBuffer, readBuffer } from './gpu.js';
 import {
   dispatchConv2d,
+  dispatchReluConv2d,
   dispatchConv1x1,
   dispatchConvTranspose2d,
   dispatchActivation,
@@ -109,12 +110,17 @@ function dispatchResidualConvBlock(device, encoder, inputBuf, weights, params) {
       { C: inC, H, W, numGroups });
   }
 
-  // ReLU
-  x = dispatchActivation(device, encoder, x, null, inC * H * W, 0);
-
-  // Conv3x3 (inC → hiddenC)
-  let convOut = dispatchConv2d(device, encoder, x, weights.conv1_weight, weights.conv1_bias,
-    { inC, inH: H, inW: W, outC: hiddenC, kH: 3, kW: 3, padH: 1, padW: 1, strideH: 1, strideW: 1 });
+  // ReLU -> Conv3x3 (inC -> hiddenC). MoGe-2 decoder uses norm='none',
+  // so this is the hot path worth fusing.
+  let convOut;
+  if (inNorm === 'none') {
+    convOut = dispatchReluConv2d(device, encoder, x, weights.conv1_weight, weights.conv1_bias,
+      { inC, inH: H, inW: W, outC: hiddenC, kH: 3, kW: 3, padH: 1, padW: 1, strideH: 1, strideW: 1 });
+  } else {
+    x = dispatchActivation(device, encoder, x, null, inC * H * W, 0);
+    convOut = dispatchConv2d(device, encoder, x, weights.conv1_weight, weights.conv1_bias,
+      { inC, inH: H, inW: W, outC: hiddenC, kH: 3, kW: 3, padH: 1, padW: 1, strideH: 1, strideW: 1 });
+  }
 
   x = convOut.buffer;
 
@@ -125,12 +131,15 @@ function dispatchResidualConvBlock(device, encoder, inputBuf, weights, params) {
       { C: hiddenC, H, W, numGroups });
   }
 
-  // ReLU
-  x = dispatchActivation(device, encoder, x, null, hiddenC * H * W, 0);
-
-  // Conv3x3 (hiddenC → outC)
-  convOut = dispatchConv2d(device, encoder, x, weights.conv2_weight, weights.conv2_bias,
-    { inC: hiddenC, inH: H, inW: W, outC, kH: 3, kW: 3, padH: 1, padW: 1, strideH: 1, strideW: 1 });
+  // ReLU -> Conv3x3 (hiddenC -> outC)
+  if (hiddenNorm === 'none') {
+    convOut = dispatchReluConv2d(device, encoder, x, weights.conv2_weight, weights.conv2_bias,
+      { inC: hiddenC, inH: H, inW: W, outC, kH: 3, kW: 3, padH: 1, padW: 1, strideH: 1, strideW: 1 });
+  } else {
+    x = dispatchActivation(device, encoder, x, null, hiddenC * H * W, 0);
+    convOut = dispatchConv2d(device, encoder, x, weights.conv2_weight, weights.conv2_bias,
+      { inC: hiddenC, inH: H, inW: W, outC, kH: 3, kW: 3, padH: 1, padW: 1, strideH: 1, strideW: 1 });
+  }
 
   // Skip connection
   let skip;

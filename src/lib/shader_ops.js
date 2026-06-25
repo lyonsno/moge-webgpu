@@ -6,6 +6,7 @@
  */
 
 import conv2dWGSL from '../shaders/conv2d.wgsl?raw';
+import reluConv2dWGSL from '../shaders/relu_conv2d.wgsl?raw';
 import conv1x1WGSL from '../shaders/conv1x1.wgsl?raw';
 import convTranspose2dWGSL from '../shaders/conv_transpose2d.wgsl?raw';
 import activationsWGSL from '../shaders/activations.wgsl?raw';
@@ -100,6 +101,44 @@ export function dispatchConv2d(device, encoder, inputBuf, weightBuf, biasBuf, pa
   const hasBias = biasBuf ? 1 : 0;
 
   const pipeline = getOrCreatePipeline(device, 'conv2d', conv2dWGSL, 'conv2d_main');
+
+  const uniformData = new Uint32Array([inC, inH, inW, outC, outH, outW, kH, kW, padH, padW, strideH, strideW, hasBias]);
+  const uniformBuf = cachedUniform(device, uniformData);
+
+  const dummyBias = biasBuf || getDummyBias(device);
+  const outputBuf = createEmptyBuffer(device, outC * outH * outW * 4);
+
+  const bindGroup = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuf } },
+      { binding: 1, resource: { buffer: inputBuf } },
+      { binding: 2, resource: { buffer: weightBuf } },
+      { binding: 3, resource: { buffer: dummyBias } },
+      { binding: 4, resource: { buffer: outputBuf } },
+    ],
+  });
+
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(ceil(outW, 16), ceil(outH, 16), outC);
+  pass.end();
+
+  return { buffer: outputBuf, outC, outH, outW };
+}
+
+/**
+ * Dispatch fused ReLU(input) -> conv2d.
+ * Returns output buffer [outC, outH, outW].
+ */
+export function dispatchReluConv2d(device, encoder, inputBuf, weightBuf, biasBuf, params) {
+  const { inC, inH, inW, outC, kH, kW, padH, padW, strideH, strideW } = params;
+  const outH = Math.floor((inH + 2 * padH - kH) / strideH) + 1;
+  const outW = Math.floor((inW + 2 * padW - kW) / strideW) + 1;
+  const hasBias = biasBuf ? 1 : 0;
+
+  const pipeline = getOrCreatePipeline(device, 'relu_conv2d', reluConv2dWGSL, 'relu_conv2d_main');
 
   const uniformData = new Uint32Array([inC, inH, inW, outC, outH, outW, kH, kW, padH, padW, strideH, strideW, hasBias]);
   const uniformBuf = cachedUniform(device, uniformData);
