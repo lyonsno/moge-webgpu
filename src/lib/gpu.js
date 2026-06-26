@@ -14,8 +14,14 @@ export async function initGPU() {
     throw new Error('No WebGPU adapter found. Your GPU may not support WebGPU.');
   }
 
+  const requiredFeatures = [];
+  if (adapter.features.has('timestamp-query')) {
+    requiredFeatures.push('timestamp-query');
+  }
+
   // Request max limits for large model inference
   const device = await adapter.requestDevice({
+    requiredFeatures,
     requiredLimits: {
       maxBufferSize: adapter.limits.maxBufferSize,
       maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,

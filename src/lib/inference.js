@@ -41,6 +41,49 @@ import {
 import { loadWeights } from './weights.js';
 import { DINOv2Backbone } from './backbone.js';
 
+function createGpuTimestampProfile(device, count) {
+  if (!device.features?.has?.('timestamp-query')) return null;
+  const byteSize = count * 8;
+  return {
+    route: 'timestamp-query',
+    count,
+    querySet: device.createQuerySet({ type: 'timestamp', count }),
+    resolveBuffer: device.createBuffer({
+      size: byteSize,
+      usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+    }),
+    readBuffer: device.createBuffer({
+      size: byteSize,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    }),
+  };
+}
+
+function writeGpuTimestamp(profile, encoder, index) {
+  if (profile) encoder.writeTimestamp(profile.querySet, index);
+}
+
+function resolveGpuTimestamps(profile, encoder) {
+  if (!profile) return;
+  encoder.resolveQuerySet(profile.querySet, 0, profile.count, profile.resolveBuffer, 0);
+  encoder.copyBufferToBuffer(profile.resolveBuffer, 0, profile.readBuffer, 0, profile.count * 8);
+}
+
+async function readGpuTimestamps(profile) {
+  if (!profile) return null;
+  await profile.readBuffer.mapAsync(GPUMapMode.READ);
+  const values = Array.from(new BigUint64Array(profile.readBuffer.getMappedRange().slice(0)));
+  profile.readBuffer.unmap();
+  profile.querySet.destroy?.();
+  profile.resolveBuffer.destroy();
+  profile.readBuffer.destroy();
+  return values;
+}
+
+function timestampDeltaMs(values, start, end) {
+  if (!values || values.length <= end) return null;
+  return Number(values[end] - values[start]) / 1e6;
+}
 
 // --- Model config from upstream v2.json ---
 const MODEL_CONFIG = {
@@ -425,7 +468,7 @@ export class MoGeInference {
   /**
    * Run full inference.
    */
-  async run(imageData) {
+  async run(imageData, options = {}) {
     const totalStart = performance.now();
     const phaseTimings = {};
     const { width, height } = imageData;
@@ -479,7 +522,15 @@ export class MoGeInference {
     let backboneClsTokenBuf = null;
     let imageBuf = null;
     const tempUploadBuffers = [];
-    const commandEncoder = device.createCommandEncoder();
+    const profileStagedGpu = !!options.profileStagedGpu;
+    const stagedGpuPhaseTimings = profileStagedGpu
+      ? { route: 'staged-submits' }
+      : null;
+    let commandEncoder = device.createCommandEncoder();
+    const gpuTimestampProfile = options.profileGpuTimestamps
+      ? createGpuTimestampProfile(device, 4)
+      : null;
+    writeGpuTimestamp(gpuTimestampProfile, commandEncoder, 0);
 
     if (useBackbone) {
       imageBuf = createStorageBuffer(device, normalizedImage);
@@ -493,8 +544,17 @@ export class MoGeInference {
       // Keep feature and CLS buffers on GPU — no readback here
       backboneFeatureBuf = featureBuf;
       backboneClsTokenBuf = clsTokenBuf;
+
+      if (profileStagedGpu) {
+        const waitStart = performance.now();
+        device.queue.submit([commandEncoder.finish()]);
+        await device.queue.onSubmittedWorkDone();
+        stagedGpuPhaseTimings.backboneSubmitWaitMs = performance.now() - waitStart;
+        commandEncoder = device.createCommandEncoder();
+      }
     } else {
       phaseTimings.backboneEncodeMs = 0;
+      if (profileStagedGpu) stagedGpuPhaseTimings.backboneSubmitWaitMs = 0;
       // Try fixture, then fall back to random
       const fixture = await this._loadFixture();
       if (fixture) {
@@ -508,6 +568,7 @@ export class MoGeInference {
         console.log(`Using stub encoder features`);
       }
     }
+    writeGpuTimestamp(gpuTimestampProfile, commandEncoder, 1);
 
     // Try loading PyTorch neck inputs for decoder validation
     const USE_PYTORCH_NECK_INPUTS = false; // Set true to bypass backbone for decoder-only validation
@@ -705,6 +766,14 @@ export class MoGeInference {
         neckInputs.push({ buffer: createStorageBuffer(device, uv), H: h, W: w });
       }
     }
+    writeGpuTimestamp(gpuTimestampProfile, commandEncoder, 2);
+    if (profileStagedGpu) {
+      const waitStart = performance.now();
+      device.queue.submit([commandEncoder.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      stagedGpuPhaseTimings.neckInputSubmitWaitMs = performance.now() - waitStart;
+      commandEncoder = device.createCommandEncoder();
+    }
 
     // Submit backbone (if used) and start decoder in one encoder
     // No separate submit — backbone and decoder buffer copies share this encoder
@@ -726,9 +795,18 @@ export class MoGeInference {
     const maskInputs = neckOutputs.map(f => ({ buffer: f.buffer, H: f.H, W: f.W }));
     const maskOutputs = dispatchConvStack(device, decoderEncoder, maskInputs, this.weights.maskHead, MODEL_CONFIG.maskHead);
     phaseTimings.neckAndHeadsEncodeMs = performance.now() - neckAndHeadsEncodeStart;
+    writeGpuTimestamp(gpuTimestampProfile, decoderEncoder, 3);
+    resolveGpuTimestamps(gpuTimestampProfile, decoderEncoder);
 
     // Submit entire pipeline (backbone + decoder in one encoder)
-    device.queue.submit([decoderEncoder.finish()]);
+    if (profileStagedGpu) {
+      const waitStart = performance.now();
+      device.queue.submit([decoderEncoder.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      stagedGpuPhaseTimings.decoderSubmitWaitMs = performance.now() - waitStart;
+    } else {
+      device.queue.submit([decoderEncoder.finish()]);
+    }
     if (imageBuf) imageBuf.destroy();
     tempUploadBuffers.forEach(buf => buf.destroy());
 
@@ -744,6 +822,8 @@ export class MoGeInference {
       readBuffer(device, lastMask.buffer, lastMask.C * lastMask.H * lastMask.W * 4),
     ]);
     phaseTimings.gpuReadbackMs = performance.now() - gpuReadbackStart;
+    if (profileStagedGpu) stagedGpuPhaseTimings.outputReadbackMs = phaseTimings.gpuReadbackMs;
+    const gpuTimestamps = await readGpuTimestamps(gpuTimestampProfile);
 
     const outH = lastPoints.H;
     const outW = lastPoints.W;
@@ -762,6 +842,7 @@ export class MoGeInference {
     console.log(`Points raw: ${pointsDiag}`);
     window.__mogeDebug = window.__mogeDebug || {};
     window.__mogeDebug.pointsDiag = pointsDiag;
+    window.__mogeDebug.outputSize = `${outW}x${outH}`;
 
     let mMin = Infinity, mMax = -Infinity;
     for (let i = 0; i < maskRaw.length; i++) {
@@ -856,13 +937,46 @@ export class MoGeInference {
       for (let i = 0; i < depth.length; i++) depth[i] *= metricScale;
     }
 
+    let dMin = Infinity, dMax = -Infinity;
+    for (let i = 0; i < depth.length; i++) {
+      if (isFinite(depth[i])) {
+        dMin = Math.min(dMin, depth[i]);
+        dMax = Math.max(dMax, depth[i]);
+      }
+    }
+
     // Clean up
     neckInputs.forEach(f => f.buffer.destroy());
 
     phaseTimings.postprocessMs = performance.now() - postprocessStart;
     phaseTimings.totalMs = performance.now() - totalStart;
     window.__mogeDebug = window.__mogeDebug || {};
+    window.__mogeDebug.depthRange = `[${dMin.toFixed(4)}, ${dMax.toFixed(4)}]`;
     window.__mogeDebug.phaseTimings = phaseTimings;
+    if (profileStagedGpu) {
+      stagedGpuPhaseTimings.totalProfiledGpuMs =
+        stagedGpuPhaseTimings.backboneSubmitWaitMs +
+        stagedGpuPhaseTimings.neckInputSubmitWaitMs +
+        stagedGpuPhaseTimings.decoderSubmitWaitMs +
+        stagedGpuPhaseTimings.outputReadbackMs;
+      window.__mogeDebug.stagedGpuPhaseTimings = stagedGpuPhaseTimings;
+    }
+    if (gpuTimestamps) {
+      window.__mogeDebug.gpuPhaseTimings = {
+        route: 'timestamp-query',
+        timestampUnit: 'nanoseconds',
+        timestamps: gpuTimestamps.map(String),
+        backboneGpuMs: timestampDeltaMs(gpuTimestamps, 0, 1),
+        neckInputGpuMs: timestampDeltaMs(gpuTimestamps, 1, 2),
+        decoderGpuMs: timestampDeltaMs(gpuTimestamps, 2, 3),
+        mainPassGpuMs: timestampDeltaMs(gpuTimestamps, 0, 3),
+      };
+    } else if (options.profileGpuTimestamps) {
+      window.__mogeDebug.gpuPhaseTimings = {
+        route: 'unavailable',
+        reason: 'timestamp-query feature was not present on the GPUDevice',
+      };
+    }
 
     return { depth, normals, points, colors, width: outW, height: outH, metricScale };
   }
