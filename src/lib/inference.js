@@ -523,8 +523,12 @@ export class MoGeInference {
     let imageBuf = null;
     const tempUploadBuffers = [];
     const profileStagedGpu = !!options.profileStagedGpu;
+    const profileDecoderSubstages = !!options.profileDecoderSubstages;
     const stagedGpuPhaseTimings = profileStagedGpu
       ? { route: 'staged-submits' }
+      : null;
+    const decoderSubstageTimings = profileDecoderSubstages
+      ? { route: 'decoder-staged-submits' }
       : null;
     let commandEncoder = device.createCommandEncoder();
     const gpuTimestampProfile = options.profileGpuTimestamps
@@ -777,29 +781,60 @@ export class MoGeInference {
 
     // Submit backbone (if used) and start decoder in one encoder
     // No separate submit — backbone and decoder buffer copies share this encoder
-    const decoderEncoder = commandEncoder;
+    let decoderEncoder = commandEncoder;
 
     // Neck
     const neckAndHeadsEncodeStart = performance.now();
     const neckOutputs = dispatchConvStack(device, decoderEncoder, neckInputs, this.weights.neck, MODEL_CONFIG.neck);
+    if (profileDecoderSubstages) {
+      const waitStart = performance.now();
+      device.queue.submit([decoderEncoder.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      decoderSubstageTimings.neckSubmitWaitMs = performance.now() - waitStart;
+      decoderEncoder = device.createCommandEncoder();
+    }
 
     // Points head
     const pointsInputs = neckOutputs.map(f => ({ buffer: f.buffer, H: f.H, W: f.W }));
     const pointsOutputs = dispatchConvStack(device, decoderEncoder, pointsInputs, this.weights.pointsHead, MODEL_CONFIG.pointsHead);
+    if (profileDecoderSubstages) {
+      const waitStart = performance.now();
+      device.queue.submit([decoderEncoder.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      decoderSubstageTimings.pointsHeadSubmitWaitMs = performance.now() - waitStart;
+      decoderEncoder = device.createCommandEncoder();
+    }
 
     // Normal head
     const normalInputs = neckOutputs.map(f => ({ buffer: f.buffer, H: f.H, W: f.W }));
     const normalOutputs = dispatchConvStack(device, decoderEncoder, normalInputs, this.weights.normalHead, MODEL_CONFIG.normalHead);
+    if (profileDecoderSubstages) {
+      const waitStart = performance.now();
+      device.queue.submit([decoderEncoder.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      decoderSubstageTimings.normalHeadSubmitWaitMs = performance.now() - waitStart;
+      decoderEncoder = device.createCommandEncoder();
+    }
 
     // Mask head
     const maskInputs = neckOutputs.map(f => ({ buffer: f.buffer, H: f.H, W: f.W }));
     const maskOutputs = dispatchConvStack(device, decoderEncoder, maskInputs, this.weights.maskHead, MODEL_CONFIG.maskHead);
+    if (profileDecoderSubstages) {
+      const waitStart = performance.now();
+      device.queue.submit([decoderEncoder.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      decoderSubstageTimings.maskHeadSubmitWaitMs = performance.now() - waitStart;
+    }
     phaseTimings.neckAndHeadsEncodeMs = performance.now() - neckAndHeadsEncodeStart;
-    writeGpuTimestamp(gpuTimestampProfile, decoderEncoder, 3);
-    resolveGpuTimestamps(gpuTimestampProfile, decoderEncoder);
+    if (!profileDecoderSubstages) {
+      writeGpuTimestamp(gpuTimestampProfile, decoderEncoder, 3);
+      resolveGpuTimestamps(gpuTimestampProfile, decoderEncoder);
+    }
 
     // Submit entire pipeline (backbone + decoder in one encoder)
-    if (profileStagedGpu) {
+    if (profileDecoderSubstages) {
+      // Decoder substages were already submitted above.
+    } else if (profileStagedGpu) {
       const waitStart = performance.now();
       device.queue.submit([decoderEncoder.finish()]);
       await device.queue.onSubmittedWorkDone();
@@ -960,6 +995,14 @@ export class MoGeInference {
         stagedGpuPhaseTimings.decoderSubmitWaitMs +
         stagedGpuPhaseTimings.outputReadbackMs;
       window.__mogeDebug.stagedGpuPhaseTimings = stagedGpuPhaseTimings;
+    }
+    if (profileDecoderSubstages) {
+      decoderSubstageTimings.totalDecoderSubstageMs =
+        decoderSubstageTimings.neckSubmitWaitMs +
+        decoderSubstageTimings.pointsHeadSubmitWaitMs +
+        decoderSubstageTimings.normalHeadSubmitWaitMs +
+        decoderSubstageTimings.maskHeadSubmitWaitMs;
+      window.__mogeDebug.decoderSubstageTimings = decoderSubstageTimings;
     }
     if (gpuTimestamps) {
       window.__mogeDebug.gpuPhaseTimings = {
