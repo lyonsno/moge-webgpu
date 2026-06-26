@@ -7,6 +7,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "benchmark:ab": "node tools/benchmark_ab.mjs",
+    "test:phase-timings": "node tools/test_phase_timings.mjs",
     "test:fused-relu-conv2d": "node tools/test_fused_relu_conv2d.mjs",
     "test": "echo \"See tools/compare_backbone.mjs and tools/visual_smoke.mjs for test harnesses\""
   },

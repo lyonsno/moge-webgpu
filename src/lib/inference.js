@@ -426,6 +426,8 @@ export class MoGeInference {
    * Run full inference.
    */
   async run(imageData) {
+    const totalStart = performance.now();
+    const phaseTimings = {};
     const { width, height } = imageData;
     const device = this.device;
     const encoderDim = MODEL_CONFIG.encoder.dimOut;
@@ -440,6 +442,8 @@ export class MoGeInference {
     let encoderData;
     let clsTokenData = null;
     let useBackbone = this.backbone && this.useRealWeights;
+
+    const preprocessStart = performance.now();
 
     // Prepare image for backbone: normalize with ImageNet mean/std, resize to tokenH*14 x tokenW*14
     const imgH = tokenH * MODEL_CONFIG.patchSize;
@@ -469,6 +473,7 @@ export class MoGeInference {
         normalizedImage[c * imgH * imgW + i] = (pixel - imageMean[c]) / imageStd[c];
       }
     }
+    phaseTimings.preprocessMs = performance.now() - preprocessStart;
 
     let backboneFeatureBuf = null;
     let backboneClsTokenBuf = null;
@@ -479,14 +484,17 @@ export class MoGeInference {
     if (useBackbone) {
       imageBuf = createStorageBuffer(device, normalizedImage);
 
+      const backboneEncodeStart = performance.now();
       const { featureBuf, clsTokenBuf } = this.backbone.encode(
         commandEncoder, imageBuf, this.weights, tokenH, tokenW
       );
+      phaseTimings.backboneEncodeMs = performance.now() - backboneEncodeStart;
 
       // Keep feature and CLS buffers on GPU — no readback here
       backboneFeatureBuf = featureBuf;
       backboneClsTokenBuf = clsTokenBuf;
     } else {
+      phaseTimings.backboneEncodeMs = 0;
       // Try fixture, then fall back to random
       const fixture = await this._loadFixture();
       if (fixture) {
@@ -703,6 +711,7 @@ export class MoGeInference {
     const decoderEncoder = commandEncoder;
 
     // Neck
+    const neckAndHeadsEncodeStart = performance.now();
     const neckOutputs = dispatchConvStack(device, decoderEncoder, neckInputs, this.weights.neck, MODEL_CONFIG.neck);
 
     // Points head
@@ -716,6 +725,7 @@ export class MoGeInference {
     // Mask head
     const maskInputs = neckOutputs.map(f => ({ buffer: f.buffer, H: f.H, W: f.W }));
     const maskOutputs = dispatchConvStack(device, decoderEncoder, maskInputs, this.weights.maskHead, MODEL_CONFIG.maskHead);
+    phaseTimings.neckAndHeadsEncodeMs = performance.now() - neckAndHeadsEncodeStart;
 
     // Submit entire pipeline (backbone + decoder in one encoder)
     device.queue.submit([decoderEncoder.finish()]);
@@ -727,11 +737,13 @@ export class MoGeInference {
     const lastNormals = normalOutputs[normalOutputs.length - 1];
     const lastMask = maskOutputs[maskOutputs.length - 1];
 
+    const gpuReadbackStart = performance.now();
     const [pointsRaw, normalsRaw, maskRaw] = await Promise.all([
       readBuffer(device, lastPoints.buffer, lastPoints.C * lastPoints.H * lastPoints.W * 4),
       readBuffer(device, lastNormals.buffer, lastNormals.C * lastNormals.H * lastNormals.W * 4),
       readBuffer(device, lastMask.buffer, lastMask.C * lastMask.H * lastMask.W * 4),
     ]);
+    phaseTimings.gpuReadbackMs = performance.now() - gpuReadbackStart;
 
     const outH = lastPoints.H;
     const outW = lastPoints.W;
@@ -762,10 +774,15 @@ export class MoGeInference {
 
     // Read CLS token for scale head (deferred from backbone to avoid mid-pipeline sync)
     if (backboneClsTokenBuf && !clsTokenData) {
+      const clsReadbackStart = performance.now();
       clsTokenData = await readBuffer(device, backboneClsTokenBuf, encoderDim * 4);
+      phaseTimings.clsReadbackMs = performance.now() - clsReadbackStart;
+    } else {
+      phaseTimings.clsReadbackMs = 0;
     }
 
     // Scale head: CLS token → metric scale via MLP (1024→1024→1024→1) + exp
+    const scaleHeadStart = performance.now();
     let metricScale = 1.0;
     if (clsTokenData && this.weights.scaleHead) {
       let x = clsTokenData;
@@ -785,8 +802,10 @@ export class MoGeInference {
       metricScale = Math.exp(x[0]);
       console.log(`Scale head: raw=${x[0].toFixed(4)}, metric_scale=${metricScale.toFixed(4)}`);
     }
+    phaseTimings.scaleHeadMs = performance.now() - scaleHeadStart;
 
     // Post-processing: exp remap
+    const postprocessStart = performance.now();
     const points = new Float32Array(3 * outH * outW);
     const depth = new Float32Array(outH * outW);
     const colors = new Float32Array(3 * outH * outW);
@@ -839,6 +858,11 @@ export class MoGeInference {
 
     // Clean up
     neckInputs.forEach(f => f.buffer.destroy());
+
+    phaseTimings.postprocessMs = performance.now() - postprocessStart;
+    phaseTimings.totalMs = performance.now() - totalStart;
+    window.__mogeDebug = window.__mogeDebug || {};
+    window.__mogeDebug.phaseTimings = phaseTimings;
 
     return { depth, normals, points, colors, width: outW, height: outH, metricScale };
   }
