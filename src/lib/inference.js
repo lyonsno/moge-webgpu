@@ -304,6 +304,75 @@ function dispatchConvStack(device, encoder, inFeatures, weights, config) {
   return outFeatures;
 }
 
+async function dispatchConvStackProfiledByLevel(device, encoder, inFeatures, weights, config) {
+  const { dimIn, dimResBlocks, dimOut, numResBlocks, resamplers, resBlockInNorm, resBlockHiddenNorm } = config;
+  const numLevels = dimResBlocks.length;
+  const outFeatures = [];
+  const levels = [];
+  let x = null;
+
+  for (let i = 0; i < numLevels; i++) {
+    const H = inFeatures[i].H;
+    const W = inFeatures[i].W;
+
+    let projected = null;
+    if (dimIn[i] != null && inFeatures[i].buffer != null) {
+      projected = dispatchConv1x1(device, encoder, inFeatures[i].buffer,
+        weights.levels[i].input_weight, weights.levels[i].input_bias,
+        { inC: dimIn[i], outC: dimResBlocks[i], H, W });
+    }
+
+    if (i === 0) {
+      x = projected.buffer;
+    } else if (projected) {
+      x = dispatchActivation(device, encoder, x, projected.buffer, dimResBlocks[i] * H * W, 2);
+    }
+
+    for (let j = 0; j < numResBlocks[i]; j++) {
+      x = dispatchResidualConvBlock(device, encoder, x, weights.levels[i].res_blocks[j], {
+        inC: dimResBlocks[i], outC: dimResBlocks[i], hiddenC: dimResBlocks[i],
+        H, W, inNorm: resBlockInNorm, hiddenNorm: resBlockHiddenNorm,
+      });
+    }
+
+    const outputC = dimOut[i] != null ? dimOut[i] : dimResBlocks[i];
+    if (dimOut[i] != null) {
+      const out = dispatchConv1x1(device, encoder, x,
+        weights.levels[i].output_weight, weights.levels[i].output_bias,
+        { inC: dimResBlocks[i], outC: dimOut[i], H, W });
+      outFeatures.push({ buffer: out.buffer, C: dimOut[i], H, W });
+    } else {
+      outFeatures.push({ buffer: x, C: dimResBlocks[i], H, W });
+    }
+
+    if (i < numLevels - 1 && resamplers[i]) {
+      const resampled = dispatchResampler(device, encoder, x,
+        weights.levels[i].resampler, {
+          inC: dimResBlocks[i], outC: dimResBlocks[i + 1],
+          H, W, type: resamplers[i],
+        });
+      x = resampled.buffer;
+    }
+
+    const waitStart = performance.now();
+    device.queue.submit([encoder.finish()]);
+    await device.queue.onSubmittedWorkDone();
+    const submitWaitMs = performance.now() - waitStart;
+    levels.push({
+      level: i,
+      submitWaitMs,
+      shape: [outputC, H, W],
+      dimIn: dimIn[i],
+      dimResBlocks: dimResBlocks[i],
+      numResBlocks: numResBlocks[i],
+      resampler: i < numLevels - 1 ? (resamplers[i] || null) : null,
+    });
+    encoder = device.createCommandEncoder();
+  }
+
+  return { outFeatures, encoder, levels };
+}
+
 
 export class MoGeInference {
   constructor(gpu) {
@@ -524,11 +593,15 @@ export class MoGeInference {
     const tempUploadBuffers = [];
     const profileStagedGpu = !!options.profileStagedGpu;
     const profileDecoderSubstages = !!options.profileDecoderSubstages;
+    const profileNeckLevels = !!options.profileNeckLevels;
     const stagedGpuPhaseTimings = profileStagedGpu
       ? { route: 'staged-submits' }
       : null;
     const decoderSubstageTimings = profileDecoderSubstages
       ? { route: 'decoder-staged-submits' }
+      : null;
+    const neckLevelTimings = profileNeckLevels
+      ? { route: 'neck-level-staged-submits', levels: [] }
       : null;
     let commandEncoder = device.createCommandEncoder();
     const gpuTimestampProfile = options.profileGpuTimestamps
@@ -782,10 +855,28 @@ export class MoGeInference {
     // Submit backbone (if used) and start decoder in one encoder
     // No separate submit — backbone and decoder buffer copies share this encoder
     let decoderEncoder = commandEncoder;
+    if (profileNeckLevels) {
+      const waitStart = performance.now();
+      device.queue.submit([decoderEncoder.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      neckLevelTimings.preNeckSubmitWaitMs = performance.now() - waitStart;
+      decoderEncoder = device.createCommandEncoder();
+    }
 
     // Neck
     const neckAndHeadsEncodeStart = performance.now();
-    const neckOutputs = dispatchConvStack(device, decoderEncoder, neckInputs, this.weights.neck, MODEL_CONFIG.neck);
+    let neckOutputs;
+    if (profileNeckLevels) {
+      const profiledNeck = await dispatchConvStackProfiledByLevel(
+        device, decoderEncoder, neckInputs, this.weights.neck, MODEL_CONFIG.neck
+      );
+      neckOutputs = profiledNeck.outFeatures;
+      decoderEncoder = profiledNeck.encoder;
+      neckLevelTimings.levels = profiledNeck.levels;
+      neckLevelTimings.totalNeckLevelMs = profiledNeck.levels.reduce((sum, level) => sum + level.submitWaitMs, 0);
+    } else {
+      neckOutputs = dispatchConvStack(device, decoderEncoder, neckInputs, this.weights.neck, MODEL_CONFIG.neck);
+    }
     if (profileDecoderSubstages) {
       const waitStart = performance.now();
       device.queue.submit([decoderEncoder.finish()]);
@@ -1003,6 +1094,9 @@ export class MoGeInference {
         decoderSubstageTimings.normalHeadSubmitWaitMs +
         decoderSubstageTimings.maskHeadSubmitWaitMs;
       window.__mogeDebug.decoderSubstageTimings = decoderSubstageTimings;
+    }
+    if (profileNeckLevels) {
+      window.__mogeDebug.neckLevelTimings = neckLevelTimings;
     }
     if (gpuTimestamps) {
       window.__mogeDebug.gpuPhaseTimings = {

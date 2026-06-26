@@ -9,6 +9,7 @@
     "build": "vite build",
     "benchmark:ab": "node tools/benchmark_ab.mjs",
     "test:decoder-substages": "node tools/test_decoder_substages.mjs",
+    "test:neck-levels": "node tools/test_neck_levels.mjs",
     "test:gpu-staged-profile": "node tools/test_gpu_staged_profile.mjs",
     "test:gpu-timestamps": "node tools/test_gpu_timestamps.mjs",
     "test:phase-timings": "node tools/test_phase_timings.mjs",
