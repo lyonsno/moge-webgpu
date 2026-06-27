@@ -10,6 +10,7 @@
     "benchmark:ab": "node tools/benchmark_ab.mjs",
     "test:decoder-substages": "node tools/test_decoder_substages.mjs",
     "test:neck-internals": "node tools/test_neck_internals.mjs",
+    "test:neck-resampler": "node tools/test_neck_resampler.mjs",
     "test:neck-levels": "node tools/test_neck_levels.mjs",
     "test:gpu-staged-profile": "node tools/test_gpu_staged_profile.mjs",
     "test:gpu-timestamps": "node tools/test_gpu_timestamps.mjs",
