@@ -11,6 +11,7 @@
     "test:decoder-substages": "node tools/test_decoder_substages.mjs",
     "test:neck-internals": "node tools/test_neck_internals.mjs",
     "test:neck-resampler": "node tools/test_neck_resampler.mjs",
+    "test:conv-transpose2d-stride2": "node tools/test_conv_transpose2d_stride2.mjs",
     "test:neck-levels": "node tools/test_neck_levels.mjs",
     "test:gpu-staged-profile": "node tools/test_gpu_staged_profile.mjs",
     "test:gpu-timestamps": "node tools/test_gpu_timestamps.mjs",

@@ -9,6 +9,7 @@ import conv2dWGSL from '../shaders/conv2d.wgsl?raw';
 import reluConv2dWGSL from '../shaders/relu_conv2d.wgsl?raw';
 import conv1x1WGSL from '../shaders/conv1x1.wgsl?raw';
 import convTranspose2dWGSL from '../shaders/conv_transpose2d.wgsl?raw';
+import convTranspose2dStride2WGSL from '../shaders/conv_transpose2d_stride2.wgsl?raw';
 import activationsWGSL from '../shaders/activations.wgsl?raw';
 import groupnormWGSL from '../shaders/groupnorm.wgsl?raw';
 import pixelshuffleWGSL from '../shaders/pixelshuffle.wgsl?raw';
@@ -381,6 +382,35 @@ export function dispatchConvTranspose2d(device, encoder, inputBuf, weightBuf, bi
   const outH = inH * stride;
   const outW = inW * stride;
   const hasBias = biasBuf ? 1 : 0;
+  const dummyBias = biasBuf || getDummyBias(device);
+  const outputBuf = createEmptyBuffer(device, outC * outH * outW * 4);
+
+  if (stride === 2) {
+    const pipeline = getOrCreatePipeline(device, 'conv_transpose2d_stride2', convTranspose2dStride2WGSL, 'conv_transpose2d_stride2_main');
+    const totalWG = ceil(outC * outH * outW, 256);
+    const [wgX, wgY] = splitWorkgroups(totalWG);
+    const uniformData = new Uint32Array([inC, inH, inW, outC, outH, outW, hasBias, wgX]);
+    const uniformBuf = cachedUniform(device, uniformData);
+
+    const bindGroup = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: uniformBuf } },
+        { binding: 1, resource: { buffer: inputBuf } },
+        { binding: 2, resource: { buffer: weightBuf } },
+        { binding: 3, resource: { buffer: dummyBias } },
+        { binding: 4, resource: { buffer: outputBuf } },
+      ],
+    });
+
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(wgX, wgY);
+    pass.end();
+
+    return { buffer: outputBuf, C: outC, H: outH, W: outW, kernel: 'conv_transpose2d_stride2' };
+  }
 
   const pipeline = getOrCreatePipeline(device, 'conv_transpose2d', convTranspose2dWGSL, 'conv_transpose2d_main');
 
@@ -388,9 +418,6 @@ export function dispatchConvTranspose2d(device, encoder, inputBuf, weightBuf, bi
   const [wgX, wgY] = splitWorkgroups(totalWG);
   const uniformData = new Uint32Array([inC, inH, inW, outC, outH, outW, kH, kW, stride, stride, hasBias, wgX]);
   const uniformBuf = cachedUniform(device, uniformData);
-
-  const dummyBias = biasBuf || getDummyBias(device);
-  const outputBuf = createEmptyBuffer(device, outC * outH * outW * 4);
 
   const bindGroup = device.createBindGroup({
     layout: pipeline.getBindGroupLayout(0),
@@ -409,5 +436,5 @@ export function dispatchConvTranspose2d(device, encoder, inputBuf, weightBuf, bi
   pass.dispatchWorkgroups(wgX, wgY);
   pass.end();
 
-  return { buffer: outputBuf, C: outC, H: outH, W: outW };
+  return { buffer: outputBuf, C: outC, H: outH, W: outW, kernel: 'conv_transpose2d_general' };
 }
