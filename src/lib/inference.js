@@ -85,6 +85,100 @@ function timestampDeltaMs(values, start, end) {
   return Number(values[end] - values[start]) / 1e6;
 }
 
+const MOGE_DEPTH_NORMAL_ROUTE_ID = 'moge.depth-normal.webgpu-local.v0';
+const MOGE_MODEL_ID = 'Ruicheng/moge-2-vitl-normal';
+
+function timedStagesFromStagedProfile(staged) {
+  if (!staged) return null;
+  return [
+    { name: 'backbone', ms: staged.backboneSubmitWaitMs },
+    { name: 'neck-input', ms: staged.neckInputSubmitWaitMs },
+    { name: 'decoder-heads', ms: staged.decoderSubmitWaitMs },
+    { name: 'output-readback', ms: staged.outputReadbackMs },
+  ].filter(stage => Number.isFinite(stage.ms));
+}
+
+function createMogeWebGpuRouteReceipt({ backendIdentity, routeReceipt, stagedGpuPhaseTimings, phaseTimings, outH, outW }) {
+  const sourceArtifact = routeReceipt?.sourceArtifact || {};
+  const outputArtifacts = routeReceipt?.outputs || {};
+  const model = routeReceipt?.model || {};
+  const kernel = routeReceipt?.kernel || {};
+  const status = routeReceipt?.status || (sourceArtifact.sha256 ? 'real' : 'partial');
+  const stagedStages = timedStagesFromStagedProfile(stagedGpuPhaseTimings);
+  const timingSource = stagedStages ? 'queue-submit-wait' : 'wall-clock';
+  const totalMs = stagedGpuPhaseTimings?.totalProfiledGpuMs ?? phaseTimings.totalMs;
+
+  const output = (role, artifact, shape) => ({
+    role,
+    artifactId: artifact?.artifactId || `runtime:${role}`,
+    sha256: artifact?.sha256 || null,
+    hashStatus: artifact?.sha256 ? 'provided' : 'not-hashed-browser-runtime',
+    shape,
+    status: artifact?.status || status,
+  });
+
+  return {
+    schema: 'kaminos.webgpu-route-receipt.v0',
+    requestedRouteId: MOGE_DEPTH_NORMAL_ROUTE_ID,
+    effectiveRouteId: MOGE_DEPTH_NORMAL_ROUTE_ID,
+    status,
+    fallbackReason: routeReceipt?.fallbackReason || null,
+    backend: backendIdentity || {
+      kind: 'webgpu-local',
+      runtime: 'browser',
+      adapterName: 'unknown-webgpu-adapter',
+      browser: navigator.userAgent || 'unknown-browser',
+      requestedFeatures: [],
+      features: [],
+      limits: {},
+      timestampQuery: 'unavailable',
+    },
+    model: {
+      id: MOGE_MODEL_ID,
+      revision: model.revision || 'local-browser-weights',
+      weightsHash: model.weightsHash || null,
+      dtype: model.dtype || 'fp16',
+    },
+    kernel: {
+      kitVersion: kernel.kitVersion || '0.0.0',
+      profile: kernel.profile || 'conv-transpose2d-stride2',
+      commit: kernel.commit || null,
+    },
+    inputs: [
+      {
+        role: 'source-image',
+        artifactId: sourceArtifact.artifactId || 'runtime:browser-imagedata',
+        sha256: sourceArtifact.sha256 || null,
+        hashStatus: sourceArtifact.sha256 ? 'provided' : 'not-hashed-browser-runtime',
+        shape: Array.isArray(sourceArtifact.shape) ? [...sourceArtifact.shape] : null,
+      },
+    ],
+    outputs: [
+      output('depth', outputArtifacts.depth, [outH, outW]),
+      output('normal', outputArtifacts.normal, [3, outH, outW]),
+      output('pointmap', outputArtifacts.pointMap, [3, outH, outW]),
+    ],
+    timings: {
+      source: timingSource,
+      totalMs,
+      stages: stagedStages || [
+        { name: 'total', ms: phaseTimings.totalMs },
+      ],
+      profile: stagedGpuPhaseTimings
+        ? {
+            schema: 'kaminos.webgpu-staged-profile.v0',
+            route: stagedGpuPhaseTimings.route,
+            timingSource,
+            requiredStages: ['backbone', 'decoder-heads', 'output-readback'],
+            stages: stagedStages,
+            stageNames: stagedStages.map(stage => stage.name),
+            totalMs,
+          }
+        : null,
+    },
+  };
+}
+
 // --- Model config from upstream v2.json ---
 const MODEL_CONFIG = {
   encoder: {
@@ -617,6 +711,7 @@ async function dispatchConvStackProfiledResampler(device, encoder, inFeatures, w
 export class MoGeInference {
   constructor(gpu) {
     this.device = gpu.device;
+    this.backendIdentity = gpu.backendIdentity || null;
     this.weights = null;
     this.backbone = null;
   }
@@ -1393,6 +1488,14 @@ export class MoGeInference {
         reason: 'timestamp-query feature was not present on the GPUDevice',
       };
     }
+    window.__mogeDebug.webGpuRouteReceipt = createMogeWebGpuRouteReceipt({
+      backendIdentity: this.backendIdentity,
+      routeReceipt: options.routeReceipt,
+      stagedGpuPhaseTimings,
+      phaseTimings,
+      outH,
+      outW,
+    });
 
     return { depth, normals, points, colors, width: outW, height: outH, metricScale };
   }

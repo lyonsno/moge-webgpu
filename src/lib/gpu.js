@@ -2,6 +2,35 @@
  * WebGPU initialization and device management.
  */
 
+const INFERENCE_LIMIT_KEYS = [
+  'maxBufferSize',
+  'maxStorageBufferBindingSize',
+  'maxComputeWorkgroupStorageSize',
+  'maxComputeInvocationsPerWorkgroup',
+  'maxComputeWorkgroupSizeX',
+  'maxComputeWorkgroupSizeY',
+];
+
+function featureList(features) {
+  if (!features) return [];
+  return Array.from(features).map(String).sort();
+}
+
+function inferenceLimits(limits) {
+  const out = {};
+  for (const key of INFERENCE_LIMIT_KEYS) {
+    if (Number.isFinite(limits?.[key])) out[key] = limits[key];
+  }
+  return out;
+}
+
+function adapterName(adapter) {
+  const info = adapter.info || {};
+  return info.description
+    || [info.vendor, info.architecture, info.device].filter(Boolean).join(' ')
+    || 'unknown-webgpu-adapter';
+}
+
 export async function initGPU() {
   if (!navigator.gpu) {
     throw new Error('WebGPU is not supported in this browser. Try Chrome 113+ or Edge 113+.');
@@ -18,18 +47,12 @@ export async function initGPU() {
   if (adapter.features.has('timestamp-query')) {
     requiredFeatures.push('timestamp-query');
   }
+  const requiredLimits = inferenceLimits(adapter.limits);
 
   // Request max limits for large model inference
   const device = await adapter.requestDevice({
     requiredFeatures,
-    requiredLimits: {
-      maxBufferSize: adapter.limits.maxBufferSize,
-      maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
-      maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
-      maxComputeInvocationsPerWorkgroup: adapter.limits.maxComputeInvocationsPerWorkgroup,
-      maxComputeWorkgroupSizeX: adapter.limits.maxComputeWorkgroupSizeX,
-      maxComputeWorkgroupSizeY: adapter.limits.maxComputeWorkgroupSizeY,
-    },
+    requiredLimits,
   });
 
   device.lost.then((info) => {
@@ -39,7 +62,21 @@ export async function initGPU() {
     }
   });
 
-  return { adapter, device };
+  const deviceFeatures = featureList(device.features || adapter.features);
+  return {
+    adapter,
+    device,
+    backendIdentity: {
+      kind: 'webgpu-local',
+      runtime: 'browser',
+      adapterName: adapterName(adapter),
+      browser: navigator.userAgent || 'unknown-browser',
+      requestedFeatures: [...requiredFeatures],
+      features: deviceFeatures,
+      limits: requiredLimits,
+      timestampQuery: requiredFeatures.includes('timestamp-query') ? 'requested' : 'unavailable',
+    },
+  };
 }
 
 /**

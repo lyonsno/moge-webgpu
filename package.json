@@ -14,6 +14,7 @@
     "test:conv-transpose2d-stride2": "node tools/test_conv_transpose2d_stride2.mjs",
     "test:neck-levels": "node tools/test_neck_levels.mjs",
     "test:gpu-staged-profile": "node tools/test_gpu_staged_profile.mjs",
+    "test:webgpu-route-receipt": "node tools/test_webgpu_route_receipt.mjs",
     "test:gpu-timestamps": "node tools/test_gpu_timestamps.mjs",
     "test:phase-timings": "node tools/test_phase_timings.mjs",
     "test:fused-relu-conv2d": "node tools/test_fused_relu_conv2d.mjs",
