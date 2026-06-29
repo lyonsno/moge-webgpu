@@ -107,4 +107,19 @@ assert.equal(routeMismatch.authoritative, false);
 assert.equal(validateMogeRouteWorkerResult(routeMismatch).ok, false);
 assert.match(routeMismatch.validation.errors.join('\n'), /effectiveRouteId/);
 
+const wallClockOnly = createMogeRouteWorkerResult({
+  request,
+  receipt: {
+    ...receipt,
+    timings: {
+      source: 'wall-clock',
+      totalMs: 1853.4,
+      stages: [{ name: 'total', ms: 1853.4 }],
+    },
+  },
+});
+assert.equal(wallClockOnly.authoritative, false);
+assert.equal(validateMogeRouteWorkerResult(wallClockOnly).ok, false);
+assert.match(wallClockOnly.validation.errors.join('\n'), /queue-submit-wait|staged/i);
+
 console.log('route boundary contracts passed');

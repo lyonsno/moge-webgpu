@@ -1,6 +1,8 @@
 export const MOGE_DEPTH_NORMAL_ROUTE_ID = 'moge.depth-normal.webgpu-local.v0';
 export const MOGE_ROUTE_REQUEST_SCHEMA = 'kaminos.webgpu-route-request.v0';
 export const MOGE_ROUTE_RESULT_SCHEMA = 'kaminos.webgpu-route-result.v0';
+const AUTHORITATIVE_TIMING_SOURCE = 'queue-submit-wait';
+const AUTHORITATIVE_TIMING_STAGES = ['backbone', 'decoder-heads', 'output-readback'];
 
 function clone(value) {
   return value == null ? value : JSON.parse(JSON.stringify(value));
@@ -134,11 +136,28 @@ function validateRouteReceipt(errors, receipt) {
     if (output.status !== 'real') errors.push(`receipt.outputs.${output.role}.status must be real, got ${output.status}`);
   }
   requireString(errors, receipt.timings?.source, 'receipt.timings.source');
+  if (receipt.timings?.source !== AUTHORITATIVE_TIMING_SOURCE) {
+    errors.push(`receipt.timings.source must be ${AUTHORITATIVE_TIMING_SOURCE} for authoritative result`);
+  }
   if (!Number.isFinite(receipt.timings?.totalMs) || receipt.timings.totalMs <= 0) {
     errors.push('receipt.timings.totalMs must be a positive finite number');
   }
   if (!Array.isArray(receipt.timings?.stages) || receipt.timings.stages.length === 0) {
     errors.push('receipt.timings.stages must be a non-empty array');
+  } else {
+    const stageNames = new Set();
+    for (const [index, stage] of receipt.timings.stages.entries()) {
+      requireString(errors, stage?.name, `receipt.timings.stages[${index}].name`);
+      if (!Number.isFinite(stage?.ms) || stage.ms < 0) {
+        errors.push(`receipt.timings.stages[${index}].ms must be a finite non-negative number`);
+      }
+      if (isNonEmptyString(stage?.name)) stageNames.add(stage.name);
+    }
+    for (const stageName of AUTHORITATIVE_TIMING_STAGES) {
+      if (!stageNames.has(stageName)) {
+        errors.push(`receipt.timings.stages missing authoritative staged-submit stage ${stageName}`);
+      }
+    }
   }
 }
 
