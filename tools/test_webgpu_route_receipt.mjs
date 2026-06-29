@@ -80,12 +80,25 @@ async function main() {
       });
 
       return {
+        request: window.__mogeDebug?.webGpuRouteRequest || null,
+        result: window.__mogeDebug?.webGpuRouteResult || null,
         receipt: window.__mogeDebug?.webGpuRouteReceipt || null,
         outputSize: window.__mogeDebug?.outputSize || null,
         depthRange: window.__mogeDebug?.depthRange || null,
         pointsDiag: window.__mogeDebug?.pointsDiag || null,
       };
     });
+
+    const request = result.request;
+    if (!request) throw new Error('webGpuRouteRequest missing from window.__mogeDebug');
+    if (request.schema !== 'kaminos.webgpu-route-request.v0') throw new Error(`bad request schema ${request.schema}`);
+    if (request.routeId !== 'moge.depth-normal.webgpu-local.v0') throw new Error(`bad request routeId ${request.routeId}`);
+    if (request.inputs?.[0]?.artifactId !== 'image:test-fixture-input') throw new Error('request did not preserve source artifact id');
+    if (request.inputs?.[0]?.sha256 !== 'sha256:test-fixture-input') throw new Error('request did not preserve source sha256');
+    const requestedOutputRoles = new Set((request.outputs || []).map(output => output.role));
+    for (const role of ['depth', 'normal', 'pointmap']) {
+      if (!requestedOutputRoles.has(role)) throw new Error(`request missing output role ${role}`);
+    }
 
     const receipt = result.receipt;
     if (!receipt) throw new Error('webGpuRouteReceipt missing from window.__mogeDebug');
@@ -106,6 +119,21 @@ async function main() {
     for (const role of ['depth', 'normal', 'pointmap']) {
       if (!roles.has(role)) throw new Error(`receipt missing output role ${role}`);
     }
+
+    const routeResult = result.result;
+    if (!routeResult) throw new Error('webGpuRouteResult missing from window.__mogeDebug');
+    if (routeResult.schema !== 'kaminos.webgpu-route-result.v0') throw new Error(`bad result schema ${routeResult.schema}`);
+    if (routeResult.requestId !== request.requestId) throw new Error('result requestId does not match request');
+    if (routeResult.routeId !== 'moge.depth-normal.webgpu-local.v0') throw new Error(`bad result routeId ${routeResult.routeId}`);
+    if (routeResult.status !== 'real') throw new Error(`result status must be real, got ${routeResult.status}`);
+    if (routeResult.authoritative !== true) throw new Error(`result must be authoritative, got ${routeResult.authoritative}`);
+    if (routeResult.receipt?.effectiveRouteId !== receipt.effectiveRouteId) throw new Error('result did not preserve effective route receipt');
+    if (routeResult.validation?.ok !== true) throw new Error(`result validation failed: ${JSON.stringify(routeResult.validation)}`);
+    const resultRoles = new Set((routeResult.outputs || []).map(output => output.role));
+    for (const role of ['depth', 'normal', 'pointmap']) {
+      if (!resultRoles.has(role)) throw new Error(`result missing output role ${role}`);
+    }
+
     if (!result.outputSize || !result.depthRange || !result.pointsDiag?.includes('NaN=0')) {
       throw new Error(`missing output diagnostics: ${JSON.stringify(result)}`);
     }

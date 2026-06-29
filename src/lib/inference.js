@@ -40,6 +40,10 @@ import {
 } from './shader_ops.js';
 import { loadWeights } from './weights.js';
 import { DINOv2Backbone } from './backbone.js';
+import {
+  createMogeRouteInvocationRequest,
+  createMogeRouteWorkerResult,
+} from './route_boundary.js';
 
 function createGpuTimestampProfile(device, count) {
   if (!device.features?.has?.('timestamp-query')) return null;
@@ -1488,13 +1492,27 @@ export class MoGeInference {
         reason: 'timestamp-query feature was not present on the GPUDevice',
       };
     }
-    window.__mogeDebug.webGpuRouteReceipt = createMogeWebGpuRouteReceipt({
+    const webGpuRouteRequest = createMogeRouteInvocationRequest({
+      routeReceipt: {
+        ...(options.routeReceipt || {}),
+        profileStagedGpu,
+      },
+      outH,
+      outW,
+    });
+    const webGpuRouteReceipt = createMogeWebGpuRouteReceipt({
       backendIdentity: this.backendIdentity,
       routeReceipt: options.routeReceipt,
       stagedGpuPhaseTimings,
       phaseTimings,
       outH,
       outW,
+    });
+    window.__mogeDebug.webGpuRouteRequest = webGpuRouteRequest;
+    window.__mogeDebug.webGpuRouteReceipt = webGpuRouteReceipt;
+    window.__mogeDebug.webGpuRouteResult = createMogeRouteWorkerResult({
+      request: webGpuRouteRequest,
+      receipt: webGpuRouteReceipt,
     });
 
     return { depth, normals, points, colors, width: outW, height: outH, metricScale };
