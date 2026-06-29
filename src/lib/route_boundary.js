@@ -1,6 +1,8 @@
 export const MOGE_DEPTH_NORMAL_ROUTE_ID = 'moge.depth-normal.webgpu-local.v0';
+export const MOGE_ROUTE_DEFINITION_SCHEMA = 'kaminos.webgpu-route-definition.v0';
 export const MOGE_ROUTE_REQUEST_SCHEMA = 'kaminos.webgpu-route-request.v0';
 export const MOGE_ROUTE_RESULT_SCHEMA = 'kaminos.webgpu-route-result.v0';
+export const MOGE_ROUTE_RECEIPT_SCHEMA = 'kaminos.webgpu-route-receipt.v0';
 const AUTHORITATIVE_TIMING_SOURCE = 'queue-submit-wait';
 const AUTHORITATIVE_TIMING_STAGES = ['backbone', 'decoder-heads', 'output-readback'];
 
@@ -114,7 +116,7 @@ function validateRouteReceipt(errors, receipt) {
     errors.push('receipt must be an object');
     return;
   }
-  if (receipt.schema !== 'kaminos.webgpu-route-receipt.v0') errors.push('receipt.schema must be kaminos.webgpu-route-receipt.v0');
+  if (receipt.schema !== MOGE_ROUTE_RECEIPT_SCHEMA) errors.push(`receipt.schema must be ${MOGE_ROUTE_RECEIPT_SCHEMA}`);
   if (receipt.requestedRouteId !== MOGE_DEPTH_NORMAL_ROUTE_ID) errors.push(`receipt.requestedRouteId must be ${MOGE_DEPTH_NORMAL_ROUTE_ID}`);
   if (receipt.effectiveRouteId !== MOGE_DEPTH_NORMAL_ROUTE_ID) errors.push(`receipt.effectiveRouteId must be ${MOGE_DEPTH_NORMAL_ROUTE_ID}`);
   if (receipt.status !== 'real') errors.push(`receipt.status must be real for authoritative result, got ${receipt.status}`);
@@ -159,6 +161,28 @@ function validateRouteReceipt(errors, receipt) {
       }
     }
   }
+}
+
+export function createMogeRouteSchemaContract(input = {}) {
+  return {
+    schema: 'kaminos.webgpu-route-schema-contract.v0',
+    kitVersion: input.kitVersion || '0.0.0',
+    definitionSchema: MOGE_ROUTE_DEFINITION_SCHEMA,
+    requestSchema: MOGE_ROUTE_REQUEST_SCHEMA,
+    resultSchema: MOGE_ROUTE_RESULT_SCHEMA,
+    receiptSchema: MOGE_ROUTE_RECEIPT_SCHEMA,
+    authoritativeReceiptStatuses: ['real'],
+    nonAuthoritativeReceiptStatuses: ['fallback', 'partial', 'cached'],
+    routes: {
+      mogeDepthNormal: {
+        routeId: MOGE_DEPTH_NORMAL_ROUTE_ID,
+        requiredInputRoles: ['source-image'],
+        requiredOutputRoles: ['depth', 'normal', 'pointmap'],
+        authoritativeTimingSource: AUTHORITATIVE_TIMING_SOURCE,
+        authoritativeTimingStages: [...AUTHORITATIVE_TIMING_STAGES],
+      },
+    },
+  };
 }
 
 export function validateMogeRouteWorkerResult(result) {
