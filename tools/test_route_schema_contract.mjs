@@ -4,9 +4,8 @@
  */
 
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
-import { resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
+
+import * as kit from '@kaminos/webgpu-inference-kit';
 
 import {
   createMogeRouteInvocationRequest,
@@ -14,21 +13,6 @@ import {
   createMogeRouteWorkerResult,
 } from '../src/lib/route_boundary.js';
 
-const candidateKitEntries = [
-  process.env.KAMINOS_WEBGPU_INFERENCE_KIT_SRC,
-  '../kaminos/webgpu-inference-kit/src/index.js',
-  '/private/tmp/kaminos-cranial-webgpu-inference-kit-0628/webgpu-inference-kit/src/index.js',
-].filter(Boolean);
-
-function resolveKitEntry() {
-  for (const candidate of candidateKitEntries) {
-    const resolved = resolve(candidate);
-    if (existsSync(resolved)) return resolved;
-  }
-  throw new Error(`Unable to locate @kaminos/webgpu-inference-kit src entry. Tried: ${candidateKitEntries.join(', ')}`);
-}
-
-const kit = await import(pathToFileURL(resolveKitEntry()).href);
 const kitContract = kit.createWebGpuRouteSchemaContract();
 const mogeContract = createMogeRouteSchemaContract();
 
