@@ -39,6 +39,8 @@ assert.equal(mogeContract.resultSchema, kitContract.resultSchema);
 assert.equal(mogeContract.receiptSchema, kitContract.receiptSchema);
 assert.equal(mogeContract.runtimeProfileSchema, kitContract.runtimeProfileSchema);
 assert.equal(mogeContract.evidenceClassificationSchema, kitContract.evidenceClassificationSchema);
+assert.equal(mogeContract.schedulerSchema, kitContract.schedulerSchema);
+assert.equal(mogeContract.backpressureSchema, kitContract.backpressureSchema);
 assert.deepEqual(mogeContract.authoritativeReceiptStatuses, kitContract.authoritativeReceiptStatuses);
 assert.deepEqual(mogeContract.nonAuthoritativeReceiptStatuses, kitContract.nonAuthoritativeReceiptStatuses);
 assert.equal(mogeContract.routes.mogeDepthNormal.routeId, 'moge.depth-normal.webgpu-local.v0');

@@ -5,6 +5,8 @@ export const MOGE_ROUTE_RESULT_SCHEMA = 'kaminos.webgpu-route-result.v0';
 export const MOGE_ROUTE_RECEIPT_SCHEMA = 'kaminos.webgpu-route-receipt.v0';
 export const MOGE_RUNTIME_PROFILE_SCHEMA = 'kaminos.webgpu-runtime-profile.v0';
 export const MOGE_ROUTE_EVIDENCE_CLASSIFICATION_SCHEMA = 'kaminos.webgpu-route-evidence-classification.v0';
+export const MOGE_ROUTE_SCHEDULER_SCHEMA = 'kaminos.webgpu-route-scheduler.v0';
+export const MOGE_ROUTE_BACKPRESSURE_SCHEMA = 'kaminos.webgpu-route-backpressure.v0';
 const AUTHORITATIVE_TIMING_SOURCE = 'queue-submit-wait';
 const AUTHORITATIVE_TIMING_STAGES = ['backbone', 'decoder-heads', 'output-readback'];
 
@@ -175,6 +177,8 @@ export function createMogeRouteSchemaContract(input = {}) {
     receiptSchema: MOGE_ROUTE_RECEIPT_SCHEMA,
     runtimeProfileSchema: MOGE_RUNTIME_PROFILE_SCHEMA,
     evidenceClassificationSchema: MOGE_ROUTE_EVIDENCE_CLASSIFICATION_SCHEMA,
+    schedulerSchema: MOGE_ROUTE_SCHEDULER_SCHEMA,
+    backpressureSchema: MOGE_ROUTE_BACKPRESSURE_SCHEMA,
     authoritativeReceiptStatuses: ['real'],
     nonAuthoritativeReceiptStatuses: ['fallback', 'partial', 'cached'],
     routes: {
