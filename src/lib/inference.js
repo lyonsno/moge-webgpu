@@ -40,6 +40,7 @@ import {
 } from './shader_ops.js';
 import { loadWeights } from './weights.js';
 import { DINOv2Backbone } from './backbone.js';
+import { selectCpuFallbackEncoderFeatures } from './encoder_features.js';
 import {
   WEBGPU_INFERENCE_KIT_VERSION,
   createMogeRouteInvocationRequest,
@@ -984,16 +985,30 @@ export class MoGeInference {
     } else {
       phaseTimings.backboneEncodeMs = 0;
       if (profileStagedGpu) stagedGpuPhaseTimings.backboneSubmitWaitMs = 0;
-      // Try fixture, then fall back to random
+      // Try fixture, then fall back to correctly shaped random features.
       const fixture = await this._loadFixture();
-      if (fixture) {
-        encoderData = fixture.features;
+      const encoderSelection = selectCpuFallbackEncoderFeatures({
+        fixture,
+        encoderDim,
+        tokenH,
+        tokenW,
+      });
+      encoderData = encoderSelection.features;
+      clsTokenData = encoderSelection.clsToken;
+      if (typeof window !== 'undefined') {
+        window.__mogeDebug = window.__mogeDebug || {};
+        window.__mogeDebug.encoderFeatureSource = encoderSelection.source;
+        window.__mogeDebug.rejectedEncoderFixture = encoderSelection.rejectedFixture;
+      }
+      if (encoderSelection.source === 'fixture') {
         console.log(`Using fixture encoder features`);
+      } else if (encoderSelection.source === 'stub-shape-mismatch') {
+        console.warn(
+          `Ignoring incompatible fixture encoder features: expected ${encoderSelection.rejectedFixture.expectedLength} floats ` +
+          `for ${tokenH}x${tokenW}, got ${encoderSelection.rejectedFixture.actualLength} floats ` +
+          `for ${encoderSelection.rejectedFixture.fixtureTokenH}x${encoderSelection.rejectedFixture.fixtureTokenW}; using stub encoder features`
+        );
       } else {
-        encoderData = new Float32Array(encoderDim * tokenH * tokenW);
-        for (let i = 0; i < encoderData.length; i++) {
-          encoderData[i] = (Math.random() - 0.5) * 0.5;
-        }
         console.log(`Using stub encoder features`);
       }
     }

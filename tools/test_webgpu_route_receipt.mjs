@@ -86,6 +86,8 @@ async function main() {
         outputSize: window.__mogeDebug?.outputSize || null,
         depthRange: window.__mogeDebug?.depthRange || null,
         pointsDiag: window.__mogeDebug?.pointsDiag || null,
+        encoderFeatureSource: window.__mogeDebug?.encoderFeatureSource || null,
+        rejectedEncoderFixture: window.__mogeDebug?.rejectedEncoderFixture || null,
       };
     });
 
@@ -136,6 +138,12 @@ async function main() {
 
     if (!result.outputSize || !result.depthRange || !result.pointsDiag?.includes('NaN=0')) {
       throw new Error(`missing output diagnostics: ${JSON.stringify(result)}`);
+    }
+    if (result.encoderFeatureSource !== 'stub-shape-mismatch') {
+      throw new Error(`expected incompatible fixture to fall back to shaped stub, got ${result.encoderFeatureSource}`);
+    }
+    if (result.rejectedEncoderFixture?.fixtureTokenH !== 49 || result.rejectedEncoderFixture?.expectedTokenH !== 37) {
+      throw new Error(`missing rejected fixture shape evidence: ${JSON.stringify(result.rejectedEncoderFixture)}`);
     }
 
     console.log(JSON.stringify(result, null, 2));

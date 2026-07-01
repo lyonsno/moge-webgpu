@@ -17,6 +17,7 @@
     "test:webgpu-route-receipt": "node tools/test_webgpu_route_receipt.mjs",
     "test:route-boundary": "node tools/test_route_boundary_contracts.mjs",
     "test:route-schema-contract": "node tools/test_route_schema_contract.mjs",
+    "test:encoder-feature-shape": "node tools/test_encoder_feature_shape.mjs",
     "test:gpu-timestamps": "node tools/test_gpu_timestamps.mjs",
     "test:phase-timings": "node tools/test_phase_timings.mjs",
     "test:fused-relu-conv2d": "node tools/test_fused_relu_conv2d.mjs",
