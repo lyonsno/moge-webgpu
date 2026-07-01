@@ -16,7 +16,9 @@ import {
 const kitContract = kit.createWebGpuRouteSchemaContract();
 const mogeContract = createMogeRouteSchemaContract();
 
+assert.equal(kit.WEBGPU_INFERENCE_KIT_VERSION, '0.1.1');
 assert.equal(mogeContract.schema, kitContract.schema);
+assert.equal(mogeContract.kitVersion, kitContract.kitVersion);
 assert.equal(mogeContract.definitionSchema, kitContract.definitionSchema);
 assert.equal(mogeContract.requestSchema, kitContract.requestSchema);
 assert.equal(mogeContract.resultSchema, kitContract.resultSchema);
@@ -84,7 +86,7 @@ const receipt = {
     dtype: 'fp16',
   },
   kernel: {
-    kitVersion: '0.0.0',
+    kitVersion: kit.WEBGPU_INFERENCE_KIT_VERSION,
     profile: 'conv-transpose2d-stride2',
     commit: 'a1bf4d3',
   },

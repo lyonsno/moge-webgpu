@@ -41,6 +41,7 @@ import {
 import { loadWeights } from './weights.js';
 import { DINOv2Backbone } from './backbone.js';
 import {
+  WEBGPU_INFERENCE_KIT_VERSION,
   createMogeRouteInvocationRequest,
   createMogeRouteWorkerResult,
 } from './route_boundary.js';
@@ -144,7 +145,7 @@ function createMogeWebGpuRouteReceipt({ backendIdentity, routeReceipt, stagedGpu
       dtype: model.dtype || 'fp16',
     },
     kernel: {
-      kitVersion: kernel.kitVersion || '0.0.0',
+      kitVersion: kernel.kitVersion || WEBGPU_INFERENCE_KIT_VERSION,
       profile: kernel.profile || 'conv-transpose2d-stride2',
       commit: kernel.commit || null,
     },

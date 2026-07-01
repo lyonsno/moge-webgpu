@@ -5,6 +5,8 @@
 
 import assert from 'node:assert/strict';
 
+import { WEBGPU_INFERENCE_KIT_VERSION } from '@kaminos/webgpu-inference-kit';
+
 import {
   MOGE_DEPTH_NORMAL_ROUTE_ID,
   createMogeRouteInvocationRequest,
@@ -62,7 +64,7 @@ const receipt = {
     dtype: 'fp16',
   },
   kernel: {
-    kitVersion: '0.0.0',
+    kitVersion: WEBGPU_INFERENCE_KIT_VERSION,
     profile: 'conv-transpose2d-stride2',
     commit: '15d2dea',
   },
@@ -87,6 +89,13 @@ const result = createMogeRouteWorkerResult({ request, receipt });
 assert.equal(result.schema, 'kaminos.webgpu-route-result.v0');
 assert.equal(result.authoritative, true);
 assert.equal(validateMogeRouteWorkerResult(result).ok, true);
+assert.match(
+  validateMogeRouteWorkerResult({
+    ...result,
+    receipt: { ...receipt, kernel: { ...receipt.kernel, kitVersion: '' } },
+  }).errors.join('\n'),
+  /kernel.kitVersion/,
+);
 
 const partialReceipt = {
   ...receipt,

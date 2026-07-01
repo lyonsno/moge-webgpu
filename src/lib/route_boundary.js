@@ -1,3 +1,6 @@
+import { WEBGPU_INFERENCE_KIT_VERSION } from '@kaminos/webgpu-inference-kit';
+
+export { WEBGPU_INFERENCE_KIT_VERSION };
 export const MOGE_DEPTH_NORMAL_ROUTE_ID = 'moge.depth-normal.webgpu-local.v0';
 export const MOGE_ROUTE_DEFINITION_SCHEMA = 'kaminos.webgpu-route-definition.v0';
 export const MOGE_ROUTE_REQUEST_SCHEMA = 'kaminos.webgpu-route-request.v0';
@@ -135,6 +138,7 @@ function validateRouteReceipt(errors, receipt) {
   requireString(errors, receipt.model?.revision, 'receipt.model.revision');
   requireString(errors, receipt.model?.weightsHash, 'receipt.model.weightsHash');
   requireString(errors, receipt.model?.dtype, 'receipt.model.dtype');
+  requireString(errors, receipt.kernel?.kitVersion, 'receipt.kernel.kitVersion');
   requireString(errors, receipt.kernel?.profile, 'receipt.kernel.profile');
   validateArtifacts(errors, receipt.inputs, 'receipt.inputs', ['source-image'], { requireHash: true });
   validateArtifacts(errors, receipt.outputs, 'receipt.outputs', ['depth', 'normal', 'pointmap'], { requireHash: true });
@@ -170,7 +174,7 @@ function validateRouteReceipt(errors, receipt) {
 export function createMogeRouteSchemaContract(input = {}) {
   return {
     schema: 'kaminos.webgpu-route-schema-contract.v0',
-    kitVersion: input.kitVersion || '0.0.0',
+    kitVersion: input.kitVersion || WEBGPU_INFERENCE_KIT_VERSION,
     definitionSchema: MOGE_ROUTE_DEFINITION_SCHEMA,
     requestSchema: MOGE_ROUTE_REQUEST_SCHEMA,
     resultSchema: MOGE_ROUTE_RESULT_SCHEMA,
