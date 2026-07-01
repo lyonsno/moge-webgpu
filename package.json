@@ -23,7 +23,7 @@
     "test": "echo \"See tools/compare_backbone.mjs and tools/visual_smoke.mjs for test harnesses\""
   },
   "devDependencies": {
-    "@kaminos/webgpu-inference-kit": "file:../kaminos-cranial-webgpu-inference-kit-0628/webgpu-inference-kit",
+    "@kaminos/webgpu-inference-kit": "^0.1.0",
     "puppeteer-core": "^25.1.0",
     "vite": "^6.0.0"
   }
