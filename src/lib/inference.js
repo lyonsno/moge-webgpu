@@ -104,12 +104,23 @@ function timedStagesFromStagedProfile(staged) {
   ].filter(stage => Number.isFinite(stage.ms));
 }
 
-function createMogeWebGpuRouteReceipt({ backendIdentity, routeReceipt, stagedGpuPhaseTimings, phaseTimings, outH, outW }) {
+function runtimeEvidenceFallbackReason(runtimeEvidence) {
+  if (!runtimeEvidence) return null;
+  const reasons = [];
+  if (runtimeEvidence.weights !== 'real') reasons.push(`weights=${runtimeEvidence.weights || 'unknown'}`);
+  if (runtimeEvidence.encoderFeatures && runtimeEvidence.encoderFeatures !== 'backbone-gpu' && runtimeEvidence.encoderFeatures !== 'fixture') {
+    reasons.push(`encoderFeatures=${runtimeEvidence.encoderFeatures}`);
+  }
+  return reasons.length > 0 ? `non-authoritative runtime evidence (${reasons.join(', ')})` : null;
+}
+
+function createMogeWebGpuRouteReceipt({ backendIdentity, routeReceipt, stagedGpuPhaseTimings, phaseTimings, outH, outW, runtimeEvidence }) {
   const sourceArtifact = routeReceipt?.sourceArtifact || {};
   const outputArtifacts = routeReceipt?.outputs || {};
   const model = routeReceipt?.model || {};
   const kernel = routeReceipt?.kernel || {};
-  const status = routeReceipt?.status || (sourceArtifact.sha256 ? 'real' : 'partial');
+  const runtimeFallbackReason = runtimeEvidenceFallbackReason(runtimeEvidence);
+  const status = runtimeFallbackReason ? 'partial' : (routeReceipt?.status || (sourceArtifact.sha256 ? 'real' : 'partial'));
   const stagedStages = timedStagesFromStagedProfile(stagedGpuPhaseTimings);
   const timingSource = stagedStages ? 'queue-submit-wait' : 'wall-clock';
   const totalMs = stagedGpuPhaseTimings?.totalProfiledGpuMs ?? phaseTimings.totalMs;
@@ -128,7 +139,8 @@ function createMogeWebGpuRouteReceipt({ backendIdentity, routeReceipt, stagedGpu
     requestedRouteId: MOGE_DEPTH_NORMAL_ROUTE_ID,
     effectiveRouteId: MOGE_DEPTH_NORMAL_ROUTE_ID,
     status,
-    fallbackReason: routeReceipt?.fallbackReason || null,
+    fallbackReason: runtimeFallbackReason || routeReceipt?.fallbackReason || null,
+    runtimeEvidence: runtimeEvidence || null,
     backend: backendIdentity || {
       kind: 'webgpu-local',
       runtime: 'browser',
@@ -960,6 +972,10 @@ export class MoGeInference {
     const gpuTimestampProfile = options.profileGpuTimestamps
       ? createGpuTimestampProfile(device, 4)
       : null;
+    const runtimeEvidence = {
+      weights: this.useRealWeights ? 'real' : 'stub',
+      encoderFeatures: null,
+    };
     writeGpuTimestamp(gpuTimestampProfile, commandEncoder, 0);
 
     if (useBackbone) {
@@ -974,6 +990,7 @@ export class MoGeInference {
       // Keep feature and CLS buffers on GPU — no readback here
       backboneFeatureBuf = featureBuf;
       backboneClsTokenBuf = clsTokenBuf;
+      runtimeEvidence.encoderFeatures = 'backbone-gpu';
 
       if (profileStagedGpu) {
         const waitStart = performance.now();
@@ -995,6 +1012,7 @@ export class MoGeInference {
       });
       encoderData = encoderSelection.features;
       clsTokenData = encoderSelection.clsToken;
+      runtimeEvidence.encoderFeatures = encoderSelection.source;
       if (typeof window !== 'undefined') {
         window.__mogeDebug = window.__mogeDebug || {};
         window.__mogeDebug.encoderFeatureSource = encoderSelection.source;
@@ -1523,6 +1541,7 @@ export class MoGeInference {
       phaseTimings,
       outH,
       outW,
+      runtimeEvidence,
     });
     window.__mogeDebug.webGpuRouteRequest = webGpuRouteRequest;
     window.__mogeDebug.webGpuRouteReceipt = webGpuRouteReceipt;

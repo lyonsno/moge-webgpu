@@ -107,7 +107,8 @@ async function main() {
     if (receipt.schema !== 'kaminos.webgpu-route-receipt.v0') throw new Error(`bad receipt schema ${receipt.schema}`);
     if (receipt.requestedRouteId !== 'moge.depth-normal.webgpu-local.v0') throw new Error(`bad requestedRouteId ${receipt.requestedRouteId}`);
     if (receipt.effectiveRouteId !== 'moge.depth-normal.webgpu-local.v0') throw new Error(`bad effectiveRouteId ${receipt.effectiveRouteId}`);
-    if (receipt.status !== 'real') throw new Error(`receipt status must be real, got ${receipt.status}`);
+    if (receipt.status !== 'partial') throw new Error(`stub receipt status must be partial, got ${receipt.status}`);
+    if (!receipt.fallbackReason?.includes('stub')) throw new Error(`stub receipt missing fallbackReason, got ${receipt.fallbackReason}`);
     if (receipt.backend?.kind !== 'webgpu-local') throw new Error(`bad backend kind ${receipt.backend?.kind}`);
     if (receipt.backend?.runtime !== 'browser') throw new Error(`bad backend runtime ${receipt.backend?.runtime}`);
     if (!receipt.backend?.adapterName) throw new Error('receipt missing backend.adapterName');
@@ -127,10 +128,13 @@ async function main() {
     if (routeResult.schema !== 'kaminos.webgpu-route-result.v0') throw new Error(`bad result schema ${routeResult.schema}`);
     if (routeResult.requestId !== request.requestId) throw new Error('result requestId does not match request');
     if (routeResult.routeId !== 'moge.depth-normal.webgpu-local.v0') throw new Error(`bad result routeId ${routeResult.routeId}`);
-    if (routeResult.status !== 'real') throw new Error(`result status must be real, got ${routeResult.status}`);
-    if (routeResult.authoritative !== true) throw new Error(`result must be authoritative, got ${routeResult.authoritative}`);
+    if (routeResult.status !== 'partial') throw new Error(`stub result status must be partial, got ${routeResult.status}`);
+    if (routeResult.authoritative !== false) throw new Error(`stub result must not be authoritative, got ${routeResult.authoritative}`);
     if (routeResult.receipt?.effectiveRouteId !== receipt.effectiveRouteId) throw new Error('result did not preserve effective route receipt');
-    if (routeResult.validation?.ok !== true) throw new Error(`result validation failed: ${JSON.stringify(routeResult.validation)}`);
+    if (routeResult.validation?.ok !== false) throw new Error(`stub result validation should be non-authoritative: ${JSON.stringify(routeResult.validation)}`);
+    if (!routeResult.validation?.errors?.join('\n').includes('partial')) {
+      throw new Error(`stub result validation did not name partial evidence: ${JSON.stringify(routeResult.validation)}`);
+    }
     const resultRoles = new Set((routeResult.outputs || []).map(output => output.role));
     for (const role of ['depth', 'normal', 'pointmap']) {
       if (!resultRoles.has(role)) throw new Error(`result missing output role ${role}`);
