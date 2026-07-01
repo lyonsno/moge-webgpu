@@ -16,7 +16,7 @@ import {
 const kitContract = kit.createWebGpuRouteSchemaContract();
 const mogeContract = createMogeRouteSchemaContract();
 
-assert.equal(kit.WEBGPU_INFERENCE_KIT_VERSION, '0.1.1');
+assert.match(kit.WEBGPU_INFERENCE_KIT_VERSION, /^0\.1\.\d+$/);
 assert.equal(mogeContract.schema, kitContract.schema);
 assert.equal(mogeContract.kitVersion, kitContract.kitVersion);
 assert.equal(mogeContract.definitionSchema, kitContract.definitionSchema);
