@@ -1,4 +1,9 @@
-import { WEBGPU_INFERENCE_KIT_VERSION } from '@kaminos/webgpu-inference-kit';
+import {
+  WEBGPU_INFERENCE_KIT_VERSION,
+  createMogeDepthNormalRouteDefinition,
+  validateWebGpuRouteBackpressureProfile,
+  validateWebGpuRouteSchedulerProfile,
+} from '@kaminos/webgpu-inference-kit';
 
 export { WEBGPU_INFERENCE_KIT_VERSION };
 export const MOGE_DEPTH_NORMAL_ROUTE_ID = 'moge.depth-normal.webgpu-local.v0';
@@ -16,6 +21,8 @@ const AUTHORITATIVE_TIMING_STAGES = ['backbone', 'decoder-heads', 'output-readba
 function clone(value) {
   return value == null ? value : JSON.parse(JSON.stringify(value));
 }
+
+const DEFAULT_MOGE_ROUTE_DEFINITION = createMogeDepthNormalRouteDefinition();
 
 function isNonEmptyString(value) {
   return typeof value === 'string' && value.trim().length > 0;
@@ -76,6 +83,8 @@ export function createMogeRouteInvocationRequest({ routeReceipt, outH, outW, req
     },
     model: clone(routeReceipt?.model || {}),
     kernel: clone(routeReceipt?.kernel || {}),
+    scheduler: clone(routeReceipt?.scheduler || DEFAULT_MOGE_ROUTE_DEFINITION.scheduler),
+    backpressure: clone(routeReceipt?.backpressure || DEFAULT_MOGE_ROUTE_DEFINITION.backpressure),
     createdAt: now,
   };
 }
@@ -89,6 +98,10 @@ export function validateMogeRouteInvocationRequest(request) {
   if (request.backendKind !== 'webgpu-local') errors.push('backendKind must be webgpu-local');
   validateArtifacts(errors, request.inputs, 'inputs', ['source-image'], { requireHash: true });
   validateArtifacts(errors, request.outputs, 'outputs', ['depth', 'normal', 'pointmap'], { requireHash: false });
+  const schedulerResult = validateWebGpuRouteSchedulerProfile(request.scheduler);
+  if (!schedulerResult.ok) errors.push(...schedulerResult.errors.map(error => `scheduler.${error}`));
+  const backpressureResult = validateWebGpuRouteBackpressureProfile(request.backpressure);
+  if (!backpressureResult.ok) errors.push(...backpressureResult.errors.map(error => `backpressure.${error}`));
   return { ok: errors.length === 0, errors };
 }
 
@@ -192,6 +205,8 @@ export function createMogeRouteSchemaContract(input = {}) {
         requiredOutputRoles: ['depth', 'normal', 'pointmap'],
         authoritativeTimingSource: AUTHORITATIVE_TIMING_SOURCE,
         authoritativeTimingStages: [...AUTHORITATIVE_TIMING_STAGES],
+        scheduler: clone(DEFAULT_MOGE_ROUTE_DEFINITION.scheduler),
+        backpressure: clone(DEFAULT_MOGE_ROUTE_DEFINITION.backpressure),
       },
     },
   };

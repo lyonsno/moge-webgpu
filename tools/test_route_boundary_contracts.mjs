@@ -5,7 +5,11 @@
 
 import assert from 'node:assert/strict';
 
-import { WEBGPU_INFERENCE_KIT_VERSION } from '@kaminos/webgpu-inference-kit';
+import {
+  WEBGPU_INFERENCE_KIT_VERSION,
+  WEBGPU_ROUTE_BACKPRESSURE_SCHEMA,
+  WEBGPU_ROUTE_SCHEDULER_SCHEMA,
+} from '@kaminos/webgpu-inference-kit';
 
 import {
   MOGE_DEPTH_NORMAL_ROUTE_ID,
@@ -13,6 +17,10 @@ import {
   createMogeRouteWorkerResult,
   validateMogeRouteWorkerResult,
 } from '../src/lib/route_boundary.js';
+
+const [kitMajor, kitMinor, kitPatch] = WEBGPU_INFERENCE_KIT_VERSION.split('.').map(Number);
+assert.deepEqual([kitMajor, kitMinor], [0, 1]);
+assert.ok(kitPatch >= 4, `breathability contract requires kit >=0.1.4, got ${WEBGPU_INFERENCE_KIT_VERSION}`);
 
 const routeReceipt = {
   sourceArtifact: {
@@ -41,6 +49,24 @@ assert.equal(request.schema, 'kaminos.webgpu-route-request.v0');
 assert.equal(request.routeId, MOGE_DEPTH_NORMAL_ROUTE_ID);
 assert.equal(request.inputs[0].sha256, 'sha256:test-fixture-input');
 assert.deepEqual(request.outputs.map(output => output.role), ['depth', 'normal', 'pointmap']);
+assert.equal(request.scheduler.schema, WEBGPU_ROUTE_SCHEDULER_SCHEMA);
+assert.equal(request.backpressure.schema, WEBGPU_ROUTE_BACKPRESSURE_SCHEMA);
+assert.deepEqual(
+  request.scheduler.breathability.spans.map(span => [span.stage, span.kind, span.interruptible]),
+  [
+    ['backbone', 'gpu-submit-bound', false],
+    ['decoder-heads', 'gpu-submit-bound', false],
+    ['output-readback', 'readback-bound', false],
+  ],
+);
+assert.deepEqual(
+  request.scheduler.breathability.checkpoints.map(checkpoint => [checkpoint.afterStage, checkpoint.yieldable]),
+  [
+    ['backbone', true],
+    ['decoder-heads', true],
+    ['output-readback', true],
+  ],
+);
 
 const receipt = {
   schema: 'kaminos.webgpu-route-receipt.v0',

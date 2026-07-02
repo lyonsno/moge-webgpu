@@ -16,7 +16,9 @@ import {
 const kitContract = kit.createWebGpuRouteSchemaContract();
 const mogeContract = createMogeRouteSchemaContract();
 
-assert.match(kit.WEBGPU_INFERENCE_KIT_VERSION, /^0\.1\.\d+$/);
+const [kitMajor, kitMinor, kitPatch] = kit.WEBGPU_INFERENCE_KIT_VERSION.split('.').map(Number);
+assert.deepEqual([kitMajor, kitMinor], [0, 1]);
+assert.ok(kitPatch >= 4, `breathability contract requires kit >=0.1.4, got ${kit.WEBGPU_INFERENCE_KIT_VERSION}`);
 assert.equal(mogeContract.schema, kitContract.schema);
 assert.equal(mogeContract.kitVersion, kitContract.kitVersion);
 assert.equal(mogeContract.definitionSchema, kitContract.definitionSchema);
@@ -32,6 +34,16 @@ assert.deepEqual(mogeContract.nonAuthoritativeReceiptStatuses, kitContract.nonAu
 assert.equal(mogeContract.routes.mogeDepthNormal.routeId, 'moge.depth-normal.webgpu-local.v0');
 assert.deepEqual(mogeContract.routes.mogeDepthNormal.requiredOutputRoles, ['depth', 'normal', 'pointmap']);
 assert.deepEqual(mogeContract.routes.mogeDepthNormal.authoritativeTimingStages, ['backbone', 'decoder-heads', 'output-readback']);
+assert.equal(mogeContract.routes.mogeDepthNormal.scheduler.schema, kit.WEBGPU_ROUTE_SCHEDULER_SCHEMA);
+assert.equal(mogeContract.routes.mogeDepthNormal.backpressure.schema, kit.WEBGPU_ROUTE_BACKPRESSURE_SCHEMA);
+assert.deepEqual(
+  mogeContract.routes.mogeDepthNormal.scheduler.breathability.checkpoints.map(checkpoint => checkpoint.afterStage),
+  ['backbone', 'decoder-heads', 'output-readback'],
+);
+assert.deepEqual(
+  mogeContract.routes.mogeDepthNormal.scheduler.breathability.spans.map(span => span.kind),
+  ['gpu-submit-bound', 'gpu-submit-bound', 'readback-bound'],
+);
 
 const request = createMogeRouteInvocationRequest({
   routeReceipt: {
