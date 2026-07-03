@@ -93,6 +93,8 @@ function timestampDeltaMs(values, start, end) {
 
 const MOGE_DEPTH_NORMAL_ROUTE_ID = 'moge.depth-normal.webgpu-local.v0';
 const MOGE_MODEL_ID = 'Ruicheng/moge-2-vitl-normal';
+const SCHEDULER_VERIFICATION_RECEIPT_SCHEMA = 'kaminos.webgpu-scheduler-verification-receipt.v0';
+const SCHEDULER_EVENT_TRACE_SCHEMA = 'kaminos.webgpu-scheduler-event-trace.v0';
 
 function timedStagesFromStagedProfile(staged) {
   if (!staged) return null;
@@ -114,7 +116,149 @@ function runtimeEvidenceFallbackReason(runtimeEvidence) {
   return reasons.length > 0 ? `non-authoritative runtime evidence (${reasons.join(', ')})` : null;
 }
 
-function createMogeWebGpuRouteReceipt({ backendIdentity, routeReceipt, stagedGpuPhaseTimings, phaseTimings, outH, outW, runtimeEvidence }) {
+function cloneJson(value) {
+  return value == null ? value : JSON.parse(JSON.stringify(value));
+}
+
+function createMogeSchedulerEventTrace(stagedStages) {
+  let cursorMs = 0;
+  const events = [];
+  for (const [index, stage] of (stagedStages || []).entries()) {
+    if (!stage?.name || !Number.isFinite(stage.ms)) continue;
+    const boundary = `moge-stage:${stage.name}`;
+    const waitKind = stage.name === 'output-readback' ? 'readback-wait' : 'queue-work-done';
+    events.push({
+      tMs: cursorMs,
+      phase: stage.name,
+      boundary,
+      kind: `${waitKind}-start`,
+      index,
+      source: 'moge-webgpu-runtime',
+    });
+    cursorMs += Math.max(0, stage.ms);
+    events.push({
+      tMs: cursorMs,
+      phase: stage.name,
+      boundary,
+      kind: `${waitKind}-end`,
+      index,
+      waitMs: stage.ms,
+      source: 'moge-webgpu-runtime',
+    });
+  }
+  return {
+    schema: SCHEDULER_EVENT_TRACE_SCHEMA,
+    clock: 'performance.now',
+    timingAuthority: stagedStages ? 'queue-submit-wait' : 'not-observed',
+    events,
+  };
+}
+
+function createMogeBoundaryAssertions(scheduler, events) {
+  const requested = scheduler?.requestedScheduler?.phaseChunkSize || {};
+  const effective = scheduler?.effectiveScheduler?.phaseChunkSize || {};
+  const unsupportedFields = scheduler?.effectiveScheduler?.unsupportedFields || [];
+  return Object.entries(requested).map(([phase, requestedValue]) => {
+    const field = `phaseChunkSize.${phase}`;
+    const boundary = `moge-stage:${phase}`;
+    const boundaryEvents = events.filter(event => event.boundary === boundary);
+    const unsupported = unsupportedFields.includes(field) || unsupportedFields.includes('phaseChunkSize');
+    const observedStart = boundaryEvents.some(event => String(event.kind || '').endsWith('-start'));
+    const observedEnd = boundaryEvents.some(event => String(event.kind || '').endsWith('-end'));
+    const observedCount = observedStart && observedEnd ? 1 : 0;
+    return {
+      field,
+      requested: requestedValue,
+      effective: Number.isFinite(effective[phase]) ? effective[phase] : null,
+      status: unsupported ? 'unsupported' : (observedCount > 0 ? 'verified' : 'unverified'),
+      observedBoundary: boundary,
+      observedCount,
+      expectedMinimumCount: 1,
+      observedQueueWaitCount: observedCount,
+      observedYieldCount: 0,
+      unsupportedReason: unsupported ? 'effective scheduler declared this field unsupported' : null,
+    };
+  });
+}
+
+function schedulerRequestsYield(scheduler = {}) {
+  const requested = scheduler.requestedScheduler || {};
+  const effective = scheduler.effectiveScheduler || {};
+  return Number(requested.yieldMs || 0) > 0 || Number(effective.yieldMs || 0) > 0;
+}
+
+function createMogeSchedulerVerificationReceipt({ routeRequest, scheduler, backpressure, stagedStages }) {
+  const eventTrace = createMogeSchedulerEventTrace(stagedStages);
+  const boundaryAssertions = createMogeBoundaryAssertions(scheduler, eventTrace.events);
+  const downgrades = [];
+  const falseAuthorityChecks = {
+    eventTraceMissing: false,
+    verifiedWithoutObservedBoundary: false,
+    timingProxyOnly: false,
+    queueWaitEventsMissing: false,
+    boundaryAssertionEventMismatch: false,
+    requestedBoundaryAssertionMissing: false,
+    requestedFieldDroppedWithoutUnsupported: false,
+  };
+
+  if (!eventTrace.events.length) {
+    downgrades.push('event-trace-missing');
+    falseAuthorityChecks.eventTraceMissing = true;
+  }
+  if (schedulerRequestsYield(scheduler)) downgrades.push('yield-events-missing');
+
+  const requestedPhases = Object.keys(scheduler?.requestedScheduler?.phaseChunkSize || {});
+  const verifiedPhases = new Set(
+    boundaryAssertions
+      .filter(assertion => assertion.status === 'verified')
+      .map(assertion => assertion.field.replace(/^phaseChunkSize\./, ''))
+  );
+  for (const phase of requestedPhases) {
+    if (!verifiedPhases.has(phase)) {
+      downgrades.push('requested-boundary-assertion-missing');
+      falseAuthorityChecks.requestedBoundaryAssertionMissing = true;
+      break;
+    }
+  }
+
+  const unsupported = boundaryAssertions.some(assertion => assertion.status === 'unsupported');
+  const verified = eventTrace.events.length > 0
+    && requestedPhases.length > 0
+    && requestedPhases.every(phase => verifiedPhases.has(phase))
+    && !schedulerRequestsYield(scheduler)
+    && !unsupported;
+  const status = unsupported ? 'unsupported' : (verified ? 'verified' : 'scheduler-unverified');
+
+  return {
+    schema: SCHEDULER_VERIFICATION_RECEIPT_SCHEMA,
+    status,
+    classification: status === 'verified'
+      ? 'observed-boundary'
+      : (status === 'unsupported' ? 'unsupported' : 'config-only'),
+    observationClass: boundaryAssertions.some(assertion => assertion.status === 'verified') ? 'observed-stage-boundary' : 'none',
+    route: {
+      requestedRouteId: routeRequest?.routeId || MOGE_DEPTH_NORMAL_ROUTE_ID,
+      effectiveRouteId: MOGE_DEPTH_NORMAL_ROUTE_ID,
+      backendClass: 'browser-webgpu',
+      requestId: routeRequest?.requestId || null,
+    },
+    scheduler: cloneJson(scheduler),
+    backpressure: cloneJson(backpressure),
+    eventTrace,
+    boundaryAssertions,
+    frameTail: {
+      evidenceSource: eventTrace.timingAuthority,
+      disclaimer: 'not-gpu-exclusive-or-present-latency',
+      rafFps: null,
+      frameP95Ms: null,
+      queueDoneP95Ms: null,
+    },
+    downgrades: [...new Set(downgrades)],
+    falseAuthorityChecks,
+  };
+}
+
+function createMogeWebGpuRouteReceipt({ backendIdentity, routeRequest, routeReceipt, stagedGpuPhaseTimings, phaseTimings, outH, outW, runtimeEvidence }) {
   const sourceArtifact = routeReceipt?.sourceArtifact || {};
   const outputArtifacts = routeReceipt?.outputs || {};
   const model = routeReceipt?.model || {};
@@ -176,6 +320,16 @@ function createMogeWebGpuRouteReceipt({ backendIdentity, routeReceipt, stagedGpu
       output('normal', outputArtifacts.normal, [3, outH, outW]),
       output('pointmap', outputArtifacts.pointMap, [3, outH, outW]),
     ],
+    runtime: {
+      scheduler: cloneJson(routeRequest?.scheduler || null),
+      backpressure: cloneJson(routeRequest?.backpressure || null),
+      schedulerVerification: createMogeSchedulerVerificationReceipt({
+        routeRequest,
+        scheduler: routeRequest?.scheduler || null,
+        backpressure: routeRequest?.backpressure || null,
+        stagedStages,
+      }),
+    },
     timings: {
       source: timingSource,
       totalMs,
@@ -1536,6 +1690,7 @@ export class MoGeInference {
     });
     const webGpuRouteReceipt = createMogeWebGpuRouteReceipt({
       backendIdentity: this.backendIdentity,
+      routeRequest: webGpuRouteRequest,
       routeReceipt: options.routeReceipt,
       stagedGpuPhaseTimings,
       phaseTimings,

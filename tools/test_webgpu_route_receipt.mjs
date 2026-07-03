@@ -118,6 +118,45 @@ async function main() {
     if (receipt.kernel?.profile !== 'conv-transpose2d-stride2') throw new Error(`bad kernel profile ${receipt.kernel?.profile}`);
     if (receipt.timings?.source !== 'queue-submit-wait') throw new Error(`bad timing source ${receipt.timings?.source}`);
     if (!Number.isFinite(receipt.timings?.totalMs) || receipt.timings.totalMs <= 0) throw new Error('receipt missing positive totalMs');
+    if (receipt.runtime?.scheduler?.schema !== 'kaminos.webgpu-route-scheduler.v0') {
+      throw new Error(`receipt missing runtime scheduler profile: ${JSON.stringify(receipt.runtime?.scheduler)}`);
+    }
+    if (receipt.runtime?.backpressure?.schema !== 'kaminos.webgpu-route-backpressure.v0') {
+      throw new Error(`receipt missing runtime backpressure profile: ${JSON.stringify(receipt.runtime?.backpressure)}`);
+    }
+    const schedulerVerification = receipt.runtime?.schedulerVerification;
+    if (schedulerVerification?.schema !== 'kaminos.webgpu-scheduler-verification-receipt.v0') {
+      throw new Error(`receipt missing scheduler verification receipt: ${JSON.stringify(schedulerVerification)}`);
+    }
+    if (schedulerVerification.status !== 'scheduler-unverified') {
+      throw new Error(`MoGE scheduler proof must stay scheduler-unverified until yield evidence exists, got ${schedulerVerification.status}`);
+    }
+    if (schedulerVerification.classification !== 'config-only') {
+      throw new Error(`downgraded MoGE scheduler proof must classify conservatively, got ${schedulerVerification.classification}`);
+    }
+    if (schedulerVerification.observationClass !== 'observed-stage-boundary') {
+      throw new Error(`MoGE scheduler proof should preserve observed boundary class, got ${schedulerVerification.observationClass}`);
+    }
+    if (schedulerVerification.eventTrace?.schema !== 'kaminos.webgpu-scheduler-event-trace.v0') {
+      throw new Error(`scheduler verification missing event trace schema: ${JSON.stringify(schedulerVerification.eventTrace)}`);
+    }
+    if (schedulerVerification.eventTrace?.timingAuthority !== 'queue-submit-wait') {
+      throw new Error(`scheduler verification must name queue-submit-wait authority, got ${schedulerVerification.eventTrace?.timingAuthority}`);
+    }
+    if (!Array.isArray(schedulerVerification.eventTrace?.events) || schedulerVerification.eventTrace.events.length < 6) {
+      throw new Error(`scheduler verification missing observed stage events: ${JSON.stringify(schedulerVerification.eventTrace?.events)}`);
+    }
+    const verifiedBoundaries = new Set(
+      (schedulerVerification.boundaryAssertions || [])
+        .filter(assertion => assertion.status === 'verified')
+        .map(assertion => assertion.observedBoundary)
+    );
+    for (const boundary of ['moge-stage:backbone', 'moge-stage:decoder-heads', 'moge-stage:output-readback']) {
+      if (!verifiedBoundaries.has(boundary)) throw new Error(`scheduler verification missing boundary ${boundary}`);
+    }
+    if (!schedulerVerification.downgrades?.includes('yield-events-missing')) {
+      throw new Error(`scheduler verification must flag missing JS yield evidence: ${JSON.stringify(schedulerVerification.downgrades)}`);
+    }
     const roles = new Set((receipt.outputs || []).map(output => output.role));
     for (const role of ['depth', 'normal', 'pointmap']) {
       if (!roles.has(role)) throw new Error(`receipt missing output role ${role}`);
