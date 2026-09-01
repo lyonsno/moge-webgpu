@@ -2,6 +2,8 @@
 
 Single-image depth and surface normal estimation running entirely in the browser via WebGPU compute shaders.
 
+**[Live demo →](https://lyonsno.github.io/moge-webgpu/)** — drop in an image and get depth, normals, and a 3D pointcloud. Heads up: the first load streams ~660MB of model weights (cached by your browser afterward).
+
 A complete port of [MoGe-2](https://github.com/microsoft/MoGe) (ViT-Large + ConvStack decoder) from PyTorch to WebGPU. No server, no WASM, no ONNX runtime — pure GPU compute shaders dispatched from JavaScript.
 
 ## What it does
