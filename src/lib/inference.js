@@ -880,6 +880,21 @@ async function dispatchConvStackProfiledResampler(device, encoder, inFeatures, w
 }
 
 
+// Hosted fp16 weights (see tools/convert_weights.py for how they were produced).
+const HOSTED_WEIGHTS_URL = 'https://huggingface.co/lyonsno/moge-webgpu/resolve/main/weights.bin';
+
+// Prefer a locally converted public/weights.bin; fall back to the hosted copy.
+// Vite's SPA fallback answers missing files with 200 text/html, so a plain
+// fetch cannot distinguish "no local weights" from success — check content-type.
+async function resolveWeightsUrl() {
+  try {
+    const head = await fetch('/weights.bin', { method: 'HEAD' });
+    const type = head.headers.get('content-type') || '';
+    if (head.ok && !type.includes('text/html')) return '/weights.bin';
+  } catch (e) { /* fall through to hosted */ }
+  return HOSTED_WEIGHTS_URL;
+}
+
 export class MoGeInference {
   constructor(gpu) {
     this.device = gpu.device;
@@ -890,9 +905,11 @@ export class MoGeInference {
 
   async init(onProgress) {
     try {
-      this.weights = await loadWeights(this.device, '/weights.bin', onProgress);
+      const weightsUrl = await resolveWeightsUrl();
+      this.weights = await loadWeights(this.device, weightsUrl, onProgress);
       this.useRealWeights = true;
-      console.log('Loaded real MoGe-2 weights');
+      this.weightsSource = weightsUrl === HOSTED_WEIGHTS_URL ? 'hosted' : 'local';
+      console.log(`Loaded real MoGe-2 weights (${this.weightsSource}: ${weightsUrl})`);
 
       // Initialize backbone
       this.backbone = new DINOv2Backbone(this.device);

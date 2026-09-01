@@ -29,17 +29,20 @@ MoGe-2-ViT-Large-Normal (`Ruicheng/moge-2-vitl-normal`):
 
 15 compute shaders: patch embedding, layer norm, multi-head self-attention (QKV projection, score computation, softmax, apply), linear projection, GELU MLP, layer scale, conv2d (replicate padding), conv1x1, conv_transpose2d, bilinear upsample, pixel shuffle, group norm, activations (ReLU/add/sigmoid).
 
-## Setup
+## Quick start
 
 ```bash
 git clone https://github.com/lyonsno/moge-webgpu.git
 cd moge-webgpu
 npm install
+npm run dev
 ```
 
-### Download and convert weights
+That's it — the app streams pre-converted fp16 weights (~660MB, cached by the browser) from [lyonsno/moge-webgpu on HuggingFace](https://huggingface.co/lyonsno/moge-webgpu) on first load. No Python required.
 
-Requires a Python environment with PyTorch and huggingface_hub:
+### Optional: convert weights locally
+
+If you'd rather serve the weights yourself (or convert a different checkpoint), use a Python environment with PyTorch and huggingface_hub:
 
 ```bash
 python tools/convert_weights.py \
@@ -48,14 +51,7 @@ python tools/convert_weights.py \
   --dtype fp16
 ```
 
-This downloads the model from HuggingFace (~1.3GB PyTorch checkpoint) and converts it to a flat fp16 binary (~660MB) optimized for WebGPU buffer loading.
-
-### Run
-
-```bash
-npx vite --port 5180
-# Open http://localhost:5180/
-```
+This downloads the model from HuggingFace (~1.3GB PyTorch checkpoint) and converts it to a flat fp16 binary (~660MB) optimized for WebGPU buffer loading. A local `public/weights.bin` takes precedence over the hosted copy.
 
 ## Browser requirements
 

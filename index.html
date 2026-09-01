@@ -91,7 +91,13 @@
 
   <div id="status"></div>
   <div id="error"></div>
-  <pre id="debug-output" style="color: #0f0; background: #111; padding: 1rem; max-width: 800px; font-size: 0.75rem; border-radius: 8px; white-space: pre-wrap;"></pre>
+  <!-- Diagnostics panel; hidden unless the page is opened with ?debug=1 -->
+  <pre id="debug-output" style="display: none; color: #0f0; background: #111; padding: 1rem; max-width: 800px; font-size: 0.75rem; border-radius: 8px; white-space: pre-wrap;"></pre>
+  <script>
+    if (new URLSearchParams(location.search).get('debug')) {
+      document.getElementById('debug-output').style.display = 'block';
+    }
+  </script>
 
   <div id="output">
     <div class="output-panel">
