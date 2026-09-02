@@ -120,7 +120,64 @@ function cloneJson(value) {
   return value == null ? value : JSON.parse(JSON.stringify(value));
 }
 
-function createMogeSchedulerEventTrace(stagedStages) {
+// --- Cooperative scheduling (model-owned, aligned to the kit's declared
+// moge scheduler profile: per-phase chunked submits with browser yields) ---
+
+function resolveCooperativeScheduler(requested) {
+  if (!requested || requested.mode !== 'cooperative') return null;
+  return {
+    mode: 'cooperative',
+    yieldMs: Math.max(0, Number.isFinite(Number(requested.yieldMs)) ? Number(requested.yieldMs) : 4),
+    vitBlockChunkSize: Math.max(1, Math.floor(Number(requested.vitBlockChunkSize) || 1)),
+    waitForSubmittedWorkDone: requested.waitForSubmittedWorkDone !== false,
+    events: [],
+  };
+}
+
+function coopEvent(coop, phase, kind, extra = {}) {
+  coop.events.push({
+    tMs: performance.now(),
+    phase,
+    boundary: `moge-stage:${phase}`,
+    kind,
+    source: 'moge-webgpu-runtime',
+    ...extra,
+  });
+}
+
+async function coopYield(coop, phase) {
+  if (!coop) return;
+  coopEvent(coop, phase, 'yield-start');
+  await new Promise(resolve => setTimeout(resolve, coop.yieldMs));
+  coopEvent(coop, phase, 'yield-end', { yieldMs: coop.yieldMs });
+}
+
+function cooperativeSchedulerDescriptor(coop) {
+  const config = {
+    mode: 'cooperative',
+    yieldMs: coop.yieldMs,
+    waitForSubmittedWorkDone: coop.waitForSubmittedWorkDone,
+    phaseChunkSize: {
+      backbone: coop.vitBlockChunkSize,
+      'decoder-heads': 1,
+      'output-readback': 1,
+    },
+  };
+  return {
+    requestedScheduler: { ...config, phaseChunkSize: { ...config.phaseChunkSize } },
+    effectiveScheduler: { ...config, phaseChunkSize: { ...config.phaseChunkSize }, unsupportedFields: [] },
+  };
+}
+
+function createMogeSchedulerEventTrace(stagedStages, observedEvents) {
+  if (Array.isArray(observedEvents) && observedEvents.length > 0) {
+    return {
+      schema: SCHEDULER_EVENT_TRACE_SCHEMA,
+      clock: 'performance.now',
+      timingAuthority: 'queue-submit-wait',
+      events: observedEvents.map(event => ({ ...event })),
+    };
+  }
   let cursorMs = 0;
   const events = [];
   for (const [index, stage] of (stagedStages || []).entries()) {
@@ -163,9 +220,13 @@ function createMogeBoundaryAssertions(scheduler, events) {
     const boundary = `moge-stage:${phase}`;
     const boundaryEvents = events.filter(event => event.boundary === boundary);
     const unsupported = unsupportedFields.includes(field) || unsupportedFields.includes('phaseChunkSize');
+    const observedQueueWaitCount = boundaryEvents.filter(event =>
+      event.kind === 'queue-work-done-end' || event.kind === 'readback-wait-end'
+    ).length;
+    const observedYieldCount = boundaryEvents.filter(event => event.kind === 'yield-end').length;
     const observedStart = boundaryEvents.some(event => String(event.kind || '').endsWith('-start'));
     const observedEnd = boundaryEvents.some(event => String(event.kind || '').endsWith('-end'));
-    const observedCount = observedStart && observedEnd ? 1 : 0;
+    const observedCount = Math.max(observedQueueWaitCount, observedStart && observedEnd ? 1 : 0);
     return {
       field,
       requested: requestedValue,
@@ -174,8 +235,8 @@ function createMogeBoundaryAssertions(scheduler, events) {
       observedBoundary: boundary,
       observedCount,
       expectedMinimumCount: 1,
-      observedQueueWaitCount: observedCount,
-      observedYieldCount: 0,
+      observedQueueWaitCount,
+      observedYieldCount,
       unsupportedReason: unsupported ? 'effective scheduler declared this field unsupported' : null,
     };
   });
@@ -187,9 +248,10 @@ function schedulerRequestsYield(scheduler = {}) {
   return Number(requested.yieldMs || 0) > 0 || Number(effective.yieldMs || 0) > 0;
 }
 
-function createMogeSchedulerVerificationReceipt({ routeRequest, scheduler, backpressure, stagedStages }) {
-  const eventTrace = createMogeSchedulerEventTrace(stagedStages);
+function createMogeSchedulerVerificationReceipt({ routeRequest, scheduler, backpressure, stagedStages, observedEvents }) {
+  const eventTrace = createMogeSchedulerEventTrace(stagedStages, observedEvents);
   const boundaryAssertions = createMogeBoundaryAssertions(scheduler, eventTrace.events);
+  const yieldObserved = boundaryAssertions.some(assertion => assertion.observedYieldCount > 0);
   const downgrades = [];
   const falseAuthorityChecks = {
     eventTraceMissing: false,
@@ -205,7 +267,7 @@ function createMogeSchedulerVerificationReceipt({ routeRequest, scheduler, backp
     downgrades.push('event-trace-missing');
     falseAuthorityChecks.eventTraceMissing = true;
   }
-  if (schedulerRequestsYield(scheduler)) downgrades.push('yield-events-missing');
+  if (schedulerRequestsYield(scheduler) && !yieldObserved) downgrades.push('yield-events-missing');
 
   const requestedPhases = Object.keys(scheduler?.requestedScheduler?.phaseChunkSize || {});
   const verifiedPhases = new Set(
@@ -225,7 +287,7 @@ function createMogeSchedulerVerificationReceipt({ routeRequest, scheduler, backp
   const verified = eventTrace.events.length > 0
     && requestedPhases.length > 0
     && requestedPhases.every(phase => verifiedPhases.has(phase))
-    && !schedulerRequestsYield(scheduler)
+    && (!schedulerRequestsYield(scheduler) || yieldObserved)
     && !unsupported;
   const status = unsupported ? 'unsupported' : (verified ? 'verified' : 'scheduler-unverified');
 
@@ -258,7 +320,7 @@ function createMogeSchedulerVerificationReceipt({ routeRequest, scheduler, backp
   };
 }
 
-function createMogeWebGpuRouteReceipt({ backendIdentity, routeRequest, routeReceipt, stagedGpuPhaseTimings, phaseTimings, outH, outW, runtimeEvidence }) {
+function createMogeWebGpuRouteReceipt({ backendIdentity, routeRequest, routeReceipt, stagedGpuPhaseTimings, phaseTimings, outH, outW, runtimeEvidence, observedSchedulerEvents }) {
   const sourceArtifact = routeReceipt?.sourceArtifact || {};
   const outputArtifacts = routeReceipt?.outputs || {};
   const model = routeReceipt?.model || {};
@@ -328,6 +390,7 @@ function createMogeWebGpuRouteReceipt({ backendIdentity, routeRequest, routeRece
         scheduler: routeRequest?.scheduler || null,
         backpressure: routeRequest?.backpressure || null,
         stagedStages,
+        observedEvents: observedSchedulerEvents,
       }),
     },
     timings: {
@@ -1115,7 +1178,9 @@ export class MoGeInference {
     let backboneClsTokenBuf = null;
     let imageBuf = null;
     const tempUploadBuffers = [];
+    const coop = resolveCooperativeScheduler(options.scheduler);
     const profileStagedGpu = !!options.profileStagedGpu;
+    const stagedSubmits = profileStagedGpu || !!coop;
     const profileDecoderSubstages = !!options.profileDecoderSubstages;
     const profileNeckLevels = !!options.profileNeckLevels;
     const profileNeckInternalsLevel = Number.isInteger(options.profileNeckInternals?.level)
@@ -1124,8 +1189,8 @@ export class MoGeInference {
     const profileNeckResamplerLevel = Number.isInteger(options.profileNeckResampler?.level)
       ? options.profileNeckResampler.level
       : null;
-    const stagedGpuPhaseTimings = profileStagedGpu
-      ? { route: 'staged-submits' }
+    const stagedGpuPhaseTimings = stagedSubmits
+      ? { route: coop ? 'cooperative-staged-submits' : 'staged-submits' }
       : null;
     const decoderSubstageTimings = profileDecoderSubstages
       ? { route: 'decoder-staged-submits' }
@@ -1140,7 +1205,9 @@ export class MoGeInference {
       ? { route: 'neck-resampler-staged-submits', level: profileNeckResamplerLevel, stages: [] }
       : null;
     let commandEncoder = device.createCommandEncoder();
-    const gpuTimestampProfile = options.profileGpuTimestamps
+    // GPU timestamp brackets assume the monolithic single-encoder flow;
+    // cooperative chunked submits use queue-submit-wait timing instead.
+    const gpuTimestampProfile = options.profileGpuTimestamps && !coop
       ? createGpuTimestampProfile(device, 4)
       : null;
     const runtimeEvidence = {
@@ -1153,26 +1220,51 @@ export class MoGeInference {
       imageBuf = createStorageBuffer(device, normalizedImage);
 
       const backboneEncodeStart = performance.now();
-      const { featureBuf, clsTokenBuf } = this.backbone.encode(
-        commandEncoder, imageBuf, this.weights, tokenH, tokenW
-      );
-      phaseTimings.backboneEncodeMs = performance.now() - backboneEncodeStart;
+      if (coop) {
+        // Cooperative path: per-chunk submits with browser yields between them.
+        // Work buffers persist across submits, so numerics match encode().
+        let backboneWaitMs = 0;
+        const { featureBuf, clsTokenBuf } = await this.backbone.encodeChunked(
+          imageBuf, this.weights, tokenH, tokenW, {
+            chunkBlocks: coop.vitBlockChunkSize,
+            onChunk: async (chunkEncoder, meta) => {
+              coopEvent(coop, 'backbone', 'queue-work-done-start', meta.kind === 'vit-blocks'
+                ? { firstBlock: meta.firstBlock, lastBlock: meta.lastBlock }
+                : { chunk: meta.kind });
+              const waitStart = performance.now();
+              device.queue.submit([chunkEncoder.finish()]);
+              if (coop.waitForSubmittedWorkDone) await device.queue.onSubmittedWorkDone();
+              const waitMs = performance.now() - waitStart;
+              backboneWaitMs += waitMs;
+              coopEvent(coop, 'backbone', 'queue-work-done-end', { waitMs });
+              await coopYield(coop, 'backbone');
+            },
+          }
+        );
+        backboneFeatureBuf = featureBuf;
+        backboneClsTokenBuf = clsTokenBuf;
+        stagedGpuPhaseTimings.backboneSubmitWaitMs = backboneWaitMs;
+      } else {
+        const { featureBuf, clsTokenBuf } = this.backbone.encode(
+          commandEncoder, imageBuf, this.weights, tokenH, tokenW
+        );
+        // Keep feature and CLS buffers on GPU — no readback here
+        backboneFeatureBuf = featureBuf;
+        backboneClsTokenBuf = clsTokenBuf;
 
-      // Keep feature and CLS buffers on GPU — no readback here
-      backboneFeatureBuf = featureBuf;
-      backboneClsTokenBuf = clsTokenBuf;
-      runtimeEvidence.encoderFeatures = 'backbone-gpu';
-
-      if (profileStagedGpu) {
-        const waitStart = performance.now();
-        device.queue.submit([commandEncoder.finish()]);
-        await device.queue.onSubmittedWorkDone();
-        stagedGpuPhaseTimings.backboneSubmitWaitMs = performance.now() - waitStart;
-        commandEncoder = device.createCommandEncoder();
+        if (profileStagedGpu) {
+          const waitStart = performance.now();
+          device.queue.submit([commandEncoder.finish()]);
+          await device.queue.onSubmittedWorkDone();
+          stagedGpuPhaseTimings.backboneSubmitWaitMs = performance.now() - waitStart;
+          commandEncoder = device.createCommandEncoder();
+        }
       }
+      phaseTimings.backboneEncodeMs = performance.now() - backboneEncodeStart;
+      runtimeEvidence.encoderFeatures = 'backbone-gpu';
     } else {
       phaseTimings.backboneEncodeMs = 0;
-      if (profileStagedGpu) stagedGpuPhaseTimings.backboneSubmitWaitMs = 0;
+      if (stagedSubmits) stagedGpuPhaseTimings.backboneSubmitWaitMs = 0;
       // Try fixture, then fall back to correctly shaped random features.
       const fixture = await this._loadFixture();
       const encoderSelection = selectCpuFallbackEncoderFeatures({
@@ -1400,11 +1492,16 @@ export class MoGeInference {
       }
     }
     writeGpuTimestamp(gpuTimestampProfile, commandEncoder, 2);
-    if (profileStagedGpu) {
+    if (stagedSubmits) {
+      if (coop) coopEvent(coop, 'decoder-heads', 'queue-work-done-start', { chunk: 'neck-input' });
       const waitStart = performance.now();
       device.queue.submit([commandEncoder.finish()]);
       await device.queue.onSubmittedWorkDone();
       stagedGpuPhaseTimings.neckInputSubmitWaitMs = performance.now() - waitStart;
+      if (coop) {
+        coopEvent(coop, 'decoder-heads', 'queue-work-done-end', { waitMs: stagedGpuPhaseTimings.neckInputSubmitWaitMs });
+        await coopYield(coop, 'decoder-heads');
+      }
       commandEncoder = device.createCommandEncoder();
     }
 
@@ -1502,11 +1599,16 @@ export class MoGeInference {
     // Submit entire pipeline (backbone + decoder in one encoder)
     if (profileDecoderSubstages) {
       // Decoder substages were already submitted above.
-    } else if (profileStagedGpu) {
+    } else if (stagedSubmits) {
+      if (coop) coopEvent(coop, 'decoder-heads', 'queue-work-done-start', { chunk: 'neck-and-heads' });
       const waitStart = performance.now();
       device.queue.submit([decoderEncoder.finish()]);
       await device.queue.onSubmittedWorkDone();
       stagedGpuPhaseTimings.decoderSubmitWaitMs = performance.now() - waitStart;
+      if (coop) {
+        coopEvent(coop, 'decoder-heads', 'queue-work-done-end', { waitMs: stagedGpuPhaseTimings.decoderSubmitWaitMs });
+        await coopYield(coop, 'decoder-heads');
+      }
     } else {
       device.queue.submit([decoderEncoder.finish()]);
     }
@@ -1518,6 +1620,7 @@ export class MoGeInference {
     const lastNormals = normalOutputs[normalOutputs.length - 1];
     const lastMask = maskOutputs[maskOutputs.length - 1];
 
+    if (coop) coopEvent(coop, 'output-readback', 'readback-wait-start');
     const gpuReadbackStart = performance.now();
     const [pointsRaw, normalsRaw, maskRaw] = await Promise.all([
       readBuffer(device, lastPoints.buffer, lastPoints.C * lastPoints.H * lastPoints.W * 4),
@@ -1525,7 +1628,11 @@ export class MoGeInference {
       readBuffer(device, lastMask.buffer, lastMask.C * lastMask.H * lastMask.W * 4),
     ]);
     phaseTimings.gpuReadbackMs = performance.now() - gpuReadbackStart;
-    if (profileStagedGpu) stagedGpuPhaseTimings.outputReadbackMs = phaseTimings.gpuReadbackMs;
+    if (stagedSubmits) stagedGpuPhaseTimings.outputReadbackMs = phaseTimings.gpuReadbackMs;
+    if (coop) {
+      coopEvent(coop, 'output-readback', 'readback-wait-end', { waitMs: phaseTimings.gpuReadbackMs });
+      await coopYield(coop, 'output-readback');
+    }
     const gpuTimestamps = await readGpuTimestamps(gpuTimestampProfile);
 
     const outH = lastPoints.H;
@@ -1656,7 +1763,7 @@ export class MoGeInference {
     window.__mogeDebug = window.__mogeDebug || {};
     window.__mogeDebug.depthRange = `[${dMin.toFixed(4)}, ${dMax.toFixed(4)}]`;
     window.__mogeDebug.phaseTimings = phaseTimings;
-    if (profileStagedGpu) {
+    if (stagedSubmits) {
       stagedGpuPhaseTimings.totalProfiledGpuMs =
         stagedGpuPhaseTimings.backboneSubmitWaitMs +
         stagedGpuPhaseTimings.neckInputSubmitWaitMs +
@@ -1705,6 +1812,15 @@ export class MoGeInference {
       outH,
       outW,
     });
+    if (coop) {
+      // The route request's declared scheduler must reflect the cooperative
+      // config that actually ran, and the verification receipt gets the
+      // observed event trace (real submits + yields, not synthesized stages).
+      webGpuRouteRequest.scheduler = {
+        ...(webGpuRouteRequest.scheduler || {}),
+        ...cooperativeSchedulerDescriptor(coop),
+      };
+    }
     const webGpuRouteReceipt = createMogeWebGpuRouteReceipt({
       backendIdentity: this.backendIdentity,
       routeRequest: webGpuRouteRequest,
@@ -1714,14 +1830,20 @@ export class MoGeInference {
       outH,
       outW,
       runtimeEvidence,
+      observedSchedulerEvents: coop ? coop.events : null,
     });
     window.__mogeDebug.webGpuRouteRequest = webGpuRouteRequest;
     window.__mogeDebug.webGpuRouteReceipt = webGpuRouteReceipt;
-    window.__mogeDebug.webGpuRouteResult = createMogeRouteWorkerResult({
+    const webGpuRouteResult = createMogeRouteWorkerResult({
       request: webGpuRouteRequest,
       receipt: webGpuRouteReceipt,
     });
+    window.__mogeDebug.webGpuRouteResult = webGpuRouteResult;
 
-    return { depth, normals, points, colors, width: outW, height: outH, metricScale };
+    return {
+      depth, normals, points, colors, width: outW, height: outH, metricScale,
+      routeResult: webGpuRouteResult,
+      schedulerVerificationReceipt: webGpuRouteReceipt.runtime.schedulerVerification,
+    };
   }
 }

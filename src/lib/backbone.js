@@ -199,8 +199,59 @@ export class DINOv2Backbone {
     this._workTokenW = tokenW;
   }
 
-  encode(encoder, imageBuf, weights, tokenH, tokenW) {
+  // Encode a single transformer block. ctx.currentTokens is updated in place;
+  // intermediate feature snapshots accumulate in ctx.intermediateFeatures.
+  _encodeBlock(encoder, weights, ctx, l) {
     const device = this.device;
+    const { N, T, D, wb } = ctx;
+    const { normBuf, qBuf, kBuf, vBuf, scoreBuf, attnOutBuf, projOutBuf, hiddenBuf, ffnOutBuf, qkvWorkBuf, tokenBufA, tokenBufB } = wb;
+
+    // LayerNorm1
+    this._encodeLayerNorm(encoder, ctx.currentTokens, normBuf, weights, `encoder.backbone.blocks.${l}.norm1`, N);
+
+    // Attention: QKV projections
+    this._encodeQKV(encoder, normBuf, qBuf, kBuf, vBuf, weights, l, N, qkvWorkBuf);
+
+    // Attention scores
+    this._encodeAttnScores(encoder, qBuf, kBuf, scoreBuf, N);
+
+    // Softmax
+    this._encodeAttnSoftmax(encoder, scoreBuf, N);
+
+    // Apply attention
+    this._encodeAttnApply(encoder, scoreBuf, vBuf, attnOutBuf, N);
+
+    // Output projection
+    this._encodeLinear(encoder, attnOutBuf, projOutBuf, weights, `encoder.backbone.blocks.${l}.attn.proj`, N, D, D);
+
+    // LayerScale1 + residual: output = currentTokens + ls1.gamma * projOutBuf
+    // Write to the OTHER buffer to avoid read/write race
+    const attnResidualOut = (ctx.currentTokens === tokenBufA) ? tokenBufB : tokenBufA;
+    this._encodeLayerScaleResidual(encoder, projOutBuf, ctx.currentTokens, attnResidualOut, weights, `encoder.backbone.blocks.${l}.ls1`, T, D);
+    ctx.currentTokens = attnResidualOut;
+
+    // LayerNorm2
+    this._encodeLayerNorm(encoder, ctx.currentTokens, normBuf, weights, `encoder.backbone.blocks.${l}.norm2`, N);
+
+    // GELU MLP: fc1 (linear+GELU) then fc2 (linear)
+    this._encodeLinearGelu(encoder, normBuf, hiddenBuf, weights, `encoder.backbone.blocks.${l}.mlp.fc1`, N, D, VIT_CONFIG.mlpHiddenDim);
+    this._encodeLinear(encoder, hiddenBuf, ffnOutBuf, weights, `encoder.backbone.blocks.${l}.mlp.fc2`, N, VIT_CONFIG.mlpHiddenDim, D);
+
+    // LayerScale2 + residual: write to the other buffer
+    const ffnResidualOut = (ctx.currentTokens === tokenBufA) ? tokenBufB : tokenBufA;
+    this._encodeLayerScaleResidual(encoder, ffnOutBuf, ctx.currentTokens, ffnResidualOut, weights, `encoder.backbone.blocks.${l}.ls2`, T, D);
+    ctx.currentTokens = ffnResidualOut;
+
+    // Capture intermediate features at specified layers
+    if (VIT_CONFIG.intermediateLayers.includes(l)) {
+      // Copy current token state for feature extraction
+      const snapBuf = createEmptyBuffer(device, T * 4, GPUBufferUsage.COPY_DST);
+      encoder.copyBufferToBuffer(ctx.currentTokens, 0, snapBuf, 0, T * 4);
+      ctx.intermediateFeatures.push({ buffer: snapBuf, layerIdx: l });
+    }
+  }
+
+  encode(encoder, imageBuf, weights, tokenH, tokenW) {
     const D = VIT_CONFIG.dim;
     const numPatches = tokenH * tokenW;
     const N = numPatches + 1; // +1 for CLS
@@ -214,56 +265,51 @@ export class DINOv2Backbone {
     this._encodePatchEmbed(encoder, imageBuf, weights, wb.tokenBufA, tokenH, tokenW);
 
     // --- Transformer blocks ---
-    const intermediateFeatures = [];
-    let currentTokens = wb.tokenBufA;
-
-    const { normBuf, qBuf, kBuf, vBuf, scoreBuf, attnOutBuf, projOutBuf, hiddenBuf, ffnOutBuf, qkvWorkBuf, tokenBufA, tokenBufB } = wb;
-
+    const ctx = { N, T, D, wb, currentTokens: wb.tokenBufA, intermediateFeatures: [] };
     for (let l = 0; l < VIT_CONFIG.numLayers; l++) {
-      // LayerNorm1
-      this._encodeLayerNorm(encoder, currentTokens, normBuf, weights, `encoder.backbone.blocks.${l}.norm1`, N);
-
-      // Attention: QKV projections
-      this._encodeQKV(encoder, normBuf, qBuf, kBuf, vBuf, weights, l, N, qkvWorkBuf);
-
-      // Attention scores
-      this._encodeAttnScores(encoder, qBuf, kBuf, scoreBuf, N);
-
-      // Softmax
-      this._encodeAttnSoftmax(encoder, scoreBuf, N);
-
-      // Apply attention
-      this._encodeAttnApply(encoder, scoreBuf, vBuf, attnOutBuf, N);
-
-      // Output projection
-      this._encodeLinear(encoder, attnOutBuf, projOutBuf, weights, `encoder.backbone.blocks.${l}.attn.proj`, N, D, D);
-
-      // LayerScale1 + residual: output = currentTokens + ls1.gamma * projOutBuf
-      // Write to the OTHER buffer to avoid read/write race
-      const attnResidualOut = (currentTokens === tokenBufA) ? tokenBufB : tokenBufA;
-      this._encodeLayerScaleResidual(encoder, projOutBuf, currentTokens, attnResidualOut, weights, `encoder.backbone.blocks.${l}.ls1`, T, D);
-      currentTokens = attnResidualOut;
-
-      // LayerNorm2
-      this._encodeLayerNorm(encoder, currentTokens, normBuf, weights, `encoder.backbone.blocks.${l}.norm2`, N);
-
-      // GELU MLP: fc1 (linear+GELU) then fc2 (linear)
-      this._encodeLinearGelu(encoder, normBuf, hiddenBuf, weights, `encoder.backbone.blocks.${l}.mlp.fc1`, N, D, VIT_CONFIG.mlpHiddenDim);
-      this._encodeLinear(encoder, hiddenBuf, ffnOutBuf, weights, `encoder.backbone.blocks.${l}.mlp.fc2`, N, VIT_CONFIG.mlpHiddenDim, D);
-
-      // LayerScale2 + residual: write to the other buffer
-      const ffnResidualOut = (currentTokens === tokenBufA) ? tokenBufB : tokenBufA;
-      this._encodeLayerScaleResidual(encoder, ffnOutBuf, currentTokens, ffnResidualOut, weights, `encoder.backbone.blocks.${l}.ls2`, T, D);
-      currentTokens = ffnResidualOut;
-
-      // Capture intermediate features at specified layers
-      if (VIT_CONFIG.intermediateLayers.includes(l)) {
-        // Copy current token state for feature extraction
-        const snapBuf = createEmptyBuffer(device, T * 4, GPUBufferUsage.COPY_DST);
-        encoder.copyBufferToBuffer(currentTokens, 0, snapBuf, 0, T * 4);
-        intermediateFeatures.push({ buffer: snapBuf, layerIdx: l });
-      }
+      this._encodeBlock(encoder, weights, ctx, l);
     }
+    return this._encodeProjectionAndCls(encoder, weights, ctx, tokenH, tokenW);
+  }
+
+  /**
+   * Cooperatively encode the backbone: patch embed + transformer blocks in
+   * chunks of `chunkBlocks`, calling `await onChunk(encoder, meta)` after each
+   * chunk is encoded. The hook owns submission (and any yielding); this method
+   * creates a fresh command encoder for the next chunk. Work buffers persist
+   * across submits, so numerics are identical to the monolithic encode().
+   */
+  async encodeChunked(imageBuf, weights, tokenH, tokenW, { chunkBlocks = 1, onChunk } = {}) {
+    const D = VIT_CONFIG.dim;
+    const numPatches = tokenH * tokenW;
+    const N = numPatches + 1;
+    const T = N * D;
+
+    this._ensureWorkBuffers(tokenH, tokenW);
+    const wb = this._workBufs;
+    const chunk = Math.max(1, Math.floor(chunkBlocks) || 1);
+
+    let encoder = this.device.createCommandEncoder();
+    this._encodePatchEmbed(encoder, imageBuf, weights, wb.tokenBufA, tokenH, tokenW);
+
+    const ctx = { N, T, D, wb, currentTokens: wb.tokenBufA, intermediateFeatures: [] };
+    for (let l = 0; l < VIT_CONFIG.numLayers; ) {
+      const firstBlock = l;
+      const lastBlock = Math.min(l + chunk, VIT_CONFIG.numLayers) - 1;
+      for (; l <= lastBlock; l++) this._encodeBlock(encoder, weights, ctx, l);
+      await onChunk(encoder, { kind: 'vit-blocks', firstBlock, lastBlock, totalBlocks: VIT_CONFIG.numLayers });
+      encoder = this.device.createCommandEncoder();
+    }
+
+    const result = this._encodeProjectionAndCls(encoder, weights, ctx, tokenH, tokenW);
+    await onChunk(encoder, { kind: 'feature-projection' });
+    return result;
+  }
+
+  _encodeProjectionAndCls(encoder, weights, ctx, tokenH, tokenW) {
+    const device = this.device;
+    const { N, T, D, intermediateFeatures, currentTokens } = ctx;
+    const numPatches = tokenH * tokenW;
 
     // --- Project and sum intermediate features ---
     // Each intermediate feature gets a 1x1 conv projection, then all are summed
