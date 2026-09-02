@@ -37,7 +37,9 @@ async function main() {
   page.on('pageerror', err => console.error('PAGE ERROR:', err.message));
 
   try {
-    await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'networkidle0', timeout: 30000 });
+    // forceStub: this harness asserts the stub-route receipt contract; without
+    // it, local or hosted real weights would load and status would be 'real'.
+    await page.goto(`http://127.0.0.1:${port}/?forceStub=1`, { waitUntil: 'networkidle0', timeout: 30000 });
     const result = await page.evaluate(async () => {
       const inputResp = await fetch('/test_fixtures/input.png');
       const blob = await inputResp.blob();
@@ -134,8 +136,11 @@ async function main() {
     if (schedulerVerification.classification !== 'config-only') {
       throw new Error(`downgraded MoGE scheduler proof must classify conservatively, got ${schedulerVerification.classification}`);
     }
-    if (schedulerVerification.observationClass !== 'observed-stage-boundary') {
-      throw new Error(`MoGE scheduler proof should preserve observed boundary class, got ${schedulerVerification.observationClass}`);
+    // Staged-profile traces are synthesized from real stage timings: a timing
+    // proxy, never event observation. 'observed-stage-boundary' is reserved
+    // for genuinely observed cooperative traces.
+    if (schedulerVerification.observationClass !== 'stage-timing-proxy') {
+      throw new Error(`staged-profile scheduler proof must classify as stage-timing-proxy, got ${schedulerVerification.observationClass}`);
     }
     if (schedulerVerification.eventTrace?.schema !== 'kaminos.webgpu-scheduler-event-trace.v0') {
       throw new Error(`scheduler verification missing event trace schema: ${JSON.stringify(schedulerVerification.eventTrace)}`);
@@ -146,13 +151,20 @@ async function main() {
     if (!Array.isArray(schedulerVerification.eventTrace?.events) || schedulerVerification.eventTrace.events.length < 6) {
       throw new Error(`scheduler verification missing observed stage events: ${JSON.stringify(schedulerVerification.eventTrace?.events)}`);
     }
-    const verifiedBoundaries = new Set(
+    // Synthesized (stage-timing) traces earn 'timing-only', never 'verified' —
+    // 'verified' is reserved for observed cooperative event traces.
+    const presentBoundaries = new Set(
       (schedulerVerification.boundaryAssertions || [])
-        .filter(assertion => assertion.status === 'verified')
+        .filter(assertion => assertion.status === 'timing-only')
         .map(assertion => assertion.observedBoundary)
     );
+    const falselyVerified = (schedulerVerification.boundaryAssertions || [])
+      .filter(assertion => assertion.status === 'verified');
+    if (falselyVerified.length) {
+      throw new Error(`synthesized-trace boundaries must not claim verified: ${JSON.stringify(falselyVerified.map(a => a.field))}`);
+    }
     for (const boundary of ['moge-stage:backbone', 'moge-stage:decoder-heads', 'moge-stage:output-readback']) {
-      if (!verifiedBoundaries.has(boundary)) throw new Error(`scheduler verification missing boundary ${boundary}`);
+      if (!presentBoundaries.has(boundary)) throw new Error(`scheduler verification missing boundary ${boundary}`);
     }
     if (!schedulerVerification.downgrades?.includes('yield-events-missing')) {
       throw new Error(`scheduler verification must flag missing JS yield evidence: ${JSON.stringify(schedulerVerification.downgrades)}`);

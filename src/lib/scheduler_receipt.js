@@ -148,14 +148,24 @@ export function createMogeBoundaryAssertions(scheduler, events) {
       event.kind === 'queue-work-done-end' || event.kind === 'readback-wait-end'
     ).length;
     const observedYieldCount = observedBoundaryEvents.filter(event => event.kind === 'yield-end').length;
-    const stageStart = boundaryEvents.some(event => String(event.kind || '').endsWith('-start'));
-    const stageEnd = boundaryEvents.some(event => String(event.kind || '').endsWith('-end'));
-    const observedCount = Math.max(observedQueueWaitCount, stageStart && stageEnd ? 1 : 0);
+    const observedStart = observedBoundaryEvents.some(event => String(event.kind || '').endsWith('-start'));
+    const observedEnd = observedBoundaryEvents.some(event => String(event.kind || '').endsWith('-end'));
+    const observedCount = Math.max(observedQueueWaitCount, observedStart && observedEnd ? 1 : 0);
+    // A trace synthesized from stage timings carries real queue-submit-wait
+    // measurements but is not event observation: it earns "timing-only",
+    // never "verified".
+    const synthesizedStart = boundaryEvents.some(event =>
+      event.provenance !== OBSERVED_PROVENANCE && String(event.kind || '').endsWith('-start'));
+    const synthesizedEnd = boundaryEvents.some(event =>
+      event.provenance !== OBSERVED_PROVENANCE && String(event.kind || '').endsWith('-end'));
+    const status = unsupported
+      ? 'unsupported'
+      : (observedCount > 0 ? 'verified' : (synthesizedStart && synthesizedEnd ? 'timing-only' : 'unverified'));
     return {
       field,
       requested: requestedValue,
       effective: Number.isFinite(effective[phase]) ? effective[phase] : null,
-      status: unsupported ? 'unsupported' : (observedCount > 0 ? 'verified' : 'unverified'),
+      status,
       observedBoundary: boundary,
       observedCount,
       expectedMinimumCount: 1,
@@ -205,8 +215,15 @@ export function createMogeSchedulerVerificationReceipt({ routeRequest, scheduler
       .filter(assertion => assertion.status === 'verified')
       .map(assertion => assertion.field.replace(/^phaseChunkSize\./, ''))
   );
+  // A timing-only assertion is present evidence (real stage waits), so it does
+  // not count as a missing boundary assertion — it just cannot verify.
+  const presentPhases = new Set(
+    boundaryAssertions
+      .filter(assertion => assertion.status === 'verified' || assertion.status === 'timing-only')
+      .map(assertion => assertion.field.replace(/^phaseChunkSize\./, ''))
+  );
   for (const phase of requestedPhases) {
-    if (!verifiedPhases.has(phase)) {
+    if (!presentPhases.has(phase)) {
       downgrades.push('requested-boundary-assertion-missing');
       falseAuthorityChecks.requestedBoundaryAssertionMissing = true;
       break;
@@ -228,7 +245,9 @@ export function createMogeSchedulerVerificationReceipt({ routeRequest, scheduler
     classification: status === 'verified'
       ? 'observed-boundary'
       : (status === 'unsupported' ? 'unsupported' : 'config-only'),
-    observationClass: boundaryAssertions.some(assertion => assertion.status === 'verified') ? 'observed-stage-boundary' : 'none',
+    observationClass: boundaryAssertions.some(assertion => assertion.status === 'verified')
+      ? 'observed-stage-boundary'
+      : (boundaryAssertions.some(assertion => assertion.status === 'timing-only') ? 'stage-timing-proxy' : 'none'),
     route: {
       requestedRouteId: routeRequest?.routeId || MOGE_DEPTH_NORMAL_ROUTE_ID,
       effectiveRouteId: MOGE_DEPTH_NORMAL_ROUTE_ID,

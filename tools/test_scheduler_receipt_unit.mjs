@@ -65,6 +65,13 @@ const PHASES = ['backbone', 'decoder-heads', 'output-readback'];
   check('synthesized-yield0-classification', receipt.classification !== 'observed-boundary', `got ${receipt.classification}`);
   check('synthesized-yield0-downgrade', receipt.downgrades.includes('event-trace-synthesized'), `downgrades=${JSON.stringify(receipt.downgrades)}`);
   check('synthesized-yield0-proxy-flag', receipt.falseAuthorityChecks.timingProxyOnly === true, 'timingProxyOnly not set');
+  check('synthesized-observation-class', receipt.observationClass === 'stage-timing-proxy', `got ${receipt.observationClass}`);
+  check('synthesized-assertion-statuses',
+    receipt.boundaryAssertions.every(a => a.status === 'timing-only'),
+    `got ${JSON.stringify(receipt.boundaryAssertions.map(a => a.status))}`);
+  check('synthesized-no-missing-downgrade',
+    !receipt.downgrades.includes('requested-boundary-assertion-missing'),
+    `downgrades=${JSON.stringify(receipt.downgrades)}`);
 }
 
 // 1b. Synthesized trace + yieldMs 4 must not verify either.
@@ -87,6 +94,7 @@ const PHASES = ['backbone', 'decoder-heads', 'output-readback'];
   });
   check('observed-status', receipt.status === 'verified', `got ${receipt.status} downgrades=${JSON.stringify(receipt.downgrades)}`);
   check('observed-classification', receipt.classification === 'observed-boundary', `got ${receipt.classification}`);
+  check('observed-observation-class', receipt.observationClass === 'observed-stage-boundary', `got ${receipt.observationClass}`);
   check('observed-no-downgrades', receipt.downgrades.length === 0, `downgrades=${JSON.stringify(receipt.downgrades)}`);
   for (const a of receipt.boundaryAssertions) {
     check(`observed-yieldcount-${a.field}`, a.observedYieldCount > 0, `got ${a.observedYieldCount}`);

@@ -153,8 +153,9 @@ try {
   if (!(result.depthMaxAbsDiff !== null && result.depthMaxAbsDiff < 1e-5)) {
     failures.push(`cooperative depth must match monolithic run, maxAbsDiff=${result.depthMaxAbsDiff}`);
   }
-  if (result.monolithicSchedulerStatus === 'verified') {
-    failures.push('monolithic run must not claim a verified scheduler receipt');
+  // Absence of the receipt must fail loud, not pass as "not verified".
+  if (result.monolithicSchedulerStatus !== 'scheduler-unverified') {
+    failures.push(`monolithic run must report scheduler-unverified, got ${result.monolithicSchedulerStatus}`);
   }
 
   if (failures.length) {

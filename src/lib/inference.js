@@ -772,6 +772,12 @@ export class MoGeInference {
 
   async init(onProgress) {
     try {
+      // Test hook: harnesses that assert stub-route semantics (e.g. the route
+      // receipt contract) opt in explicitly, since the hosted-weights fallback
+      // otherwise makes stub mode unreachable in any networked browser.
+      if (typeof location !== 'undefined' && new URLSearchParams(location.search).get('forceStub')) {
+        throw new Error('forced stub weights (forceStub test mode)');
+      }
       const weightsUrl = await resolveWeightsUrl();
       this.weights = await loadWeights(this.device, weightsUrl, onProgress);
       this.useRealWeights = true;
