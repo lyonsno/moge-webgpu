@@ -80,6 +80,11 @@ try {
     ctx.drawImage(img, 0, 0);
     const imageData = ctx.getImageData(0, 0, img.width, img.height);
 
+    // Negative path: the monolithic first run must NOT claim scheduler
+    // verification (no observed events exist for it).
+    const monolithicSchedulerStatus =
+      window.__mogeDebug?.webGpuRouteReceipt?.runtime?.schedulerVerification?.status ?? null;
+
     const monolithicDepth = window.__mogeResult.depth;
     const frameCountBefore = window.__frameIntervals.length;
     const t0 = performance.now();
@@ -117,6 +122,7 @@ try {
       })),
       depthFinite: Number.isFinite(run.depth?.[0]),
       depthMaxAbsDiff,
+      monolithicSchedulerStatus,
     };
   });
 
@@ -146,6 +152,9 @@ try {
   if (!result.depthFinite) failures.push('depth output not finite');
   if (!(result.depthMaxAbsDiff !== null && result.depthMaxAbsDiff < 1e-5)) {
     failures.push(`cooperative depth must match monolithic run, maxAbsDiff=${result.depthMaxAbsDiff}`);
+  }
+  if (result.monolithicSchedulerStatus === 'verified') {
+    failures.push('monolithic run must not claim a verified scheduler receipt');
   }
 
   if (failures.length) {

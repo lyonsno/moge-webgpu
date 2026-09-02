@@ -83,6 +83,8 @@ const VIT_CONFIG = {
   eps: 1e-6,
 };
 
+export const VIT_BLOCK_COUNT = VIT_CONFIG.numLayers;
+
 export class DINOv2Backbone {
   constructor(device) {
     this.device = device;

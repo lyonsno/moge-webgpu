@@ -23,7 +23,8 @@
     "test:fused-relu-conv2d": "node tools/test_fused_relu_conv2d.mjs",
     "test": "echo \"See tools/compare_backbone.mjs and tools/visual_smoke.mjs for test harnesses\"",
     "test:depth-parity": "node tools/test_depth_parity.mjs",
-    "test:cooperative-route": "node tools/test_cooperative_route.mjs"
+    "test:cooperative-route": "node tools/test_cooperative_route.mjs",
+    "test:scheduler-receipt-unit": "node tools/test_scheduler_receipt_unit.mjs"
   },
   "devDependencies": {
     "@kaminos/webgpu-inference-kit": "^0.1.4",

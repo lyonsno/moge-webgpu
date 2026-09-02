@@ -39,7 +39,14 @@ import {
   dispatchUpsample,
 } from './shader_ops.js';
 import { loadWeights } from './weights.js';
-import { DINOv2Backbone } from './backbone.js';
+import {
+  resolveCooperativeScheduler,
+  coopEvent,
+  coopYield,
+  cooperativeSchedulerDescriptor,
+  createMogeSchedulerVerificationReceipt,
+} from './scheduler_receipt.js';
+import { DINOv2Backbone, VIT_BLOCK_COUNT } from './backbone.js';
 import { selectCpuFallbackEncoderFeatures } from './encoder_features.js';
 import {
   WEBGPU_INFERENCE_KIT_VERSION,
@@ -93,9 +100,6 @@ function timestampDeltaMs(values, start, end) {
 
 const MOGE_DEPTH_NORMAL_ROUTE_ID = 'moge.depth-normal.webgpu-local.v0';
 const MOGE_MODEL_ID = 'Ruicheng/moge-2-vitl-normal';
-const SCHEDULER_VERIFICATION_RECEIPT_SCHEMA = 'kaminos.webgpu-scheduler-verification-receipt.v0';
-const SCHEDULER_EVENT_TRACE_SCHEMA = 'kaminos.webgpu-scheduler-event-trace.v0';
-
 function timedStagesFromStagedProfile(staged) {
   if (!staged) return null;
   return [
@@ -118,206 +122,6 @@ function runtimeEvidenceFallbackReason(runtimeEvidence) {
 
 function cloneJson(value) {
   return value == null ? value : JSON.parse(JSON.stringify(value));
-}
-
-// --- Cooperative scheduling (model-owned, aligned to the kit's declared
-// moge scheduler profile: per-phase chunked submits with browser yields) ---
-
-function resolveCooperativeScheduler(requested) {
-  if (!requested || requested.mode !== 'cooperative') return null;
-  return {
-    mode: 'cooperative',
-    yieldMs: Math.max(0, Number.isFinite(Number(requested.yieldMs)) ? Number(requested.yieldMs) : 4),
-    vitBlockChunkSize: Math.max(1, Math.floor(Number(requested.vitBlockChunkSize) || 1)),
-    waitForSubmittedWorkDone: requested.waitForSubmittedWorkDone !== false,
-    events: [],
-  };
-}
-
-function coopEvent(coop, phase, kind, extra = {}) {
-  coop.events.push({
-    tMs: performance.now(),
-    phase,
-    boundary: `moge-stage:${phase}`,
-    kind,
-    source: 'moge-webgpu-runtime',
-    ...extra,
-  });
-}
-
-async function coopYield(coop, phase) {
-  if (!coop) return;
-  coopEvent(coop, phase, 'yield-start');
-  await new Promise(resolve => setTimeout(resolve, coop.yieldMs));
-  coopEvent(coop, phase, 'yield-end', { yieldMs: coop.yieldMs });
-}
-
-function cooperativeSchedulerDescriptor(coop) {
-  const config = {
-    mode: 'cooperative',
-    yieldMs: coop.yieldMs,
-    waitForSubmittedWorkDone: coop.waitForSubmittedWorkDone,
-    phaseChunkSize: {
-      backbone: coop.vitBlockChunkSize,
-      'decoder-heads': 1,
-      'output-readback': 1,
-    },
-  };
-  return {
-    requestedScheduler: { ...config, phaseChunkSize: { ...config.phaseChunkSize } },
-    effectiveScheduler: { ...config, phaseChunkSize: { ...config.phaseChunkSize }, unsupportedFields: [] },
-  };
-}
-
-function createMogeSchedulerEventTrace(stagedStages, observedEvents) {
-  if (Array.isArray(observedEvents) && observedEvents.length > 0) {
-    return {
-      schema: SCHEDULER_EVENT_TRACE_SCHEMA,
-      clock: 'performance.now',
-      timingAuthority: 'queue-submit-wait',
-      events: observedEvents.map(event => ({ ...event })),
-    };
-  }
-  let cursorMs = 0;
-  const events = [];
-  for (const [index, stage] of (stagedStages || []).entries()) {
-    if (!stage?.name || !Number.isFinite(stage.ms)) continue;
-    const boundary = `moge-stage:${stage.name}`;
-    const waitKind = stage.name === 'output-readback' ? 'readback-wait' : 'queue-work-done';
-    events.push({
-      tMs: cursorMs,
-      phase: stage.name,
-      boundary,
-      kind: `${waitKind}-start`,
-      index,
-      source: 'moge-webgpu-runtime',
-    });
-    cursorMs += Math.max(0, stage.ms);
-    events.push({
-      tMs: cursorMs,
-      phase: stage.name,
-      boundary,
-      kind: `${waitKind}-end`,
-      index,
-      waitMs: stage.ms,
-      source: 'moge-webgpu-runtime',
-    });
-  }
-  return {
-    schema: SCHEDULER_EVENT_TRACE_SCHEMA,
-    clock: 'performance.now',
-    timingAuthority: stagedStages ? 'queue-submit-wait' : 'not-observed',
-    events,
-  };
-}
-
-function createMogeBoundaryAssertions(scheduler, events) {
-  const requested = scheduler?.requestedScheduler?.phaseChunkSize || {};
-  const effective = scheduler?.effectiveScheduler?.phaseChunkSize || {};
-  const unsupportedFields = scheduler?.effectiveScheduler?.unsupportedFields || [];
-  return Object.entries(requested).map(([phase, requestedValue]) => {
-    const field = `phaseChunkSize.${phase}`;
-    const boundary = `moge-stage:${phase}`;
-    const boundaryEvents = events.filter(event => event.boundary === boundary);
-    const unsupported = unsupportedFields.includes(field) || unsupportedFields.includes('phaseChunkSize');
-    const observedQueueWaitCount = boundaryEvents.filter(event =>
-      event.kind === 'queue-work-done-end' || event.kind === 'readback-wait-end'
-    ).length;
-    const observedYieldCount = boundaryEvents.filter(event => event.kind === 'yield-end').length;
-    const observedStart = boundaryEvents.some(event => String(event.kind || '').endsWith('-start'));
-    const observedEnd = boundaryEvents.some(event => String(event.kind || '').endsWith('-end'));
-    const observedCount = Math.max(observedQueueWaitCount, observedStart && observedEnd ? 1 : 0);
-    return {
-      field,
-      requested: requestedValue,
-      effective: Number.isFinite(effective[phase]) ? effective[phase] : null,
-      status: unsupported ? 'unsupported' : (observedCount > 0 ? 'verified' : 'unverified'),
-      observedBoundary: boundary,
-      observedCount,
-      expectedMinimumCount: 1,
-      observedQueueWaitCount,
-      observedYieldCount,
-      unsupportedReason: unsupported ? 'effective scheduler declared this field unsupported' : null,
-    };
-  });
-}
-
-function schedulerRequestsYield(scheduler = {}) {
-  const requested = scheduler.requestedScheduler || {};
-  const effective = scheduler.effectiveScheduler || {};
-  return Number(requested.yieldMs || 0) > 0 || Number(effective.yieldMs || 0) > 0;
-}
-
-function createMogeSchedulerVerificationReceipt({ routeRequest, scheduler, backpressure, stagedStages, observedEvents }) {
-  const eventTrace = createMogeSchedulerEventTrace(stagedStages, observedEvents);
-  const boundaryAssertions = createMogeBoundaryAssertions(scheduler, eventTrace.events);
-  const yieldObserved = boundaryAssertions.some(assertion => assertion.observedYieldCount > 0);
-  const downgrades = [];
-  const falseAuthorityChecks = {
-    eventTraceMissing: false,
-    verifiedWithoutObservedBoundary: false,
-    timingProxyOnly: false,
-    queueWaitEventsMissing: false,
-    boundaryAssertionEventMismatch: false,
-    requestedBoundaryAssertionMissing: false,
-    requestedFieldDroppedWithoutUnsupported: false,
-  };
-
-  if (!eventTrace.events.length) {
-    downgrades.push('event-trace-missing');
-    falseAuthorityChecks.eventTraceMissing = true;
-  }
-  if (schedulerRequestsYield(scheduler) && !yieldObserved) downgrades.push('yield-events-missing');
-
-  const requestedPhases = Object.keys(scheduler?.requestedScheduler?.phaseChunkSize || {});
-  const verifiedPhases = new Set(
-    boundaryAssertions
-      .filter(assertion => assertion.status === 'verified')
-      .map(assertion => assertion.field.replace(/^phaseChunkSize\./, ''))
-  );
-  for (const phase of requestedPhases) {
-    if (!verifiedPhases.has(phase)) {
-      downgrades.push('requested-boundary-assertion-missing');
-      falseAuthorityChecks.requestedBoundaryAssertionMissing = true;
-      break;
-    }
-  }
-
-  const unsupported = boundaryAssertions.some(assertion => assertion.status === 'unsupported');
-  const verified = eventTrace.events.length > 0
-    && requestedPhases.length > 0
-    && requestedPhases.every(phase => verifiedPhases.has(phase))
-    && (!schedulerRequestsYield(scheduler) || yieldObserved)
-    && !unsupported;
-  const status = unsupported ? 'unsupported' : (verified ? 'verified' : 'scheduler-unverified');
-
-  return {
-    schema: SCHEDULER_VERIFICATION_RECEIPT_SCHEMA,
-    status,
-    classification: status === 'verified'
-      ? 'observed-boundary'
-      : (status === 'unsupported' ? 'unsupported' : 'config-only'),
-    observationClass: boundaryAssertions.some(assertion => assertion.status === 'verified') ? 'observed-stage-boundary' : 'none',
-    route: {
-      requestedRouteId: routeRequest?.routeId || MOGE_DEPTH_NORMAL_ROUTE_ID,
-      effectiveRouteId: MOGE_DEPTH_NORMAL_ROUTE_ID,
-      backendClass: 'browser-webgpu',
-      requestId: routeRequest?.requestId || null,
-    },
-    scheduler: cloneJson(scheduler),
-    backpressure: cloneJson(backpressure),
-    eventTrace,
-    boundaryAssertions,
-    frameTail: {
-      evidenceSource: eventTrace.timingAuthority,
-      disclaimer: 'not-gpu-exclusive-or-present-latency',
-      rafFps: null,
-      frameP95Ms: null,
-      queueDoneP95Ms: null,
-    },
-    downgrades: [...new Set(downgrades)],
-    falseAuthorityChecks,
-  };
 }
 
 function createMogeWebGpuRouteReceipt({ backendIdentity, routeRequest, routeReceipt, stagedGpuPhaseTimings, phaseTimings, outH, outW, runtimeEvidence, observedSchedulerEvents }) {
@@ -1182,6 +986,12 @@ export class MoGeInference {
     const profileStagedGpu = !!options.profileStagedGpu;
     const stagedSubmits = profileStagedGpu || !!coop;
     const profileDecoderSubstages = !!options.profileDecoderSubstages;
+    if (coop && profileDecoderSubstages) {
+      // The substage profiler owns the decoder submits and bypasses the
+      // cooperative decoder-heads seam, which would leave decoderSubmitWaitMs
+      // unassigned (NaN total) and silently drop that phase's yields.
+      throw new Error('cooperative scheduling and profileDecoderSubstages cannot be combined');
+    }
     const profileNeckLevels = !!options.profileNeckLevels;
     const profileNeckInternalsLevel = Number.isInteger(options.profileNeckInternals?.level)
       ? options.profileNeckInternals.level
@@ -1801,7 +1611,9 @@ export class MoGeInference {
     } else if (options.profileGpuTimestamps) {
       window.__mogeDebug.gpuPhaseTimings = {
         route: 'unavailable',
-        reason: 'timestamp-query feature was not present on the GPUDevice',
+        reason: coop
+          ? 'disabled in cooperative scheduling mode; timing authority is queue-submit-wait'
+          : 'timestamp-query feature was not present on the GPUDevice',
       };
     }
     const webGpuRouteRequest = createMogeRouteInvocationRequest({
@@ -1818,7 +1630,7 @@ export class MoGeInference {
       // observed event trace (real submits + yields, not synthesized stages).
       webGpuRouteRequest.scheduler = {
         ...(webGpuRouteRequest.scheduler || {}),
-        ...cooperativeSchedulerDescriptor(coop),
+        ...cooperativeSchedulerDescriptor(coop, { backboneTotalItems: VIT_BLOCK_COUNT }),
       };
     }
     const webGpuRouteReceipt = createMogeWebGpuRouteReceipt({
