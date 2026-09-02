@@ -53,7 +53,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--image", required=True)
     parser.add_argument("--output-dir", default="public/layer_dumps")
-    parser.add_argument("--model", default="Ruicheng/moge-2-vitl")
+    parser.add_argument("--model", default="Ruicheng/moge-2-vitl-normal")
     parser.add_argument("--token-size", type=int, default=37,
                         help="Token grid size (37 matches pretrained pos_embed)")
     args = parser.parse_args()

@@ -16,7 +16,7 @@
  *   - alignedRelRms: rel RMS after dividing out scaleMedian (scale-invariant)
  *
  * Usage: node tools/test_depth_parity.mjs [--port 5182] [--headed]
- * Exit code 1 if the comparison could not run or alignedRelRms > 0.05.
+ * Exit code 1 if the comparison could not run or alignedRelRms > 0.005.
  */
 
 import puppeteer from 'puppeteer-core';
@@ -66,6 +66,11 @@ async function main() {
     );
 
     const metrics = await page.evaluate(async () => {
+      // Route authority: refuse to compare anything but the real-weights route.
+      // (Stub-weight fallback produces plausible-looking garbage metrics.)
+      if (!window.__mogeInference?.useRealWeights) {
+        return { error: 'inference ran on stub weights — no authoritative comparison possible' };
+      }
       const result = window.__mogeResult;
       const gw = result.width, gh = result.height;
       const gpu = result.depth;
@@ -119,8 +124,8 @@ async function main() {
 
     console.log(JSON.stringify(metrics, null, 2));
     if (metrics.error) process.exitCode = 1;
-    else if (metrics.alignedRelRms > 0.05) {
-      console.log(`\nFAIL: alignedRelRms ${metrics.alignedRelRms.toFixed(4)} > 0.05`);
+    else if (metrics.alignedRelRms > 0.005) {
+      console.log(`\nFAIL: alignedRelRms ${metrics.alignedRelRms.toFixed(4)} > 0.005`);
       process.exitCode = 1;
     } else {
       console.log('\nPASS');
