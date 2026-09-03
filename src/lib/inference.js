@@ -1134,6 +1134,25 @@ export class MoGeInference {
       // unassigned (NaN total) and silently drop that phase's yields.
       throw new Error('cooperative scheduling and profileDecoderSubstages cannot be combined');
     }
+    // Bounded-prefix pacer: queue-level fences resolve in submission order, so
+    // awaiting the fence captured maxInFlightChunks submits ago waits exactly
+    // until that prefix (and everything before it) retires.
+    const coopFences = [];
+    const coopPace = coop ? async () => {
+      if (coop.pacing === 'bounded-prefix') {
+        coopFences.push(device.queue.onSubmittedWorkDone());
+        const excess = coopFences.length - coop.maxInFlightChunks;
+        if (excess > 0) await coopFences.splice(0, excess)[0];
+      } else if (coop.waitForSubmittedWorkDone) {
+        await device.queue.onSubmittedWorkDone();
+      }
+    } : null;
+    const coopDrain = coop ? async () => {
+      if (coopFences.length) {
+        await coopFences[coopFences.length - 1];
+        coopFences.length = 0;
+      }
+    } : null;
     const profileNeckLevels = !!options.profileNeckLevels;
     const profileNeckInternalsLevel = Number.isInteger(options.profileNeckInternals?.level)
       ? options.profileNeckInternals.level
@@ -1188,7 +1207,7 @@ export class MoGeInference {
                   : { chunk: meta.kind }));
               const waitStart = performance.now();
               device.queue.submit([chunkEncoder.finish()]);
-              if (coop.waitForSubmittedWorkDone) await device.queue.onSubmittedWorkDone();
+              await coopPace();
               const waitMs = performance.now() - waitStart;
               backboneWaitMs += waitMs;
               coopEvent(coop, 'backbone', 'queue-work-done-end', { waitMs });
@@ -1485,7 +1504,7 @@ export class MoGeInference {
       coopEvent(coop, 'decoder-heads', 'queue-work-done-start', { chunk: chunkLabel });
       const waitStart = performance.now();
       device.queue.submit([levelEncoder.finish()]);
-      if (coop.waitForSubmittedWorkDone) await device.queue.onSubmittedWorkDone();
+      await coopPace();
       const waitMs = performance.now() - waitStart;
       coopDecoderWaitMs += waitMs;
       coopEvent(coop, 'decoder-heads', 'queue-work-done-end', { waitMs });
@@ -1624,6 +1643,7 @@ export class MoGeInference {
     const lastNormals = normalOutputs[normalOutputs.length - 1];
     const lastMask = maskOutputs[maskOutputs.length - 1];
 
+    if (coop && coop.pacing === 'bounded-prefix') await coopDrain();
     if (coop) coopEvent(coop, 'output-readback', 'readback-wait-start');
     const gpuReadbackStart = performance.now();
     const [pointsRaw, normalsRaw, maskRaw] = await Promise.all([

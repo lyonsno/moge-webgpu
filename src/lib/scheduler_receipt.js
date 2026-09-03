@@ -38,6 +38,12 @@ export function resolveCooperativeScheduler(requested) {
     // submission near a frame budget for shared-device hosts.
     splitVitBlocks: requested.splitVitBlocks === true,
     splitDecoderResBlocks: requested.splitDecoderResBlocks === true,
+    // Pacing: 'strict-drain' awaits full queue completion after every chunk
+    // (GPU idles during each wait); 'bounded-prefix' keeps up to
+    // maxInFlightChunks submitted chunks in flight and awaits only the oldest
+    // fence — GPU stays saturated while queued-ahead work stays bounded.
+    pacing: requested.pacing === 'bounded-prefix' ? 'bounded-prefix' : 'strict-drain',
+    maxInFlightChunks: Math.max(1, Math.floor(Number(requested.maxInFlightChunks) || 2)),
     waitForSubmittedWorkDone: requested.waitForSubmittedWorkDone !== false,
     events: [],
   };
@@ -84,6 +90,8 @@ export function cooperativeSchedulerDescriptor(coop, { backboneTotalItems } = {}
     mode: 'cooperative',
     yieldMs: coop.yieldMs,
     waitForSubmittedWorkDone: coop.waitForSubmittedWorkDone,
+    pacing: coop.pacing,
+    maxInFlightChunks: coop.maxInFlightChunks,
   };
   return {
     requestedScheduler: { ...base, phaseChunkSize: requestedChunks },
