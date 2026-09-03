@@ -24,7 +24,8 @@
     "test": "echo \"See tools/compare_backbone.mjs and tools/visual_smoke.mjs for test harnesses\"",
     "test:depth-parity": "node tools/test_depth_parity.mjs",
     "test:cooperative-route": "node tools/test_cooperative_route.mjs",
-    "test:scheduler-receipt-unit": "node tools/test_scheduler_receipt_unit.mjs"
+    "test:scheduler-receipt-unit": "node tools/test_scheduler_receipt_unit.mjs",
+    "build:lib": "vite build --config vite.lib.config.js"
   },
   "devDependencies": {
     "@kaminos/webgpu-inference-kit": "^0.1.4",

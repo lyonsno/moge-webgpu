@@ -2,7 +2,7 @@
  * WebGPU initialization and device management.
  */
 
-const INFERENCE_LIMIT_KEYS = [
+export const INFERENCE_LIMIT_KEYS = [
   'maxBufferSize',
   'maxStorageBufferBindingSize',
   'maxComputeWorkgroupStorageSize',
@@ -16,7 +16,7 @@ function featureList(features) {
   return Array.from(features).map(String).sort();
 }
 
-function inferenceLimits(limits) {
+export function inferenceLimits(limits) {
   const out = {};
   for (const key of INFERENCE_LIMIT_KEYS) {
     if (Number.isFinite(limits?.[key])) out[key] = limits[key];
