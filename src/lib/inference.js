@@ -495,6 +495,55 @@ function dispatchConvStack(device, encoder, inFeatures, weights, config) {
  * is created for the next level. Buffers persist across submits, so numerics
  * match the monolithic path exactly.
  */
+
+// Cooperative residual conv block: identical dispatch stream to
+// dispatchResidualConvBlock, split into two submits between the two 3x3
+// convs (each conv is roughly half the block's GPU time at high resolution).
+async function dispatchResidualConvBlockCooperative(device, encoder, inputBuf, weights, params, onSplit) {
+  const { inC, outC, hiddenC, H, W, inNorm, hiddenNorm } = params;
+  let x = inputBuf;
+  if (inNorm !== 'none') {
+    const numGroups = inNorm === 'group_norm' ? Math.floor(inC / 32) : 1;
+    x = dispatchGroupNorm(device, encoder, x, weights.norm1_scale, weights.norm1_bias,
+      { C: inC, H, W, numGroups });
+  }
+  let convOut;
+  if (inNorm === 'none') {
+    convOut = dispatchReluConv2d(device, encoder, x, weights.conv1_weight, weights.conv1_bias,
+      { inC, inH: H, inW: W, outC: hiddenC, kH: 3, kW: 3, padH: 1, padW: 1, strideH: 1, strideW: 1 });
+  } else {
+    x = dispatchActivation(device, encoder, x, null, inC * H * W, 0);
+    convOut = dispatchConv2d(device, encoder, x, weights.conv1_weight, weights.conv1_bias,
+      { inC, inH: H, inW: W, outC: hiddenC, kH: 3, kW: 3, padH: 1, padW: 1, strideH: 1, strideW: 1 });
+  }
+  x = convOut.buffer;
+
+  encoder = await onSplit(encoder);
+
+  if (hiddenNorm !== 'none') {
+    const numGroups = hiddenNorm === 'group_norm' ? Math.floor(hiddenC / 32) : 1;
+    x = dispatchGroupNorm(device, encoder, x, weights.norm2_scale, weights.norm2_bias,
+      { C: hiddenC, H, W, numGroups });
+  }
+  if (hiddenNorm === 'none') {
+    convOut = dispatchReluConv2d(device, encoder, x, weights.conv2_weight, weights.conv2_bias,
+      { inC: hiddenC, inH: H, inW: W, outC, kH: 3, kW: 3, padH: 1, padW: 1, strideH: 1, strideW: 1 });
+  } else {
+    x = dispatchActivation(device, encoder, x, null, hiddenC * H * W, 0);
+    convOut = dispatchConv2d(device, encoder, x, weights.conv2_weight, weights.conv2_bias,
+      { inC: hiddenC, inH: H, inW: W, outC, kH: 3, kW: 3, padH: 1, padW: 1, strideH: 1, strideW: 1 });
+  }
+  let skip;
+  if (inC !== outC && weights.skip_weight) {
+    skip = dispatchConv1x1(device, encoder, inputBuf, weights.skip_weight, null,
+      { inC, outC, H, W }).buffer;
+  } else {
+    skip = inputBuf;
+  }
+  const out = dispatchActivation(device, encoder, convOut.buffer, skip, outC * H * W, 2);
+  return { buffer: out, encoder };
+}
+
 async function dispatchConvStackCooperative(device, encoder, inFeatures, weights, config, onLevelChunk, { splitResBlocks = false } = {}) {
   const { dimIn, dimResBlocks, dimOut, numResBlocks, resamplers, resBlockInNorm, resBlockHiddenNorm } = config;
   const numLevels = dimResBlocks.length;
@@ -519,15 +568,27 @@ async function dispatchConvStackCooperative(device, encoder, inFeatures, weights
     }
 
     for (let j = 0; j < numResBlocks[i]; j++) {
-      x = dispatchResidualConvBlock(device, encoder, x, weights.levels[i].res_blocks[j], {
-        inC: dimResBlocks[i], outC: dimResBlocks[i], hiddenC: dimResBlocks[i],
-        H, W, inNorm: resBlockInNorm, hiddenNorm: resBlockHiddenNorm,
-      });
-      // Sub-level granularity: each res block is its own submit, so a single
-      // high-resolution level cannot occupy the queue for a whole frame.
-      if (splitResBlocks && j < numResBlocks[i] - 1) {
-        await onLevelChunk(encoder, { level: i, numLevels, H, W, part: `res-block-${j}` });
+      // Sub-level granularity: each res block splits into two submits (one
+      // per 3x3 conv), so no single submission approaches a frame budget
+      // even at the highest-resolution levels.
+      if (splitResBlocks) {
+        const r = await dispatchResidualConvBlockCooperative(device, encoder, x,
+          weights.levels[i].res_blocks[j], {
+            inC: dimResBlocks[i], outC: dimResBlocks[i], hiddenC: dimResBlocks[i],
+            H, W, inNorm: resBlockInNorm, hiddenNorm: resBlockHiddenNorm,
+          }, async splitEncoder => {
+            await onLevelChunk(splitEncoder, { level: i, numLevels, H, W, part: `res-block-${j}:conv1` });
+            return device.createCommandEncoder();
+          });
+        x = r.buffer;
+        encoder = r.encoder;
+        await onLevelChunk(encoder, { level: i, numLevels, H, W, part: `res-block-${j}:conv2` });
         encoder = device.createCommandEncoder();
+      } else {
+        x = dispatchResidualConvBlock(device, encoder, x, weights.levels[i].res_blocks[j], {
+          inC: dimResBlocks[i], outC: dimResBlocks[i], hiddenC: dimResBlocks[i],
+          H, W, inNorm: resBlockInNorm, hiddenNorm: resBlockHiddenNorm,
+        });
       }
     }
 
@@ -540,6 +601,13 @@ async function dispatchConvStackCooperative(device, encoder, inFeatures, weights
       outFeatures.push({ buffer: x, C: dimResBlocks[i], H, W });
     }
 
+    // Split the level tail too: at high resolution the output conv and the
+    // resampler are each frame-budget-sized on their own.
+    if (splitResBlocks && i < numLevels - 1 && resamplers[i]) {
+      await onLevelChunk(encoder, { level: i, numLevels, H, W, part: 'output-block' });
+      encoder = device.createCommandEncoder();
+    }
+
     if (i < numLevels - 1 && resamplers[i]) {
       const resampled = dispatchResampler(device, encoder, x,
         weights.levels[i].resampler, {
@@ -549,7 +617,7 @@ async function dispatchConvStackCooperative(device, encoder, inFeatures, weights
       x = resampled.buffer;
     }
 
-    await onLevelChunk(encoder, { level: i, numLevels, H, W });
+    await onLevelChunk(encoder, { level: i, numLevels, H, W, part: splitResBlocks ? 'tail' : undefined });
     encoder = device.createCommandEncoder();
   }
 
