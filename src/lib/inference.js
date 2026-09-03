@@ -488,6 +488,68 @@ function dispatchConvStack(device, encoder, inFeatures, weights, config) {
   return outFeatures;
 }
 
+/**
+ * Cooperative ConvStack: identical dispatch stream to dispatchConvStack, but
+ * submits per level and hands each finished chunk to `onLevelChunk(encoder,
+ * meta)` (which owns submit/wait/yield and returns nothing); a fresh encoder
+ * is created for the next level. Buffers persist across submits, so numerics
+ * match the monolithic path exactly.
+ */
+async function dispatchConvStackCooperative(device, encoder, inFeatures, weights, config, onLevelChunk) {
+  const { dimIn, dimResBlocks, dimOut, numResBlocks, resamplers, resBlockInNorm, resBlockHiddenNorm } = config;
+  const numLevels = dimResBlocks.length;
+  const outFeatures = [];
+  let x = null;
+
+  for (let i = 0; i < numLevels; i++) {
+    const H = inFeatures[i].H;
+    const W = inFeatures[i].W;
+
+    let projected = null;
+    if (dimIn[i] != null && inFeatures[i].buffer != null) {
+      projected = dispatchConv1x1(device, encoder, inFeatures[i].buffer,
+        weights.levels[i].input_weight, weights.levels[i].input_bias,
+        { inC: dimIn[i], outC: dimResBlocks[i], H, W });
+    }
+
+    if (i === 0) {
+      x = projected.buffer;
+    } else if (projected) {
+      x = dispatchActivation(device, encoder, x, projected.buffer, dimResBlocks[i] * H * W, 2);
+    }
+
+    for (let j = 0; j < numResBlocks[i]; j++) {
+      x = dispatchResidualConvBlock(device, encoder, x, weights.levels[i].res_blocks[j], {
+        inC: dimResBlocks[i], outC: dimResBlocks[i], hiddenC: dimResBlocks[i],
+        H, W, inNorm: resBlockInNorm, hiddenNorm: resBlockHiddenNorm,
+      });
+    }
+
+    if (dimOut[i] != null) {
+      const out = dispatchConv1x1(device, encoder, x,
+        weights.levels[i].output_weight, weights.levels[i].output_bias,
+        { inC: dimResBlocks[i], outC: dimOut[i], H, W });
+      outFeatures.push({ buffer: out.buffer, C: dimOut[i], H, W });
+    } else {
+      outFeatures.push({ buffer: x, C: dimResBlocks[i], H, W });
+    }
+
+    if (i < numLevels - 1 && resamplers[i]) {
+      const resampled = dispatchResampler(device, encoder, x,
+        weights.levels[i].resampler, {
+          inC: dimResBlocks[i], outC: dimResBlocks[i + 1],
+          H, W, type: resamplers[i],
+        });
+      x = resampled.buffer;
+    }
+
+    await onLevelChunk(encoder, { level: i, numLevels, H, W });
+    encoder = device.createCommandEncoder();
+  }
+
+  return { outFeatures, encoder };
+}
+
 async function dispatchConvStackProfiledByLevel(device, encoder, inFeatures, weights, config) {
   const { dimIn, dimResBlocks, dimOut, numResBlocks, resamplers, resBlockInNorm, resBlockHiddenNorm } = config;
   const numLevels = dimResBlocks.length;
@@ -1337,6 +1399,20 @@ export class MoGeInference {
 
     // Neck
     const neckAndHeadsEncodeStart = performance.now();
+    // Cooperative decoder chunking: each ConvStack level (neck + each head) is
+    // its own submit + yield, so the decoder can no longer produce a single
+    // 1s+ queue occupancy (the dominant foreground hitch in composition runs).
+    let coopDecoderWaitMs = 0;
+    const coopLevelHook = label => async (levelEncoder, meta) => {
+      coopEvent(coop, 'decoder-heads', 'queue-work-done-start', { chunk: `${label}:level-${meta.level}` });
+      const waitStart = performance.now();
+      device.queue.submit([levelEncoder.finish()]);
+      if (coop.waitForSubmittedWorkDone) await device.queue.onSubmittedWorkDone();
+      const waitMs = performance.now() - waitStart;
+      coopDecoderWaitMs += waitMs;
+      coopEvent(coop, 'decoder-heads', 'queue-work-done-end', { waitMs });
+      await coopYield(coop, 'decoder-heads');
+    };
     let neckOutputs;
     if (neckResamplerTimings) {
       const profiledNeck = await dispatchConvStackProfiledResampler(
@@ -1364,6 +1440,11 @@ export class MoGeInference {
       decoderEncoder = profiledNeck.encoder;
       neckLevelTimings.levels = profiledNeck.levels;
       neckLevelTimings.totalNeckLevelMs = profiledNeck.levels.reduce((sum, level) => sum + level.submitWaitMs, 0);
+    } else if (coop) {
+      const r = await dispatchConvStackCooperative(
+        device, decoderEncoder, neckInputs, this.weights.neck, MODEL_CONFIG.neck, coopLevelHook('neck'));
+      neckOutputs = r.outFeatures;
+      decoderEncoder = r.encoder;
     } else {
       neckOutputs = dispatchConvStack(device, decoderEncoder, neckInputs, this.weights.neck, MODEL_CONFIG.neck);
     }
@@ -1377,7 +1458,15 @@ export class MoGeInference {
 
     // Points head
     const pointsInputs = neckOutputs.map(f => ({ buffer: f.buffer, H: f.H, W: f.W }));
-    const pointsOutputs = dispatchConvStack(device, decoderEncoder, pointsInputs, this.weights.pointsHead, MODEL_CONFIG.pointsHead);
+    let pointsOutputs;
+    if (coop) {
+      const r = await dispatchConvStackCooperative(
+        device, decoderEncoder, pointsInputs, this.weights.pointsHead, MODEL_CONFIG.pointsHead, coopLevelHook('points-head'));
+      pointsOutputs = r.outFeatures;
+      decoderEncoder = r.encoder;
+    } else {
+      pointsOutputs = dispatchConvStack(device, decoderEncoder, pointsInputs, this.weights.pointsHead, MODEL_CONFIG.pointsHead);
+    }
     if (profileDecoderSubstages) {
       const waitStart = performance.now();
       device.queue.submit([decoderEncoder.finish()]);
@@ -1388,7 +1477,15 @@ export class MoGeInference {
 
     // Normal head
     const normalInputs = neckOutputs.map(f => ({ buffer: f.buffer, H: f.H, W: f.W }));
-    const normalOutputs = dispatchConvStack(device, decoderEncoder, normalInputs, this.weights.normalHead, MODEL_CONFIG.normalHead);
+    let normalOutputs;
+    if (coop) {
+      const r = await dispatchConvStackCooperative(
+        device, decoderEncoder, normalInputs, this.weights.normalHead, MODEL_CONFIG.normalHead, coopLevelHook('normal-head'));
+      normalOutputs = r.outFeatures;
+      decoderEncoder = r.encoder;
+    } else {
+      normalOutputs = dispatchConvStack(device, decoderEncoder, normalInputs, this.weights.normalHead, MODEL_CONFIG.normalHead);
+    }
     if (profileDecoderSubstages) {
       const waitStart = performance.now();
       device.queue.submit([decoderEncoder.finish()]);
@@ -1399,7 +1496,15 @@ export class MoGeInference {
 
     // Mask head
     const maskInputs = neckOutputs.map(f => ({ buffer: f.buffer, H: f.H, W: f.W }));
-    const maskOutputs = dispatchConvStack(device, decoderEncoder, maskInputs, this.weights.maskHead, MODEL_CONFIG.maskHead);
+    let maskOutputs;
+    if (coop) {
+      const r = await dispatchConvStackCooperative(
+        device, decoderEncoder, maskInputs, this.weights.maskHead, MODEL_CONFIG.maskHead, coopLevelHook('mask-head'));
+      maskOutputs = r.outFeatures;
+      decoderEncoder = r.encoder;
+    } else {
+      maskOutputs = dispatchConvStack(device, decoderEncoder, maskInputs, this.weights.maskHead, MODEL_CONFIG.maskHead);
+    }
     if (profileDecoderSubstages) {
       const waitStart = performance.now();
       device.queue.submit([decoderEncoder.finish()]);
@@ -1416,13 +1521,14 @@ export class MoGeInference {
     if (profileDecoderSubstages) {
       // Decoder substages were already submitted above.
     } else if (stagedSubmits) {
-      if (coop) coopEvent(coop, 'decoder-heads', 'queue-work-done-start', { chunk: 'neck-and-heads' });
+      if (coop) coopEvent(coop, 'decoder-heads', 'queue-work-done-start', { chunk: 'decoder-tail' });
       const waitStart = performance.now();
       device.queue.submit([decoderEncoder.finish()]);
       await device.queue.onSubmittedWorkDone();
-      stagedGpuPhaseTimings.decoderSubmitWaitMs = performance.now() - waitStart;
+      const tailWaitMs = performance.now() - waitStart;
+      stagedGpuPhaseTimings.decoderSubmitWaitMs = coopDecoderWaitMs + tailWaitMs;
       if (coop) {
-        coopEvent(coop, 'decoder-heads', 'queue-work-done-end', { waitMs: stagedGpuPhaseTimings.decoderSubmitWaitMs });
+        coopEvent(coop, 'decoder-heads', 'queue-work-done-end', { waitMs: tailWaitMs });
         await coopYield(coop, 'decoder-heads');
       }
     } else {
