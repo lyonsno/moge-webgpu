@@ -33,6 +33,11 @@ export function resolveCooperativeScheduler(requested) {
     mode: 'cooperative',
     yieldMs: Math.max(0, Number.isFinite(Number(requested.yieldMs)) ? Number(requested.yieldMs) : 4),
     vitBlockChunkSize: Math.max(1, Math.floor(Number(requested.vitBlockChunkSize) || 1)),
+    // Fine granularity: split inside vit blocks (attention/MLP segments) and
+    // inside decoder ConvStack levels (per res block), keeping each GPU
+    // submission near a frame budget for shared-device hosts.
+    splitVitBlocks: requested.splitVitBlocks === true,
+    splitDecoderResBlocks: requested.splitDecoderResBlocks === true,
     waitForSubmittedWorkDone: requested.waitForSubmittedWorkDone !== false,
     events: [],
   };

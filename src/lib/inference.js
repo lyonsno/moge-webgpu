@@ -495,7 +495,7 @@ function dispatchConvStack(device, encoder, inFeatures, weights, config) {
  * is created for the next level. Buffers persist across submits, so numerics
  * match the monolithic path exactly.
  */
-async function dispatchConvStackCooperative(device, encoder, inFeatures, weights, config, onLevelChunk) {
+async function dispatchConvStackCooperative(device, encoder, inFeatures, weights, config, onLevelChunk, { splitResBlocks = false } = {}) {
   const { dimIn, dimResBlocks, dimOut, numResBlocks, resamplers, resBlockInNorm, resBlockHiddenNorm } = config;
   const numLevels = dimResBlocks.length;
   const outFeatures = [];
@@ -523,6 +523,12 @@ async function dispatchConvStackCooperative(device, encoder, inFeatures, weights
         inC: dimResBlocks[i], outC: dimResBlocks[i], hiddenC: dimResBlocks[i],
         H, W, inNorm: resBlockInNorm, hiddenNorm: resBlockHiddenNorm,
       });
+      // Sub-level granularity: each res block is its own submit, so a single
+      // high-resolution level cannot occupy the queue for a whole frame.
+      if (splitResBlocks && j < numResBlocks[i] - 1) {
+        await onLevelChunk(encoder, { level: i, numLevels, H, W, part: `res-block-${j}` });
+        encoder = device.createCommandEncoder();
+      }
     }
 
     if (dimOut[i] != null) {
@@ -1105,10 +1111,13 @@ export class MoGeInference {
         const { featureBuf, clsTokenBuf } = await this.backbone.encodeChunked(
           imageBuf, this.weights, tokenH, tokenW, {
             chunkBlocks: coop.vitBlockChunkSize,
+            splitBlocks: coop.splitVitBlocks,
             onChunk: async (chunkEncoder, meta) => {
               coopEvent(coop, 'backbone', 'queue-work-done-start', meta.kind === 'vit-blocks'
                 ? { firstBlock: meta.firstBlock, lastBlock: meta.lastBlock }
-                : { chunk: meta.kind });
+                : (meta.kind === 'vit-block-segment'
+                  ? { chunk: `block-${meta.block}:${meta.segmentName}` }
+                  : { chunk: meta.kind }));
               const waitStart = performance.now();
               device.queue.submit([chunkEncoder.finish()]);
               if (coop.waitForSubmittedWorkDone) await device.queue.onSubmittedWorkDone();
@@ -1404,7 +1413,8 @@ export class MoGeInference {
     // 1s+ queue occupancy (the dominant foreground hitch in composition runs).
     let coopDecoderWaitMs = 0;
     const coopLevelHook = label => async (levelEncoder, meta) => {
-      coopEvent(coop, 'decoder-heads', 'queue-work-done-start', { chunk: `${label}:level-${meta.level}` });
+      const chunkLabel = `${label}:level-${meta.level}${meta.part ? `:${meta.part}` : ''}`;
+      coopEvent(coop, 'decoder-heads', 'queue-work-done-start', { chunk: chunkLabel });
       const waitStart = performance.now();
       device.queue.submit([levelEncoder.finish()]);
       if (coop.waitForSubmittedWorkDone) await device.queue.onSubmittedWorkDone();
@@ -1442,7 +1452,8 @@ export class MoGeInference {
       neckLevelTimings.totalNeckLevelMs = profiledNeck.levels.reduce((sum, level) => sum + level.submitWaitMs, 0);
     } else if (coop) {
       const r = await dispatchConvStackCooperative(
-        device, decoderEncoder, neckInputs, this.weights.neck, MODEL_CONFIG.neck, coopLevelHook('neck'));
+        device, decoderEncoder, neckInputs, this.weights.neck, MODEL_CONFIG.neck, coopLevelHook('neck'),
+        { splitResBlocks: coop.splitDecoderResBlocks });
       neckOutputs = r.outFeatures;
       decoderEncoder = r.encoder;
     } else {
@@ -1461,7 +1472,8 @@ export class MoGeInference {
     let pointsOutputs;
     if (coop) {
       const r = await dispatchConvStackCooperative(
-        device, decoderEncoder, pointsInputs, this.weights.pointsHead, MODEL_CONFIG.pointsHead, coopLevelHook('points-head'));
+        device, decoderEncoder, pointsInputs, this.weights.pointsHead, MODEL_CONFIG.pointsHead, coopLevelHook('points-head'),
+        { splitResBlocks: coop.splitDecoderResBlocks });
       pointsOutputs = r.outFeatures;
       decoderEncoder = r.encoder;
     } else {
@@ -1480,7 +1492,8 @@ export class MoGeInference {
     let normalOutputs;
     if (coop) {
       const r = await dispatchConvStackCooperative(
-        device, decoderEncoder, normalInputs, this.weights.normalHead, MODEL_CONFIG.normalHead, coopLevelHook('normal-head'));
+        device, decoderEncoder, normalInputs, this.weights.normalHead, MODEL_CONFIG.normalHead, coopLevelHook('normal-head'),
+        { splitResBlocks: coop.splitDecoderResBlocks });
       normalOutputs = r.outFeatures;
       decoderEncoder = r.encoder;
     } else {
@@ -1499,7 +1512,8 @@ export class MoGeInference {
     let maskOutputs;
     if (coop) {
       const r = await dispatchConvStackCooperative(
-        device, decoderEncoder, maskInputs, this.weights.maskHead, MODEL_CONFIG.maskHead, coopLevelHook('mask-head'));
+        device, decoderEncoder, maskInputs, this.weights.maskHead, MODEL_CONFIG.maskHead, coopLevelHook('mask-head'),
+        { splitResBlocks: coop.splitDecoderResBlocks });
       maskOutputs = r.outFeatures;
       decoderEncoder = r.encoder;
     } else {
