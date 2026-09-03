@@ -105,6 +105,7 @@ try {
       }
     }
 
+    window.__coopRouteResult = run.routeResult || null;
     const receipt = run.routeResult?.receipt || null;
     const schedulerReceipt = run.schedulerVerificationReceipt
       || run.routeResult?.schedulerVerificationReceipt
@@ -132,6 +133,22 @@ try {
     const pick = q => xs[Math.min(xs.length - 1, Math.floor(q * xs.length))];
     return xs.length ? { frames: xs.length, p50: pick(0.5), p95: pick(0.95), p99: pick(0.99), max: xs[xs.length - 1] } : null;
   });
+
+  // --emit-receipts <path>: write the full route result (receipt + scheduler
+  // verification) from this live cooperative run for downstream consumers
+  // (e.g. the Kaminos kiln volume-fire witness).
+  if (args.includes('--emit-receipts')) {
+    const receiptsPath = args[args.indexOf('--emit-receipts') + 1];
+    const routeResult = await page.evaluate(() => window.__coopRouteResult || null);
+    if (receiptsPath && routeResult) {
+      const { writeFileSync, mkdirSync } = await import('fs');
+      mkdirSync(path.dirname(path.resolve(receiptsPath)), { recursive: true });
+      writeFileSync(receiptsPath, JSON.stringify(routeResult, null, 2));
+      console.log(`receipts written: ${receiptsPath}`);
+    } else if (receiptsPath) {
+      console.log('receipts NOT written: route result unavailable');
+    }
+  }
 
   console.log(JSON.stringify({ ...result, frameStats }, null, 2));
 
