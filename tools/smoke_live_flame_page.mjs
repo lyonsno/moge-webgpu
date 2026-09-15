@@ -67,7 +67,7 @@ try {
       if (r > 90 && r > 1.35 * b) warmCount++;
     }
     return { warmCount, litCount };
-  }, shotB.toString('base64'));
+  }, Buffer.from(shotB).toString('base64'));
   if (!(warm.warmCount > 50)) {
     failures.push(`no flame color on screen: warm=${warm.warmCount} lit=${warm.litCount} (smoke-only regression?)`);
   }
