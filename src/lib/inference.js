@@ -1210,7 +1210,9 @@ export class MoGeInference {
               await coopPace();
               const waitMs = performance.now() - waitStart;
               backboneWaitMs += waitMs;
-              coopEvent(coop, 'backbone', 'queue-work-done-end', { waitMs });
+              coopEvent(coop, 'backbone', 'queue-work-done-end', { waitMs,
+                chunk: meta.kind === 'vit-block-segment' ? `block-${meta.block}:${meta.segmentName}`
+                  : (meta.kind === 'vit-blocks' ? `blocks-${meta.firstBlock}-${meta.lastBlock}` : meta.kind) });
               await coopYield(coop, 'backbone');
             },
           }
@@ -1507,7 +1509,7 @@ export class MoGeInference {
       await coopPace();
       const waitMs = performance.now() - waitStart;
       coopDecoderWaitMs += waitMs;
-      coopEvent(coop, 'decoder-heads', 'queue-work-done-end', { waitMs });
+      coopEvent(coop, 'decoder-heads', 'queue-work-done-end', { waitMs, chunk: chunkLabel });
       await coopYield(coop, 'decoder-heads');
     };
     let neckOutputs;
