@@ -4,8 +4,8 @@
 set -uo pipefail
 OUT="${1:?output dir required}"
 mkdir -p "$OUT"
-KAMINOS_ROOT="/private/tmp/kaminos-moge-live-flame-compose"
-PORT=8093
+KAMINOS_ROOT="/private/tmp/kaminos-moge-live-flame-restore-0915"
+PORT=8095
 python3 "$KAMINOS_ROOT/serve.py" $PORT > "$OUT/serve.log" 2>&1 &
 SERVE_PID=$!
 READY=0

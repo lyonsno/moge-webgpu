@@ -48,6 +48,30 @@ try {
   const fireAnimating = Buffer.compare(shotA, shotB) !== 0;
   if (!fireAnimating) failures.push('fire canvas is not animating (identical frames 1s apart)');
 
+  // Fire-color witness: an animating grey smoke plume is not a flame.
+  // Sample the captured screenshot (a WebGPU canvas read via drawImage
+  // returns transparent black, so sampling must go through the screenshot).
+  const warm = await page.evaluate(async b64 => {
+    const img = new Image();
+    img.src = `data:image/png;base64,${b64}`;
+    await img.decode();
+    const c = document.createElement('canvas');
+    c.width = 256; c.height = 256;
+    const ctx = c.getContext('2d');
+    ctx.drawImage(img, 0, 0, 256, 256);
+    const d = ctx.getImageData(0, 0, 256, 256).data;
+    let warmCount = 0, litCount = 0;
+    for (let i = 0; i < d.length; i += 16) {
+      const r = d[i], g = d[i + 1], b = d[i + 2];
+      if (r + g + b > 60) litCount++;
+      if (r > 90 && r > 1.35 * b) warmCount++;
+    }
+    return { warmCount, litCount };
+  }, shotB.toString('base64'));
+  if (!(warm.warmCount > 50)) {
+    failures.push(`no flame color on screen: warm=${warm.warmCount} lit=${warm.litCount} (smoke-only regression?)`);
+  }
+
   const fireStatus = await page.evaluate(() => document.getElementById('hud-fire').textContent);
   if (/error/i.test(fireStatus)) failures.push(`fire status: ${fireStatus}`);
 
