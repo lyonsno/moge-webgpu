@@ -67,15 +67,38 @@ function mockAdapter({ timestamp = true } = {}) {
   const ours = buildMogeDeviceRequest(adapter);
   assert.deepEqual(ours.requiredFeatures, []);
   assert.equal(ours.timestampQuery, 'unavailable');
-  // Note: the kit validator requires a non-empty features array, so the mock
-  // device carries a non-timestamp feature; the semantics under test here are
-  // timestamp degradation, not the (kit-owned) empty-features edge.
   const identity = borrowedDeviceBackendIdentity({
-    adapter, device: { features: new Set(['shader-f16']), limits: LIMITS }, browser: 'test-agent',
+    adapter, device: { features: new Set(), limits: LIMITS }, browser: 'test-agent',
   });
   const verdict = validateWebGpuBackendIdentity(identity);
   assert.ok(verdict.ok, `no-timestamp identity must validate: ${JSON.stringify(verdict.errors)}`);
   assert.equal(identity.timestampQuery, 'unavailable');
 }
+
+// Adapter support does not establish what a borrowed device enabled.
+{
+  const identity = borrowedDeviceBackendIdentity({
+    adapter: mockAdapter(), device: { features: new Set(), limits: LIMITS },
+  });
+  assert.deepEqual(identity.features, []);
+  assert.deepEqual(identity.requestedFeatures, []);
+  assert.equal(identity.timestampQuery, 'disabled');
+  assert.ok(validateWebGpuBackendIdentity(identity).ok);
+}
+{
+  const identity = borrowedDeviceBackendIdentity({
+    adapter: mockAdapter(), device: { features: new Set(['timestamp-query']), limits: LIMITS },
+  });
+  assert.deepEqual(identity.requestedFeatures, [], 'host request provenance must not be invented');
+  assert.equal(identity.timestampQuery, 'available');
+  assert.ok(validateWebGpuBackendIdentity(identity).ok);
+}
+assert.throws(() => borrowedDeviceBackendIdentity({ adapter: mockAdapter(), device: { limits: LIMITS } }),
+  /device.*features/i);
+assert.throws(() => borrowedDeviceBackendIdentity({ adapter: mockAdapter(), device: { features: new Set() } }),
+  /device.*limits/i);
+assert.throws(() => borrowedDeviceBackendIdentity({
+  adapter: mockAdapter(), device: { features: new Set(), limits: LIMITS }, requestedFeatures: ['timestamp-query'],
+}), /requested.*enabled/i);
 
 console.log('kit gpu-environment adoption contracts: PASS');

@@ -50,15 +50,27 @@ export function buildMogeDeviceRequest(adapter, options = {}) {
  * with a renderer) and MoGe must still report a kit-valid identity.
  */
 export function borrowedDeviceBackendIdentity({ adapter, device, browser, requestedFeatures } = {}) {
-  const requested = requestedFeatures
-    ?? (adapter?.features?.has?.('timestamp-query') ? ['timestamp-query'] : []);
+  if (!device?.features || typeof device.features[Symbol.iterator] !== 'function') {
+    throw new TypeError('Borrowed device features must be observed from the device');
+  }
+  if (!device?.limits) throw new TypeError('Borrowed device limits must be observed from the device');
+  const effective = Array.from(device.features);
+  const requested = requestedFeatures ?? [];
+  if (!Array.isArray(requested) || [...requested, ...effective].some(f => typeof f !== 'string')) {
+    throw new TypeError('Device features and requested features must contain feature names');
+  }
+  if (requested.some(f => !effective.includes(f))) {
+    throw new Error('Requested borrowed-device features were not enabled on the device');
+  }
   return createWebGpuBackendIdentity({
     adapterName: adapterName(adapter),
     browser: browser ?? globalThis.navigator?.userAgent ?? null,
     requestedFeatures: requested,
-    effectiveFeatures: device?.features || requested,
-    limits: device?.limits || adapter?.limits || {},
-    timestampQuery: requested.includes('timestamp-query') ? 'requested' : 'unavailable',
+    effectiveFeatures: effective,
+    limits: device.limits,
+    timestampQuery: effective.includes('timestamp-query')
+      ? (requested.includes('timestamp-query') ? 'requested' : 'available')
+      : (adapter?.features?.has?.('timestamp-query') ? 'disabled' : 'unavailable'),
   });
 }
 

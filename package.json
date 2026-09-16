@@ -29,7 +29,7 @@
     "test:buffer-pool-unit": "node tools/test_buffer_pool_unit.mjs"
   },
   "devDependencies": {
-    "@kaminos/webgpu-inference-kit": "^0.1.48",
+    "@kaminos/webgpu-inference-kit": "^0.1.49",
     "puppeteer-core": "^25.1.0",
     "vite": "^6.0.0"
   }
