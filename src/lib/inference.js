@@ -940,6 +940,44 @@ export class MoGeInference {
     }
   }
 
+  /**
+   * Warm-up inference: one discarded cooperative run on a synthetic image so
+   * the operator's first visible run is steady state — pipelines already
+   * dispatched once, bind groups created, and the buffer pool populated (the
+   * pool only helps from the second run otherwise). Cooperative chunking keeps
+   * the host responsive during warm-up. Returns the warm-up run's timings.
+   */
+  async warmUp({ imageData = null, scheduler = null } = {}) {
+    if (!this.useRealWeights) return null;
+    let img = imageData;
+    if (!img) {
+      const size = 518;
+      const data = new Uint8ClampedArray(size * size * 4);
+      for (let y = 0; y < size; y++) {
+        for (let x = 0; x < size; x++) {
+          const i = (y * size + x) * 4;
+          data[i] = (x * 255 / size) | 0;
+          data[i + 1] = (y * 255 / size) | 0;
+          data[i + 2] = ((x + y) * 127 / size) | 0;
+          data[i + 3] = 255;
+        }
+      }
+      img = typeof ImageData !== 'undefined' ? new ImageData(data, size, size) : { data, width: size, height: size };
+    }
+    const t0 = performance.now();
+    const result = await this.run(img, {
+      scheduler: scheduler || {
+        mode: 'cooperative', yieldMs: 0, vitBlockChunkSize: 1,
+        splitVitBlocks: true, splitDecoderResBlocks: true,
+        pacing: 'bounded-prefix', maxInFlightChunks: 2,
+      },
+      warmUp: true,
+    });
+    const warmUpMs = performance.now() - t0;
+    console.log(`Warm-up inference done in ${warmUpMs.toFixed(0)}ms (results discarded)`);
+    return { warmUpMs, chunks: result.schedulerVerificationReceipt?.boundaryAssertions?.length ?? null };
+  }
+
   _createStubWeights() {
     const d = this.device;
     const rand = (n) => {
