@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
+import { createMogeSchedulerVerificationReceipt } from '../src/lib/scheduler_receipt.js';
 
 // Executes the real probe with deterministic page observations. This isolates
 // evidence handling; it is not a browser/GPU conformance witness.
@@ -22,12 +23,15 @@ const events = [
   { kind:'queue-work-done-end', tMs:10, phase:'backbone', chunk:'a', boundary:1 },
   { kind:'chunk-retired', tMs:80, phase:'backbone', chunk:'a', boundary:2 },
 ];
-const input = { frameTimes:[0,10,80,90,100], baselineStart:0,inferStart:10,inferEnd:90,
+let input = { frameTimes:[0,10,80,90,100], baselineStart:0,inferStart:10,inferEnd:90,
   eventTrace:{schema:'kaminos.webgpu-scheduler-event-trace.v0', clock:'performance.now',
     timingAuthority:'queue-submit-wait', eventProvenance:'observed', events},
   schedStatus:'verified', terminalStatus:'done',
   runId:'fixture-run', sourceIdentity:{status:'verified'}, routeResult:{
-    schema:'kaminos.webgpu-route-result.v0', receipt:{
+    schema:'kaminos.webgpu-route-result.v0', routeId:'moge.depth-normal.webgpu-local.v0',
+    status:'partial',requestId:'fixture-request',
+    request:{schema:'kaminos.webgpu-route-request.v0',routeId:'moge.depth-normal.webgpu-local.v0',
+      backendKind:'webgpu-local',requestId:'fixture-request'}, receipt:{
       schema:'kaminos.webgpu-route-receipt.v0', status:'partial', fallbackReason:null,
       requestedRouteId:'moge.depth-normal.webgpu-local.v0',
       effectiveRouteId:'moge.depth-normal.webgpu-local.v0',
@@ -37,7 +41,20 @@ const input = { frameTimes:[0,10,80,90,100], baselineStart:0,inferStart:10,infer
     }} };
 // These fields mirror the retained live 7ae9b66cad8d receipt, not output
 // authority. This fixture tests policy; replay of that raw run is conformance.
-const trace = events => ({...input.eventTrace, events});
+function withEvents(events) {
+  const data=structuredClone(input);
+  const phaseChunkSize=Object.fromEntries(events.map(e=>[e.phase,1]));
+  const verification=createMogeSchedulerVerificationReceipt({
+    routeRequest:data.routeResult.request,backpressure:{},
+    scheduler:{requestedScheduler:{phaseChunkSize},effectiveScheduler:{phaseChunkSize}},
+    observedEvents:events.map(e=>({...e,boundary:`moge-stage:${e.phase}`,provenance:'observed'})),
+  });
+  data.routeResult.receipt.runtime={schedulerVerification:verification};
+  data.eventTrace=verification.eventTrace;
+  data.schedStatus=verification.status;
+  return data;
+}
+input=withEvents(events);
 let failures = 0;
 function run(name, data, env = {}) {
   const out = path.join(root, name);
@@ -57,11 +74,18 @@ check('raw timing inputs remain replayable and retirement wins over a zero wait'
   assert.equal(report.spans.filter(s=>s.kind==='gpu-occupancy').length,1);
   assert.equal(report.spans.filter(s=>s.kind==='queue-work-done').length,0);
 });
+check('new observations need only the nested scheduler receipt',()=>{
+  const data=structuredClone(input); delete data.eventTrace; delete data.schedStatus;
+  const {result,report}=run('single-source',data);
+  assert.equal(result.status,0,result.stderr);
+  assert.equal(report.summary.schedStatus,'verified');
+});
 check('missing retirement cannot claim occupancy evidence', () => {
-  const {result,report}=run('missing',{...input,eventTrace:trace(events.slice(0,2))});
+  const data=withEvents(events.slice(0,2));
+  const {result,report}=run('missing',data);
   assert.notEqual(result.status,0);
   assert.equal(report.evidence.occupancyStatus,'incomplete');
-  assert.deepEqual(report.raw.eventTrace.events,events.slice(0,2));
+  assert.deepEqual(report.raw.eventTrace.events,data.eventTrace.events);
 });
 check('error terminal cannot be admitted as completed inference', () => {
   const {result,report}=run('error',{...input,terminalStatus:'error: failed'});
@@ -83,7 +107,7 @@ check('unsplit block range has its runtime retirement identity', () => {
   const blockEvents=events.map(e=>({...e,chunk:'blocks-0-1'}));
   delete blockEvents[0].chunk;
   Object.assign(blockEvents[0],{firstBlock:0,lastBlock:1});
-  const {result,report}=run('block-range',{...input,eventTrace:trace(blockEvents)});
+  const {result,report}=run('block-range',withEvents(blockEvents));
   assert.equal(result.status,0,result.stderr);
   assert.equal(report.evidence.retirements,1);
 });
@@ -92,7 +116,7 @@ check('direct neck and decoder tail fences need no redundant retirement event', 
     {kind:'queue-work-done-start',chunk,phase:'decoder-heads',boundary:i,tMs:10+i*30},
     {kind:'queue-work-done-end',phase:'decoder-heads',boundary:i,tMs:30+i*30},
   ]);
-  const {result,report}=run('direct-fences',{...input,eventTrace:trace(direct)});
+  const {result,report}=run('direct-fences',withEvents(direct));
   assert.equal(result.status,0,result.stderr);
   assert.equal(report.evidence.retirements,2);
 });
@@ -105,7 +129,26 @@ for (const [name, alter] of [
   ['stale-trace', d=>d.eventTrace.events[0].tMs=1],
 ]) check(`${name} cannot become timing evidence`,()=>{
   const data=structuredClone(input); alter(data);
-  data.routeResult.receipt.status='real';
+  data.routeResult.status=data.routeResult.receipt.status='real';
+  assert.notEqual(run(name,data).result.status,0);
+});
+for (const [name,alter] of [
+  ['envelope-route',d=>d.routeResult.routeId='wrong.route'],
+  ['request-route',d=>d.routeResult.request.routeId='wrong.route'],
+  ['request-schema',d=>d.routeResult.request.schema='wrong'],
+  ['request-backend',d=>d.routeResult.request.backendKind='cpu'],
+  ['stale-request',d=>d.routeResult.request.requestId='stale'],
+  ['scheduler-route',d=>d.routeResult.receipt.runtime.schedulerVerification.route.effectiveRouteId='wrong.route'],
+  ['scheduler-request',d=>d.routeResult.receipt.runtime.schedulerVerification.route.requestId='stale'],
+  ['envelope-fallback',d=>d.routeResult.status='fallback'],
+  ['scheduler-invalid',d=>d.routeResult.receipt.runtime.schedulerVerification.status='invalid'],
+  ['scheduler-missing',d=>delete d.routeResult.receipt.runtime.schedulerVerification],
+  ['scheduler-schema',d=>d.routeResult.receipt.runtime.schedulerVerification.schema='wrong'],
+  ['scheduler-classification',d=>d.routeResult.receipt.runtime.schedulerVerification.classification='config-only'],
+  ['event-synthesized',d=>d.routeResult.receipt.runtime.schedulerVerification.eventTrace.events.forEach(e=>e.provenance='synthesized')],
+  ['detached-trace',d=>d.eventTrace={...d.eventTrace,events:[]}],
+]) check(`${name} cannot contradict timing identity`,()=>{
+  const data=structuredClone(input); alter(data);
   assert.notEqual(run(name,data).result.status,0);
 });
 console.log('Evidence artifacts:',root);

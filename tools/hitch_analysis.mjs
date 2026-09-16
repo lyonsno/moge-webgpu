@@ -1,12 +1,26 @@
 // Pure replay over hitch-report.raw. Temporal overlap is not a causal claim.
-import { validateWebGpuBackendIdentity } from '@kaminos/webgpu-inference-kit';
-import { MOGE_DEPTH_NORMAL_ROUTE_ID, MOGE_ROUTE_RESULT_SCHEMA, MOGE_ROUTE_RECEIPT_SCHEMA } from '../src/lib/route_boundary.js';
+import { isDeepStrictEqual } from 'node:util';
+import { validateWebGpuBackendIdentity, validateSchedulerVerificationReceipt } from '@kaminos/webgpu-inference-kit';
+import { MOGE_DEPTH_NORMAL_ROUTE_ID, MOGE_ROUTE_RESULT_SCHEMA, MOGE_ROUTE_RECEIPT_SCHEMA, MOGE_ROUTE_REQUEST_SCHEMA } from '../src/lib/route_boundary.js';
 export function analyzeHitches(data, hitchMs = 50) {
   const errors = [];
-  const events = data.eventTrace?.events ?? [], frameTimes = data.frameTimes ?? [];
+  const result = data.routeResult, receipt = result?.receipt, request = result?.request;
+  const verification = receipt?.runtime?.schedulerVerification;
+  const trace = verification?.eventTrace, events = trace?.events ?? [], frameTimes = data.frameTimes ?? [];
   if (!/^done\b/i.test(data.terminalStatus ?? '') || data.observationError) errors.push('Inference did not complete');
-  if (data.schedStatus !== 'verified' || !data.routeResult) errors.push('Current scheduler receipt is not verified');
-  const result = data.routeResult, receipt = result?.receipt, trace = data.eventTrace;
+  errors.push(...validateSchedulerVerificationReceipt(verification ?? {}).errors.map(e=>`scheduler.${e}`));
+  if (verification?.status !== 'verified' || verification?.classification !== 'observed-boundary') errors.push('Current scheduler receipt is not verified observed timing');
+  // Old recordings copied these fields; new recordings have one source only.
+  if ((data.schedStatus !== undefined && data.schedStatus !== verification?.status)
+      || (data.eventTrace !== undefined && !isDeepStrictEqual(data.eventTrace, trace))) errors.push('Detached scheduler capture contradicts nested receipt');
+  if (request?.schema !== MOGE_ROUTE_REQUEST_SCHEMA || request?.backendKind !== 'webgpu-local'
+      || [result?.routeId, request?.routeId, verification?.route?.requestedRouteId,
+        verification?.route?.effectiveRouteId].some(id=>id !== MOGE_DEPTH_NORMAL_ROUTE_ID)
+      || verification?.route?.backendClass !== 'browser-webgpu') errors.push('Conflicting request/result/scheduler route identity');
+  if (typeof result?.requestId !== 'string' || !result.requestId.trim()
+      || result.requestId !== request?.requestId || result.requestId !== verification?.route?.requestId
+      || (receipt?.requestId != null && receipt.requestId !== result.requestId)) errors.push('Conflicting or missing inference request identity');
+  if (result?.status !== receipt?.status) errors.push('Conflicting result/receipt status');
   // Timing does not require content-addressed model/input/output artifacts.
   // It does require observed execution on the requested, non-fallback route.
   if (result?.schema !== MOGE_ROUTE_RESULT_SCHEMA || receipt?.schema !== MOGE_ROUTE_RECEIPT_SCHEMA
@@ -27,6 +41,7 @@ export function analyzeHitches(data, hitchMs = 50) {
   for (const rawEvent of events) {
     const e = { ...rawEvent, chunk: rawEvent.chunk ?? (Number.isInteger(rawEvent.firstBlock)
       && Number.isInteger(rawEvent.lastBlock) ? `blocks-${rawEvent.firstBlock}-${rawEvent.lastBlock}` : undefined) };
+    if (e.provenance !== 'observed') errors.push('Scheduler event is not observed');
     if (!Number.isFinite(e.tMs) || e.tMs < previous || e.tMs < data.inferStart || e.tMs > data.inferEnd) errors.push('Invalid or stale scheduler event clock');
     previous = e.tMs;
     // Explicit CPU row-yield markers in inference.js, not GPU submissions.
@@ -82,7 +97,7 @@ export function analyzeHitches(data, hitchMs = 50) {
     outputValidation: result?.validation ?? null,
     evidence: { occupancyStatus: occupancyComplete ? 'complete' : 'incomplete', submits,
       retirements: retired.size, unmatchedSubmits: [...submitted.keys()], errors },
-    summary: { schedStatus: data.schedStatus, inferenceMs: data.inferEnd - data.inferStart,
+    summary: { schedStatus: verification?.status, inferenceMs: data.inferEnd - data.inferStart,
       baselineMs: data.inferStart - data.baselineStart, totalFrames: frameTimes.length,
       hitchThresholdMs: hitchMs, baselineHitches, inferenceHitches,
       baselineHitchesPerSecond: baselineHitches * 1000 / (data.inferStart - data.baselineStart),

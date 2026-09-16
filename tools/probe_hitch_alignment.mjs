@@ -69,9 +69,8 @@ try {
       raw.inferEnd = performance.now();
       raw.terminalStatus = hud.textContent;
       raw.routeResult = window.__mogeDebug?.webGpuRouteResult ?? null;
-      const verification = raw.routeResult?.receipt?.runtime?.schedulerVerification;
-      raw.eventTrace = verification?.eventTrace ?? null;
-      raw.schedStatus = verification?.status ?? null;
+      // The nested scheduler receipt owns its status and trace; no duplicate
+      // fields that can drift into contradictory evidence.
       await new Promise(resolve => setTimeout(resolve, 1500));
     } catch (error) { raw.observationError = String(error); }
     finally { cancelAnimationFrame(rafId); }
