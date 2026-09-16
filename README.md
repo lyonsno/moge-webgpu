@@ -4,7 +4,7 @@ Single-image depth and surface normal estimation running entirely in the browser
 
 **[Live demo →](https://lyonsno.github.io/moge-webgpu/)** — drop in an image and get depth, normals, and a 3D pointcloud. Heads up: the first load streams ~660MB of model weights (cached by your browser afterward).
 
-A complete port of [MoGe-2](https://github.com/microsoft/MoGe) (ViT-Large + ConvStack decoder) from PyTorch to WebGPU. No server, no WASM, no ONNX runtime — pure GPU compute shaders dispatched from JavaScript.
+A complete port of [MoGe-2](https://github.com/microsoft/MoGe) (ViT-Large + ConvStack decoder) from PyTorch to WebGPU. No server, no WASM, no ONNX runtime — pure GPU compute shaders dispatched from JavaScript, running on the [Kaminos WebGPU Inference Kit](https://github.com/lyonsno/kaminos/tree/main/webgpu-inference-kit) ([`@kaminos/webgpu-inference-kit`](https://www.npmjs.com/package/@kaminos/webgpu-inference-kit)) for cooperative scheduling, route receipts, and runtime telemetry.
 
 ## What it does
 
@@ -30,6 +30,35 @@ MoGe-2-ViT-Large-Normal (`Ruicheng/moge-2-vitl-normal`):
 - **Scale head**: MLP (CLS token -> metric scale)
 
 15 compute shaders: patch embedding, layer norm, multi-head self-attention (QKV projection, score computation, softmax, apply), linear projection, GELU MLP, layer scale, conv2d (replicate padding), conv1x1, conv_transpose2d, bilinear upsample, pixel shuffle, group norm, activations (ReLU/add/sigmoid).
+
+## Cooperative scheduling
+
+Long inference and a live page don't have to fight. Built on the
+[Kaminos WebGPU Inference Kit](https://github.com/lyonsno/kaminos/tree/main/webgpu-inference-kit)'s
+cooperative scheduling contract, the route can run in chunked GPU submissions
+with browser yields between them, so the page keeps rendering while the model
+works:
+
+```js
+await inference.run(imageData, {
+  scheduler: { mode: 'cooperative', yieldMs: 4, vitBlockChunkSize: 1 },
+});
+```
+
+- The DINOv2 backbone submits per transformer-block chunk; decoder and
+  readback get their own submit/yield seams. Chunked submits are
+  **bit-identical** to the monolithic run — same dispatch stream, persistent
+  buffers.
+- Measured on M4 Max/Chrome: the page rendered 170–218 frames at **16.8ms p95
+  frame intervals (60fps held)** during a full cooperative inference.
+- The run emits a kit-schema **scheduler verification receipt**: cooperative
+  behavior is claimed only from genuinely observed submit/yield events, never
+  from configuration or synthesized timing traces
+  (`npm run test:cooperative-route`, plus pure-Node authority tests in
+  `npm run test:scheduler-receipt-unit`).
+
+This is what lets MoGe share one GPU (and one `GPUDevice`) with a live
+renderer or simulation — the kit's core product target.
 
 ## Quick start
 
