@@ -90,6 +90,15 @@ try:
                 '--out', str(out), '--run-id', run_id, '--source-manifest', str(manifest)],
                 cwd=tools.parent, stdout=log, stderr=subprocess.STDOUT)
             report['probe'] = probe.wait()
+        report['phase'] = 'source-recheck'; save()
+        after = {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in identity['files']}
+        changed = [name for name, digest in after.items() if digest != identity['files'][name]]
+        report['sourceCheck'] = {'scope': 'listed-host-and-composition-files',
+            'before': identity['files'], 'after': after, 'changedFiles': changed,
+            'status': 'changed' if changed else 'unchanged'}
+        if changed:
+            raise RuntimeError(f'Served source changed during observation: {changed}')
+        report['phase'] = 'probe-result'
         evidence = json.loads((out / 'hitch-report.json').read_text())
         if report['probe'] or evidence.get('runId') != run_id or evidence.get('status') != 'complete':
             raise RuntimeError('Probe failed or did not return current complete evidence; see hitch-report.json')

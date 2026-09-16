@@ -1,6 +1,7 @@
 import {
   WEBGPU_INFERENCE_KIT_VERSION,
   createMogeDepthNormalRouteDefinition,
+  validateWebGpuBackendIdentity,
   validateWebGpuRouteBackpressureProfile,
   validateWebGpuRouteSchedulerProfile,
 } from '@kaminos/webgpu-inference-kit';
@@ -141,12 +142,7 @@ function validateRouteReceipt(errors, receipt) {
   if (receipt.effectiveRouteId !== MOGE_DEPTH_NORMAL_ROUTE_ID) errors.push(`receipt.effectiveRouteId must be ${MOGE_DEPTH_NORMAL_ROUTE_ID}`);
   if (receipt.status !== 'real') errors.push(`receipt.status must be real for authoritative result, got ${receipt.status}`);
   if (receipt.fallbackReason) errors.push(`receipt.fallbackReason must be empty for authoritative result, got ${receipt.fallbackReason}`);
-  if (receipt.backend?.kind !== 'webgpu-local') errors.push('receipt.backend.kind must be webgpu-local');
-  if (receipt.backend?.runtime !== 'browser') errors.push('receipt.backend.runtime must be browser');
-  requireString(errors, receipt.backend?.adapterName, 'receipt.backend.adapterName');
-  if (!Array.isArray(receipt.backend?.features) || receipt.backend.features.length === 0) {
-    errors.push('receipt.backend.features must be a non-empty array');
-  }
+  errors.push(...validateWebGpuBackendIdentity(receipt.backend).errors.map(e => `receipt.backend.${e}`));
   requireString(errors, receipt.model?.id, 'receipt.model.id');
   requireString(errors, receipt.model?.revision, 'receipt.model.revision');
   requireString(errors, receipt.model?.weightsHash, 'receipt.model.weightsHash');

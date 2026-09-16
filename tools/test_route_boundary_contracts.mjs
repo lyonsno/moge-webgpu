@@ -115,6 +115,17 @@ const result = createMogeRouteWorkerResult({ request, receipt });
 assert.equal(result.schema, 'kaminos.webgpu-route-result.v0');
 assert.equal(result.authoritative, true);
 assert.equal(validateMogeRouteWorkerResult(result).ok, true);
+const noOptionalFeatures = structuredClone(result);
+Object.assign(noOptionalFeatures.receipt.backend, {
+  features: [], requestedFeatures: [], timestampQuery: 'unavailable',
+});
+assert.equal(validateMogeRouteWorkerResult(noOptionalFeatures).ok, true,
+  'A browser GPUDevice need not enable optional features');
+for (const features of [null, 'timestamp-query']) {
+  const malformed = structuredClone(noOptionalFeatures);
+  malformed.receipt.backend.features = features;
+  assert.equal(validateMogeRouteWorkerResult(malformed).ok, false);
+}
 assert.match(
   validateMogeRouteWorkerResult({
     ...result,

@@ -1,10 +1,23 @@
 // Pure replay over hitch-report.raw. Temporal overlap is not a causal claim.
+import { validateWebGpuBackendIdentity } from '@kaminos/webgpu-inference-kit';
+import { MOGE_DEPTH_NORMAL_ROUTE_ID, MOGE_ROUTE_RESULT_SCHEMA, MOGE_ROUTE_RECEIPT_SCHEMA } from '../src/lib/route_boundary.js';
 export function analyzeHitches(data, hitchMs = 50) {
   const errors = [];
   const events = data.eventTrace?.events ?? [], frameTimes = data.frameTimes ?? [];
   if (!/^done\b/i.test(data.terminalStatus ?? '') || data.observationError) errors.push('Inference did not complete');
   if (data.schedStatus !== 'verified' || !data.routeResult) errors.push('Current scheduler receipt is not verified');
-  if (data.routeResult?.receipt?.status !== 'real') errors.push('Route did not produce real inference output');
+  const result = data.routeResult, receipt = result?.receipt, trace = data.eventTrace;
+  // Timing does not require content-addressed model/input/output artifacts.
+  // It does require observed execution on the requested, non-fallback route.
+  if (result?.schema !== MOGE_ROUTE_RESULT_SCHEMA || receipt?.schema !== MOGE_ROUTE_RECEIPT_SCHEMA
+      || receipt?.requestedRouteId !== MOGE_DEPTH_NORMAL_ROUTE_ID
+      || receipt?.effectiveRouteId !== MOGE_DEPTH_NORMAL_ROUTE_ID) errors.push('Wrong or missing MoGe route identity');
+  if (!['real', 'partial'].includes(receipt?.status) || receipt?.fallbackReason
+      || receipt?.runtimeEvidence?.weights !== 'real'
+      || receipt?.runtimeEvidence?.encoderFeatures !== 'backbone-gpu') errors.push('Route does not attest actual non-fallback GPU inference');
+  errors.push(...validateWebGpuBackendIdentity(receipt?.backend).errors.map(e => `backend.${e}`));
+  if (trace?.schema !== 'kaminos.webgpu-scheduler-event-trace.v0' || trace?.clock !== 'performance.now'
+      || trace?.timingAuthority !== 'queue-submit-wait' || trace?.eventProvenance !== 'observed') errors.push('Scheduler trace is not observed queue timing');
   const times = [data.baselineStart, data.inferStart, data.inferEnd];
   if (!times.every(Number.isFinite) || !(times[0] < times[1] && times[1] < times[2])) errors.push('Invalid observation windows');
   if (frameTimes.length < 2 || frameTimes.some((t, i) => !Number.isFinite(t) || (i && t <= frameTimes[i - 1]))) errors.push('Missing or nonmonotonic frames');
@@ -40,6 +53,15 @@ export function analyzeHitches(data, hitchMs = 50) {
       if (!start) errors.push('Unmatched span end');
       else {
         open.delete(key);
+        // These two production stages unconditionally await the queue fence
+        // (inference.js). A bounded-prefix chunk's wait-end does NOT retire it.
+        if (base === 'queue-work-done' && start.phase === 'decoder-heads'
+            && ['neck-input', 'decoder-tail'].includes(start.chunk) && submitted.has(start.chunk)) {
+          spans.push({ kind: 'gpu-occupancy', semantics: 'submit-to-fence-including-queue-delay',
+            phase: start.phase, chunk: start.chunk, t0: start.tMs, t1: e.tMs,
+            waitMs: e.tMs - start.tMs, completion: 'direct-queue-fence' });
+          submitted.delete(start.chunk); retired.add(start.chunk);
+        }
         waits.push({ kind: cpuMarker ? 'cpu-yield-marker' : base, phase: start.phase,
           chunk: start.chunk, t0: start.tMs, t1: e.tMs, waitMs: e.waitMs ?? e.yieldMs ?? e.tMs - start.tMs });
       }
@@ -56,7 +78,8 @@ export function analyzeHitches(data, hitchMs = 50) {
   }));
   const baselineHitches = gaps.filter(g => g.at >= data.baselineStart && g.at + g.gapMs <= data.inferStart).length;
   const inferenceHitches = attributed.filter(g => g.duringInference).length;
-  return { spans, attributed,
+  return { spans, attributed, claim: 'observed-GPU-timing-only',
+    outputValidation: result?.validation ?? null,
     evidence: { occupancyStatus: occupancyComplete ? 'complete' : 'incomplete', submits,
       retirements: retired.size, unmatchedSubmits: [...submitted.keys()], errors },
     summary: { schedStatus: data.schedStatus, inferenceMs: data.inferEnd - data.inferStart,

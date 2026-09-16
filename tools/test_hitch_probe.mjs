@@ -23,8 +23,21 @@ const events = [
   { kind:'chunk-retired', tMs:80, phase:'backbone', chunk:'a', boundary:2 },
 ];
 const input = { frameTimes:[0,10,80,90,100], baselineStart:0,inferStart:10,inferEnd:90,
-  eventTrace:{events}, schedStatus:'verified', terminalStatus:'done',
-  runId:'fixture-run', sourceIdentity:{status:'verified'}, routeResult:{receipt:{status:'real'}} };
+  eventTrace:{schema:'kaminos.webgpu-scheduler-event-trace.v0', clock:'performance.now',
+    timingAuthority:'queue-submit-wait', eventProvenance:'observed', events},
+  schedStatus:'verified', terminalStatus:'done',
+  runId:'fixture-run', sourceIdentity:{status:'verified'}, routeResult:{
+    schema:'kaminos.webgpu-route-result.v0', receipt:{
+      schema:'kaminos.webgpu-route-receipt.v0', status:'partial', fallbackReason:null,
+      requestedRouteId:'moge.depth-normal.webgpu-local.v0',
+      effectiveRouteId:'moge.depth-normal.webgpu-local.v0',
+      backend:{kind:'webgpu-local',runtime:'browser',adapterName:'fixture',features:[],
+        requestedFeatures:[],limits:{maxBufferSize:1024},timestampQuery:'unavailable'},
+      runtimeEvidence:{weights:'real',encoderFeatures:'backbone-gpu'},
+    }} };
+// These fields mirror the retained live 7ae9b66cad8d receipt, not output
+// authority. This fixture tests policy; replay of that raw run is conformance.
+const trace = events => ({...input.eventTrace, events});
 let failures = 0;
 function run(name, data, env = {}) {
   const out = path.join(root, name);
@@ -45,7 +58,7 @@ check('raw timing inputs remain replayable and retirement wins over a zero wait'
   assert.equal(report.spans.filter(s=>s.kind==='queue-work-done').length,0);
 });
 check('missing retirement cannot claim occupancy evidence', () => {
-  const {result,report}=run('missing',{...input,eventTrace:{events:events.slice(0,2)}});
+  const {result,report}=run('missing',{...input,eventTrace:trace(events.slice(0,2))});
   assert.notEqual(result.status,0);
   assert.equal(report.evidence.occupancyStatus,'incomplete');
   assert.deepEqual(report.raw.eventTrace.events,events.slice(0,2));
@@ -70,9 +83,30 @@ check('unsplit block range has its runtime retirement identity', () => {
   const blockEvents=events.map(e=>({...e,chunk:'blocks-0-1'}));
   delete blockEvents[0].chunk;
   Object.assign(blockEvents[0],{firstBlock:0,lastBlock:1});
-  const {result,report}=run('block-range',{...input,eventTrace:{events:blockEvents}});
+  const {result,report}=run('block-range',{...input,eventTrace:trace(blockEvents)});
   assert.equal(result.status,0,result.stderr);
   assert.equal(report.evidence.retirements,1);
+});
+check('direct neck and decoder tail fences need no redundant retirement event', () => {
+  const direct = ['neck-input','decoder-tail'].flatMap((chunk,i)=>[
+    {kind:'queue-work-done-start',chunk,phase:'decoder-heads',boundary:i,tMs:10+i*30},
+    {kind:'queue-work-done-end',phase:'decoder-heads',boundary:i,tMs:30+i*30},
+  ]);
+  const {result,report}=run('direct-fences',{...input,eventTrace:trace(direct)});
+  assert.equal(result.status,0,result.stderr);
+  assert.equal(report.evidence.retirements,2);
+});
+for (const [name, alter] of [
+  ['wrong-route', d=>d.routeResult.receipt.effectiveRouteId='other.route'],
+  ['wrong-backend', d=>d.routeResult.receipt.backend.kind='cpu'],
+  ['synthetic-weights', d=>d.routeResult.receipt.runtimeEvidence.weights='synthetic'],
+  ['fallback-reason', d=>d.routeResult.receipt.fallbackReason='adapter unavailable'],
+  ['projected-trace', d=>d.eventTrace.eventProvenance='projected'],
+  ['stale-trace', d=>d.eventTrace.events[0].tMs=1],
+]) check(`${name} cannot become timing evidence`,()=>{
+  const data=structuredClone(input); alter(data);
+  data.routeResult.receipt.status='real';
+  assert.notEqual(run(name,data).result.status,0);
 });
 console.log('Evidence artifacts:',root);
 process.exitCode=failures?1:0;
