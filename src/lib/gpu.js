@@ -111,6 +111,70 @@ export function createEmptyBuffer(device, size, usage = 0) {
 }
 
 /**
+ * Per-device GPU buffer pool. Model runs allocate dozens of large transient
+ * buffers (decoder conv outputs at 296^2/592^2); allocating them fresh every
+ * run leaks memory and stalls the queue on allocation. The pool hands out
+ * exact-size+usage buffers, never issues an in-use buffer twice, and returns
+ * everything to its free lists at releaseAll() (end of a run) without
+ * destroying — steady state is zero allocations per run. Reuse is safe for
+ * outputs that are fully written by their producing dispatch, which is every
+ * pooled site here.
+ */
+export function createBufferPool(device) {
+  const free = new Map();   // key -> [buffer]
+  const inUse = new Set();
+  const keyOf = (size, usage) => `${size}|${usage}`;
+  return {
+    acquire(size, usage) {
+      const key = keyOf(size, usage);
+      const list = free.get(key);
+      let buffer = list && list.length ? list.pop() : null;
+      if (!buffer) buffer = device.createBuffer({ size, usage, mappedAtCreation: false });
+      inUse.add(buffer);
+      buffer.__poolKey = key;
+      return buffer;
+    },
+    releaseAll() {
+      for (const buffer of inUse) {
+        const list = free.get(buffer.__poolKey) || [];
+        list.push(buffer);
+        free.set(buffer.__poolKey, list);
+      }
+      inUse.clear();
+    },
+    destroyAll() {
+      for (const list of free.values()) for (const buffer of list) buffer.destroy();
+      for (const buffer of inUse) buffer.destroy();
+      free.clear();
+      inUse.clear();
+    },
+    stats() {
+      let freeCount = 0;
+      for (const list of free.values()) freeCount += list.length;
+      return { inUse: inUse.size, free: freeCount };
+    },
+  };
+}
+
+const bufferPools = new WeakMap();
+export function bufferPoolFor(device) {
+  let pool = bufferPools.get(device);
+  if (!pool) { pool = createBufferPool(device); bufferPools.set(device, pool); }
+  return pool;
+}
+
+/** Pooled equivalent of createEmptyBuffer for run-transient outputs. */
+export function acquirePooledBuffer(device, size, usage = 0) {
+  return bufferPoolFor(device).acquire(
+    size, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST | usage);
+}
+
+/** Return all run-transient pooled buffers to the pool (call after readback). */
+export function releaseRunBuffers(device) {
+  bufferPoolFor(device).releaseAll();
+}
+
+/**
  * Read back buffer contents to CPU.
  */
 export async function readBuffer(device, buffer, size) {

@@ -25,7 +25,8 @@
     "test:depth-parity": "node tools/test_depth_parity.mjs",
     "test:cooperative-route": "node tools/test_cooperative_route.mjs",
     "test:scheduler-receipt-unit": "node tools/test_scheduler_receipt_unit.mjs",
-    "build:lib": "vite build --config vite.lib.config.js"
+    "build:lib": "vite build --config vite.lib.config.js",
+    "test:buffer-pool-unit": "node tools/test_buffer_pool_unit.mjs"
   },
   "devDependencies": {
     "@kaminos/webgpu-inference-kit": "^0.1.48",

@@ -27,7 +27,7 @@
  *   Post-processing: exp remap, focal recovery, force projection, mask
  */
 
-import { createStorageBuffer, createEmptyBuffer, readBuffer } from './gpu.js';
+import { createStorageBuffer, createEmptyBuffer, readBuffer, releaseRunBuffers } from './gpu.js';
 import {
   dispatchConv2d,
   dispatchReluConv2d,
@@ -37,6 +37,7 @@ import {
   dispatchGroupNorm,
   dispatchPixelShuffle,
   dispatchUpsample,
+  warmUpPipelines,
 } from './shader_ops.js';
 import { loadWeights } from './weights.js';
 import {
@@ -925,6 +926,11 @@ export class MoGeInference {
       this.backbone.init();
       console.log('DINOv2 backbone initialized');
 
+      // Precompile decoder/utility pipelines so the first run does not pay
+      // synchronous Metal pipeline compilation mid-inference.
+      const warmed = await warmUpPipelines(this.device);
+      console.log(`Warmed ${warmed.length} compute pipelines`);
+
       // Expose for console debugging
       window.__mogeInference = this;
     } catch (e) {
@@ -1781,8 +1787,11 @@ export class MoGeInference {
       }
     }
 
-    // Clean up
+    // Clean up: unpooled per-run uploads are destroyed; all pooled transient
+    // outputs (decoder levels, backbone projections) return to the pool for
+    // reuse on the next run.
     neckInputs.forEach(f => f.buffer.destroy());
+    releaseRunBuffers(device);
 
     phaseTimings.postprocessMs = performance.now() - postprocessStart;
     phaseTimings.totalMs = performance.now() - totalStart;

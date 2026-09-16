@@ -12,7 +12,7 @@
  * Produces: [1024, tokenH, tokenW] feature map + [1024] CLS token
  */
 
-import { createStorageBuffer, createEmptyBuffer, readBuffer } from './gpu.js';
+import { createStorageBuffer, createEmptyBuffer, readBuffer, acquirePooledBuffer } from './gpu.js';
 
 import patchEmbedWGSL from '../shaders/patch_embed_dinov2.wgsl?raw';
 import layerNormWGSL from '../shaders/layernorm_vit.wgsl?raw';
@@ -240,7 +240,7 @@ export class DINOv2Backbone {
         this._encodeLayerScaleResidual(encoder, ffnOutBuf, ctx.currentTokens, ffnResidualOut, weights, `encoder.backbone.blocks.${l}.ls2`, T, D);
         ctx.currentTokens = ffnResidualOut;
         if (VIT_CONFIG.intermediateLayers.includes(l)) {
-          const snapBuf = createEmptyBuffer(device, T * 4, GPUBufferUsage.COPY_DST);
+          const snapBuf = acquirePooledBuffer(device, T * 4);
           encoder.copyBufferToBuffer(ctx.currentTokens, 0, snapBuf, 0, T * 4);
           ctx.intermediateFeatures.push({ buffer: snapBuf, layerIdx: l });
         }
@@ -336,7 +336,7 @@ export class DINOv2Backbone {
 
     // --- Project and sum intermediate features ---
     // Each intermediate feature gets a 1x1 conv projection, then all are summed
-    const featureBuf = createEmptyBuffer(device, D * numPatches * 4);
+    const featureBuf = acquirePooledBuffer(device, D * numPatches * 4);
     let sumBuf = null;
     let normedClsBuf = null; // Will hold the normed CLS token from the last layer
 
@@ -351,7 +351,7 @@ export class DINOv2Backbone {
       //   5. 1x1 conv projection → [D, tokenH, tokenW]
       //
       // Step 0: Apply backbone final norm to snapshot
-      const normedBuf = createEmptyBuffer(device, T * 4);
+      const normedBuf = acquirePooledBuffer(device, T * 4);
       this._encodeLayerNorm(encoder, snapBuf, normedBuf, weights, 'encoder.backbone.norm', N);
 
       // Capture normed CLS token from last intermediate layer (for scale head)
@@ -360,11 +360,11 @@ export class DINOv2Backbone {
       }
 
       // Step 1: Linear projection on [numPatches, D] → [numPatches, D] (skip CLS via offset)
-      const projBuf = createEmptyBuffer(device, D * numPatches * 4);
+      const projBuf = acquirePooledBuffer(device, D * numPatches * 4);
       this._encodeOutputProjection(encoder, normedBuf, projBuf, weights, i, N, numPatches);
 
       // Step 2: Transpose [numPatches, D] → [D, numPatches] (= [D, tokenH, tokenW] in CHW)
-      const transposedBuf = createEmptyBuffer(device, D * numPatches * 4);
+      const transposedBuf = acquirePooledBuffer(device, D * numPatches * 4);
       this._encodeTranspose(encoder, projBuf, transposedBuf, numPatches, D);
 
       if (sumBuf === null) {

@@ -15,7 +15,7 @@ import groupnormWGSL from '../shaders/groupnorm.wgsl?raw';
 import pixelshuffleWGSL from '../shaders/pixelshuffle.wgsl?raw';
 import upsampleWGSL from '../shaders/upsample.wgsl?raw';
 
-import { createStorageBuffer, createEmptyBuffer } from './gpu.js';
+import { createStorageBuffer, createEmptyBuffer, acquirePooledBuffer } from './gpu.js';
 
 const pipelineCaches = new WeakMap();
 const uniformCaches = new WeakMap();
@@ -89,6 +89,37 @@ function getOrCreatePipeline(device, key, code, entryPoint) {
   return pipeline;
 }
 
+
+// Every lazily-compiled pipeline key; warmUpPipelines() precompiles them off
+// the first-run critical path (first dispatch otherwise pays synchronous
+// Metal pipeline compilation on the main thread — a multi-hundred-ms stall).
+const PIPELINE_TABLE = [
+  ['activation', () => activationsWGSL, 'activation_main'],
+  ['conv_transpose2d_stride2', () => convTranspose2dStride2WGSL, 'conv_transpose2d_stride2_main'],
+  ['conv_transpose2d', () => convTranspose2dWGSL, 'conv_transpose2d_main'],
+  ['conv1x1', () => conv1x1WGSL, 'conv1x1_main'],
+  ['conv2d', () => conv2dWGSL, 'conv2d_main'],
+  ['gn_norm', () => groupnormWGSL, 'groupnorm_normalize'],
+  ['gn_stats', () => groupnormWGSL, 'groupnorm_stats'],
+  ['pixelshuffle', () => pixelshuffleWGSL, 'pixelshuffle_main'],
+  ['relu_conv2d', () => reluConv2dWGSL, 'relu_conv2d_main'],
+  ['upsample', () => upsampleWGSL, 'upsample_main'],
+];
+
+export async function warmUpPipelines(device) {
+  const pipelineCache = cacheFor(device, pipelineCaches);
+  const pending = [];
+  for (const [key, code, entryPoint] of PIPELINE_TABLE) {
+    if (pipelineCache.has(key)) continue;
+    const module = device.createShaderModule({ code: code() });
+    const create = typeof device.createComputePipelineAsync === 'function'
+      ? device.createComputePipelineAsync({ layout: 'auto', compute: { module, entryPoint } })
+      : Promise.resolve(device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint } }));
+    pending.push(create.then(pipeline => { pipelineCache.set(key, pipeline); return key; }));
+  }
+  return Promise.all(pending);
+}
+
 function ceil(a, b) { return Math.ceil(a / b); }
 
 /**
@@ -107,7 +138,7 @@ export function dispatchConv2d(device, encoder, inputBuf, weightBuf, biasBuf, pa
   const uniformBuf = cachedUniform(device, uniformData);
 
   const dummyBias = biasBuf || getDummyBias(device);
-  const outputBuf = createEmptyBuffer(device, outC * outH * outW * 4);
+  const outputBuf = acquirePooledBuffer(device, outC * outH * outW * 4);
 
   const bindGroup = device.createBindGroup({
     layout: pipeline.getBindGroupLayout(0),
@@ -145,7 +176,7 @@ export function dispatchReluConv2d(device, encoder, inputBuf, weightBuf, biasBuf
   const uniformBuf = cachedUniform(device, uniformData);
 
   const dummyBias = biasBuf || getDummyBias(device);
-  const outputBuf = createEmptyBuffer(device, outC * outH * outW * 4);
+  const outputBuf = acquirePooledBuffer(device, outC * outH * outW * 4);
 
   const bindGroup = device.createBindGroup({
     layout: pipeline.getBindGroupLayout(0),
@@ -182,7 +213,7 @@ export function dispatchConv1x1(device, encoder, inputBuf, weightBuf, biasBuf, p
   const uniformBuf = cachedUniform(device, uniformData);
 
   const dummyBias = biasBuf || getDummyBias(device);
-  const outputBuf = createEmptyBuffer(device, outC * H * W * 4);
+  const outputBuf = acquirePooledBuffer(device, outC * H * W * 4);
 
   const bindGroup = device.createBindGroup({
     layout: pipeline.getBindGroupLayout(0),
@@ -217,7 +248,7 @@ export function dispatchActivation(device, encoder, inputA, inputB, count, op) {
   const uniformBuf = cachedUniform(device, uniformData);
 
   const dummyB = inputB || getDummyBias(device);
-  const outputBuf = createEmptyBuffer(device, count * 4);
+  const outputBuf = acquirePooledBuffer(device, count * 4);
 
   const bindGroup = device.createBindGroup({
     layout: pipeline.getBindGroupLayout(0),
@@ -259,8 +290,8 @@ export function dispatchGroupNorm(device, encoder, inputBuf, scaleBuf, biasBuf, 
 
   const uniformBuf = cachedUniform(device, new Uint8Array(uniformArr));
 
-  const statsBuf = createEmptyBuffer(device, numGroups * 2 * 4);
-  const outputBuf = createEmptyBuffer(device, C * H * W * 4);
+  const statsBuf = acquirePooledBuffer(device, numGroups * 2 * 4);
+  const outputBuf = acquirePooledBuffer(device, C * H * W * 4);
 
   // Pass 1: compute stats
   const statsBindGroup = device.createBindGroup({
@@ -319,7 +350,7 @@ export function dispatchPixelShuffle(device, encoder, inputBuf, params) {
   const uniformData = new Uint32Array([inC, inH, inW, outC, scaleFactor, wgX]);
   const uniformBuf = cachedUniform(device, uniformData);
 
-  const outputBuf = createEmptyBuffer(device, outC * outH * outW * 4);
+  const outputBuf = acquirePooledBuffer(device, outC * outH * outW * 4);
 
   const bindGroup = device.createBindGroup({
     layout: pipeline.getBindGroupLayout(0),
@@ -352,7 +383,7 @@ export function dispatchUpsample(device, encoder, inputBuf, params) {
   const uniformData = new Uint32Array([C, inH, inW, outH, outW, mode, wgX]);
   const uniformBuf = cachedUniform(device, uniformData);
 
-  const outputBuf = createEmptyBuffer(device, C * outH * outW * 4);
+  const outputBuf = acquirePooledBuffer(device, C * outH * outW * 4);
 
   const bindGroup = device.createBindGroup({
     layout: pipeline.getBindGroupLayout(0),
@@ -383,7 +414,7 @@ export function dispatchConvTranspose2d(device, encoder, inputBuf, weightBuf, bi
   const outW = inW * stride;
   const hasBias = biasBuf ? 1 : 0;
   const dummyBias = biasBuf || getDummyBias(device);
-  const outputBuf = createEmptyBuffer(device, outC * outH * outW * 4);
+  const outputBuf = acquirePooledBuffer(device, outC * outH * outW * 4);
 
   if (stride === 2) {
     const pipeline = getOrCreatePipeline(device, 'conv_transpose2d_stride2', convTranspose2dStride2WGSL, 'conv_transpose2d_stride2_main');
