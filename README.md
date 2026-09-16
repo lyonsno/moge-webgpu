@@ -60,6 +60,62 @@ await inference.run(imageData, {
 This is what lets MoGe share one GPU (and one `GPUDevice`) with a live
 renderer or simulation — the kit's core product target.
 
+### Scheduler options
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `mode` | — | `'cooperative'` enables chunked submits; omit for a single monolithic submit |
+| `vitBlockChunkSize` | `1` | transformer blocks per backbone submit |
+| `splitVitBlocks` | `false` | split each block into six attention/MLP segments, one submit each |
+| `splitDecoderResBlocks` | `false` | split decoder ConvStack levels per residual conv, plus output-conv and resampler tails |
+| `pacing` | `'strict-drain'` | `'bounded-prefix'` keeps up to `maxInFlightChunks` submits in flight and awaits only the oldest fence (GPU stays saturated; queued-ahead work stays bounded) |
+| `maxInFlightChunks` | `2` | bounded-prefix depth |
+| `yieldMs` | `4` | browser yield between chunks (`0` is a bare macrotask yield) |
+
+Finest granularity (`splitVitBlocks` + `splitDecoderResBlocks`) puts ~230
+submissions in a run, the fattest being a single 3×3 conv at 296². Under
+`strict-drain` that many waits stretch wall time badly; `bounded-prefix`
+restores monolithic-class total time at the same granularity (measured 52.7s
+→ 2.47s in the harness at identical chunking). In cooperative mode the CPU
+preprocess and postprocess loops are also row-banded with yields.
+
+Every chunk records submit, wait, yield and fence-retire events on a
+`performance.now` clock in the scheduler receipt, labeled by chunk (e.g.
+`block-7:attn-scores`, `neck:level-3:res-block-0:conv2`), so foreground hitches
+can be attributed to the exact submission (`tools/probe_hitch_alignment.mjs`
+aligns rAF frame gaps with submit→retire occupancy spans).
+
+## Embedding in a host application
+
+`npm run build:lib` produces `dist-lib/moge-inference.js`: a single
+self-contained ES module (WGSL inlined, no bundler needed on the host) that
+runs inference on a device the host owns:
+
+```js
+import { MoGeInference, initGPU, borrowedDeviceBackendIdentity } from './moge-inference.js';
+
+// Either let MoGe acquire a device (kit shared helper) …
+const gpu = await initGPU();
+// … or hand it one you already share with your renderer:
+// const gpu = { device, adapter, backendIdentity: borrowedDeviceBackendIdentity({ adapter, device }) };
+
+const inference = new MoGeInference(gpu);
+await inference.init(progress => {});  // weights stream from HuggingFace if no local copy
+await inference.warmUp();               // optional: one discarded cooperative run so the
+                                        // first visible run is steady state (pipelines
+                                        // dispatched, bind groups built, buffer pool filled)
+const result = await inference.run(imageData, {
+  scheduler: { mode: 'cooperative', splitVitBlocks: true, splitDecoderResBlocks: true, pacing: 'bounded-prefix' },
+});
+```
+
+Device acquisition and backend identity come from the kit's shared
+gpu-environment helpers (`requestBrowserWebGpuDevice`,
+`createWebGpuBackendIdentity`; kit `^0.1.48`). Run-transient GPU buffers are
+pooled per device and reused across runs (steady state allocates nothing).
+The first consumer is Kaminos' live-flame composition pages, which run MoGe
+beside the pyro volume simulation.
+
 ## Quick start
 
 ```bash
@@ -101,9 +157,17 @@ End-to-end depth output is compared against the PyTorch reference implementation
 ## Tools
 
 - `tools/convert_weights.py` — Convert HuggingFace PyTorch checkpoint to WebGPU binary format
-- `tools/dump_layer_outputs.py` — Dump PyTorch reference tensors for validation
+- `tools/dump_layer_outputs.py` — Dump PyTorch reference tensors for validation (defaults to the shipped checkpoint)
 - `tools/compare_backbone.mjs` — Puppeteer-based automated backbone comparison harness
-- `tools/visual_smoke.mjs` — Automated visual smoke test
+- `tools/test_depth_parity.mjs` — End-to-end depth parity vs PyTorch (`npm run test:depth-parity`)
+- `tools/test_cooperative_route.mjs` — Cooperative run under a rAF monitor: verified receipt, observed yields, bit-identical depth vs monolithic (`npm run test:cooperative-route`)
+- `tools/probe_hitch_alignment.mjs` — Attributes foreground frame gaps to the scheduler occupancy span they overlap
+- `tools/test_scheduler_receipt_unit.mjs`, `tools/test_kit_gpu_environment_unit.mjs`, `tools/test_buffer_pool_unit.mjs` — pure-Node contract tests (no GPU)
+- `tools/visual_smoke.mjs`, `tools/smoke_live_flame_page.mjs` — Automated visual smoke tests (the latter for the Kaminos composition page, with a fire-colour witness)
+
+Measurement note: headless-Chrome harness frame timings are compositor-quantized
+and only relative evidence; on-device HUD telemetry in the composition page is
+the measurement of record for smoothness.
 
 ## License
 
