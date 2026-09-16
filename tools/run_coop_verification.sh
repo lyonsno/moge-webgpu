@@ -11,13 +11,13 @@ node tools/test_scheduler_receipt_unit.mjs > "$OUT/unit.log" 2>&1
 UNIT=$?
 
 # --strictPort: if 5186 is busy, fail rather than silently serving elsewhere.
-npx vite --port $PORT --strictPort > "$OUT/vite.log" 2>&1 &
+npx vite --port $PORT --strictPort --host 127.0.0.1 > "$OUT/vite.log" 2>&1 &
 VITE_PID=$!
 # Readiness probe — a dead or unbound server must fail loud with a named phase,
 # not let the harnesses run against nothing.
 READY=0
 for _ in $(seq 1 30); do
-  if curl -sf "http://localhost:$PORT/" > /dev/null; then READY=1; break; fi
+  if curl -sf "http://127.0.0.1:$PORT/" > /dev/null; then READY=1; break; fi
   sleep 1
 done
 if [ "$READY" -ne 1 ]; then

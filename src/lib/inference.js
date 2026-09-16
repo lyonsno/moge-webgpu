@@ -1733,7 +1733,13 @@ export class MoGeInference {
     const depth = new Float32Array(outH * outW);
     const colors = new Float32Array(3 * outH * outW);
 
-    for (let i = 0; i < outH * outW; i++) {
+    // Cooperative mode: the CPU postprocess loops run on the main thread and
+    // would otherwise stall the host's frame; slice them by row bands with
+    // browser yields between bands (events under the output-readback phase).
+    const postRows = coop ? 48 : outH;
+    for (let row0 = 0; row0 < outH; row0 += postRows) {
+    const iEnd = Math.min(outH, row0 + postRows) * outW;
+    for (let i = row0 * outW; i < iEnd; i++) {
       let px = pointsRaw[0 * outH * outW + i];
       let py = pointsRaw[1 * outH * outW + i];
       let pz = pointsRaw[2 * outH * outW + i];
@@ -1759,11 +1765,19 @@ export class MoGeInference {
       colors[i * 3 + 1] = imageData.data[srcIdx * 4 + 1] / 255;
       colors[i * 3 + 2] = imageData.data[srcIdx * 4 + 2] / 255;
     }
+    if (coop && row0 + postRows < outH) {
+      coopEvent(coop, 'output-readback', 'queue-work-done-start', { chunk: `postprocess:points:rows-${row0}` });
+      coopEvent(coop, 'output-readback', 'queue-work-done-end', { waitMs: 0, chunk: `postprocess:points:rows-${row0}` });
+      await coopYield(coop, 'output-readback');
+    }
+    }
 
     // Normals from normal_head (moge-2-vitl-normal model)
     // normalsRaw is CHW planar [3, outH, outW], needs L2 normalization per pixel
     const normals = new Float32Array(3 * outH * outW);
-    for (let i = 0; i < outH * outW; i++) {
+    for (let row0 = 0; row0 < outH; row0 += postRows) {
+    const iEnd = Math.min(outH, row0 + postRows) * outW;
+    for (let i = row0 * outW; i < iEnd; i++) {
       let nx = normalsRaw[0 * outH * outW + i];
       let ny = normalsRaw[1 * outH * outW + i];
       let nz = normalsRaw[2 * outH * outW + i];
@@ -1771,6 +1785,8 @@ export class MoGeInference {
       normals[i * 3 + 0] = nx / len;
       normals[i * 3 + 1] = ny / len;
       normals[i * 3 + 2] = nz / len;
+    }
+    if (coop && row0 + postRows < outH) await coopYield(coop, 'output-readback');
     }
 
     // Apply metric scale
