@@ -1156,10 +1156,23 @@ export class MoGeInference {
     tmpCtx.drawImage(origCanvas, 0, 0, imgW, imgH);
     const resizedData = tmpCtx.getImageData(0, 0, imgW, imgH);
 
-    for (let c = 0; c < 3; c++) {
-      for (let i = 0; i < imgH * imgW; i++) {
-        const pixel = resizedData.data[i * 4 + c] / 255.0;
-        normalizedImage[c * imgH * imgW + i] = (pixel - imageMean[c]) / imageStd[c];
+    // Cooperative mode: the ~800k-iteration normalization loop is main-thread
+    // work before the first submit (the probe-attributed no-scheduler-span gap
+    // at the very start of a run); band it by rows with yields between bands.
+    const coopPre = resolveCooperativeScheduler(options.scheduler);
+    const preRows = coopPre ? 64 : imgH;
+    for (let row0 = 0; row0 < imgH; row0 += preRows) {
+      const iEnd = Math.min(imgH, row0 + preRows) * imgW;
+      for (let c = 0; c < 3; c++) {
+        for (let i = row0 * imgW; i < iEnd; i++) {
+          const pixel = resizedData.data[i * 4 + c] / 255.0;
+          normalizedImage[c * imgH * imgW + i] = (pixel - imageMean[c]) / imageStd[c];
+        }
+      }
+      if (coopPre && row0 + preRows < imgH) {
+        coopEvent(coopPre, 'backbone', 'queue-work-done-start', { chunk: `preprocess:rows-${row0}` });
+        coopEvent(coopPre, 'backbone', 'queue-work-done-end', { waitMs: 0, chunk: `preprocess:rows-${row0}` });
+        await coopYield(coopPre, 'backbone');
       }
     }
     phaseTimings.preprocessMs = performance.now() - preprocessStart;
@@ -1168,7 +1181,7 @@ export class MoGeInference {
     let backboneClsTokenBuf = null;
     let imageBuf = null;
     const tempUploadBuffers = [];
-    const coop = resolveCooperativeScheduler(options.scheduler);
+    const coop = coopPre;
     const profileStagedGpu = !!options.profileStagedGpu;
     const stagedSubmits = profileStagedGpu || !!coop;
     const profileDecoderSubstages = !!options.profileDecoderSubstages;
