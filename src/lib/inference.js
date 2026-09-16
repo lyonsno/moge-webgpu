@@ -1195,13 +1195,20 @@ export class MoGeInference {
     // awaiting the fence captured maxInFlightChunks submits ago waits exactly
     // until that prefix (and everything before it) retires.
     const coopFences = [];
-    const coopPace = coop ? async () => {
+    // coopPace(phase, chunk): under bounded-prefix the wait span understates
+    // GPU occupancy (the first maxInFlight chunks never wait), so every fence
+    // also records a 'chunk-retired' event when it resolves — the probe builds
+    // true submit->retire spans from it. Fences resolve in submission order.
+    const coopPace = coop ? async (phase, chunk) => {
       if (coop.pacing === 'bounded-prefix') {
-        coopFences.push(device.queue.onSubmittedWorkDone());
+        const fence = device.queue.onSubmittedWorkDone();
+        fence.then(() => coopEvent(coop, phase, 'chunk-retired', { chunk }));
+        coopFences.push(fence);
         const excess = coopFences.length - coop.maxInFlightChunks;
         if (excess > 0) await coopFences.splice(0, excess)[0];
       } else if (coop.waitForSubmittedWorkDone) {
         await device.queue.onSubmittedWorkDone();
+        coopEvent(coop, phase, 'chunk-retired', { chunk });
       }
     } : null;
     const coopDrain = coop ? async () => {
@@ -1262,9 +1269,11 @@ export class MoGeInference {
                 : (meta.kind === 'vit-block-segment'
                   ? { chunk: `block-${meta.block}:${meta.segmentName}` }
                   : { chunk: meta.kind }));
+              const backboneChunkLabel = meta.kind === 'vit-block-segment' ? `block-${meta.block}:${meta.segmentName}`
+                : (meta.kind === 'vit-blocks' ? `blocks-${meta.firstBlock}-${meta.lastBlock}` : meta.kind);
               const waitStart = performance.now();
               device.queue.submit([chunkEncoder.finish()]);
-              await coopPace();
+              await coopPace('backbone', backboneChunkLabel);
               const waitMs = performance.now() - waitStart;
               backboneWaitMs += waitMs;
               coopEvent(coop, 'backbone', 'queue-work-done-end', { waitMs,
@@ -1563,7 +1572,7 @@ export class MoGeInference {
       coopEvent(coop, 'decoder-heads', 'queue-work-done-start', { chunk: chunkLabel });
       const waitStart = performance.now();
       device.queue.submit([levelEncoder.finish()]);
-      await coopPace();
+      await coopPace('decoder-heads', chunkLabel);
       const waitMs = performance.now() - waitStart;
       coopDecoderWaitMs += waitMs;
       coopEvent(coop, 'decoder-heads', 'queue-work-done-end', { waitMs, chunk: chunkLabel });

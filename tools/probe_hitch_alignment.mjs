@@ -62,15 +62,26 @@ try {
 
   // --- Offline alignment ---
   const events = data.eventTrace?.events || [];
-  // Build spans: consecutive (start,end) pairs of the same kind family.
+  // Build spans. GPU chunks: submit (queue-work-done-start) -> chunk-retired
+  // (fence resolution), the true occupancy under bounded-prefix pacing; fall
+  // back to the wait end when no retire event exists. Yields: start -> end.
   const spans = [];
   const open = new Map();
+  const submitted = new Map(); // chunk label -> submit event
   for (const e of events) {
+    if (e.kind === 'queue-work-done-start' && e.chunk) submitted.set(e.chunk, e);
+    if (e.kind === 'chunk-retired' && e.chunk && submitted.has(e.chunk)) {
+      const s = submitted.get(e.chunk); submitted.delete(e.chunk);
+      spans.push({ phase: e.phase, kind: 'gpu-occupancy', t0: s.tMs, t1: e.tMs,
+        waitMs: e.tMs - s.tMs, chunk: e.chunk, firstBlock: s.firstBlock, lastBlock: s.lastBlock });
+      continue;
+    }
     const base = String(e.kind).replace(/-(start|end)$/, '');
     const key = `${e.boundary}|${base}`;
     if (e.kind.endsWith('-start')) open.set(key, e);
     else if (e.kind.endsWith('-end') && open.has(key)) {
       const s = open.get(key); open.delete(key);
+      if (base === 'queue-work-done' && s.chunk && spans.some(x => x.chunk === s.chunk && x.kind === 'gpu-occupancy')) continue;
       spans.push({
         phase: e.phase, kind: base, t0: s.tMs, t1: e.tMs,
         waitMs: e.waitMs ?? e.yieldMs ?? (e.tMs - s.tMs),
@@ -101,7 +112,7 @@ try {
 
   // Aggregate: worst chunks by queue waitMs.
   const chunkWaits = spans
-    .filter(s => s.kind === 'queue-work-done' || s.kind === 'readback-wait')
+    .filter(s => s.kind === 'gpu-occupancy' || s.kind === 'queue-work-done' || s.kind === 'readback-wait')
     .sort((a, b) => b.waitMs - a.waitMs)
     .slice(0, 12)
     .map(s => ({ phase: s.phase, blocks: Number.isFinite(s.firstBlock) ? `${s.firstBlock}-${s.lastBlock}` : (s.chunk || s.kind), waitMs: Math.round(s.waitMs) }));
