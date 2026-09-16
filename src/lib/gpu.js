@@ -1,7 +1,17 @@
 /**
  * WebGPU initialization and device management.
+ *
+ * Device acquisition and backend identity delegate to the kit's shared
+ * gpu-environment helpers (adopted 2026-09-15); buffer utilities stay local.
  */
+import {
+  createWebGpuBackendIdentity,
+  createWebGpuDeviceRequest,
+  requestBrowserWebGpuDevice,
+} from '@kaminos/webgpu-inference-kit';
 
+// Kept for embedding hosts that merge inference limits into a shared-device
+// request; mirrors the kit's copied limit-key set.
 export const INFERENCE_LIMIT_KEYS = [
   'maxBufferSize',
   'maxStorageBufferBindingSize',
@@ -10,11 +20,6 @@ export const INFERENCE_LIMIT_KEYS = [
   'maxComputeWorkgroupSizeX',
   'maxComputeWorkgroupSizeY',
 ];
-
-function featureList(features) {
-  if (!features) return [];
-  return Array.from(features).map(String).sort();
-}
 
 export function inferenceLimits(limits) {
   const out = {};
@@ -25,10 +30,36 @@ export function inferenceLimits(limits) {
 }
 
 function adapterName(adapter) {
-  const info = adapter.info || {};
+  const info = adapter?.info || {};
   return info.description
     || [info.vendor, info.architecture, info.device].filter(Boolean).join(' ')
     || 'unknown-webgpu-adapter';
+}
+
+/**
+ * Device request via the kit's shared GPU-environment helper: identical
+ * limit-copying and timestamp-query preference semantics for every kit port.
+ */
+export function buildMogeDeviceRequest(adapter, options = {}) {
+  return createWebGpuDeviceRequest(adapter, options);
+}
+
+/**
+ * Backend identity for a HOST-OWNED (borrowed/shared) device — the embedding
+ * path, where the host application created the GPUDevice (possibly shared
+ * with a renderer) and MoGe must still report a kit-valid identity.
+ */
+export function borrowedDeviceBackendIdentity({ adapter, device, browser, requestedFeatures } = {}) {
+  const requested = requestedFeatures
+    ?? (adapter?.features?.has?.('timestamp-query') ? ['timestamp-query'] : []);
+  return createWebGpuBackendIdentity({
+    adapterName: adapterName(adapter),
+    browser: browser ?? globalThis.navigator?.userAgent ?? null,
+    requestedFeatures: requested,
+    effectiveFeatures: device?.features || requested,
+    limits: device?.limits || adapter?.limits || {},
+    timestampQuery: requested.includes('timestamp-query') ? 'requested' : 'unavailable',
+  });
 }
 
 export async function initGPU() {
@@ -36,23 +67,12 @@ export async function initGPU() {
     throw new Error('WebGPU is not supported in this browser. Try Chrome 113+ or Edge 113+.');
   }
 
-  const adapter = await navigator.gpu.requestAdapter({
-    powerPreference: 'high-performance',
-  });
-  if (!adapter) {
-    throw new Error('No WebGPU adapter found. Your GPU may not support WebGPU.');
-  }
-
-  const requiredFeatures = [];
-  if (adapter.features.has('timestamp-query')) {
-    requiredFeatures.push('timestamp-query');
-  }
-  const requiredLimits = inferenceLimits(adapter.limits);
-
-  // Request max limits for large model inference
-  const device = await adapter.requestDevice({
-    requiredFeatures,
-    requiredLimits,
+  // Owned-device acquisition through the kit's shared helper: adapter request,
+  // device request (limit copy + timestamp preference), and backend identity
+  // all come from @kaminos/webgpu-inference-kit gpu-environment.
+  const { adapter, device, backendIdentity } = await requestBrowserWebGpuDevice(navigator.gpu, {
+    adapterOptions: { powerPreference: 'high-performance' },
+    label: 'moge-webgpu-inference',
   });
 
   device.lost.then((info) => {
@@ -62,21 +82,7 @@ export async function initGPU() {
     }
   });
 
-  const deviceFeatures = featureList(device.features || adapter.features);
-  return {
-    adapter,
-    device,
-    backendIdentity: {
-      kind: 'webgpu-local',
-      runtime: 'browser',
-      adapterName: adapterName(adapter),
-      browser: navigator.userAgent || 'unknown-browser',
-      requestedFeatures: [...requiredFeatures],
-      features: deviceFeatures,
-      limits: requiredLimits,
-      timestampQuery: requiredFeatures.includes('timestamp-query') ? 'requested' : 'unavailable',
-    },
-  };
+  return { adapter, device, backendIdentity };
 }
 
 /**

@@ -8,7 +8,13 @@
  * vitBlockChunkSize, waitForSubmittedWorkDone }).
  */
 export { MoGeInference } from './inference.js';
-export { initGPU, inferenceLimits, INFERENCE_LIMIT_KEYS } from './gpu.js';
+export {
+  initGPU,
+  inferenceLimits,
+  INFERENCE_LIMIT_KEYS,
+  buildMogeDeviceRequest,
+  borrowedDeviceBackendIdentity,
+} from './gpu.js';
 export {
   resolveCooperativeScheduler,
   createMogeSchedulerVerificationReceipt,

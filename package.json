@@ -28,7 +28,7 @@
     "build:lib": "vite build --config vite.lib.config.js"
   },
   "devDependencies": {
-    "@kaminos/webgpu-inference-kit": "^0.1.4",
+    "@kaminos/webgpu-inference-kit": "^0.1.48",
     "puppeteer-core": "^25.1.0",
     "vite": "^6.0.0"
   }
