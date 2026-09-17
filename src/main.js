@@ -12,6 +12,7 @@ import { PointcloudRenderer } from './lib/pointcloud.js';
 let gpu = null;
 let inference = null;
 let pointcloudRenderer = null;
+let handlingImage = false;
 
 const dropZone = document.getElementById('drop-zone');
 const fileInput = document.getElementById('file-input');
@@ -48,6 +49,12 @@ fileInput.addEventListener('change', () => {
 });
 
 async function handleImage(file) {
+  if (handlingImage) {
+    errorEl.textContent = 'An image is already processing. Please wait before choosing another.';
+    errorEl.style.display = 'block';
+    return;
+  }
+  handlingImage = true;
   try {
     setStatus('Initializing WebGPU...');
     if (!gpu) {
@@ -125,6 +132,8 @@ async function handleImage(file) {
     if (debugEl) {
       debugEl.textContent = JSON.stringify({ error: e.message, stack: e.stack }, null, 2);
     }
+  } finally {
+    handlingImage = false;
   }
 }
 

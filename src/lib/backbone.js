@@ -13,6 +13,7 @@
  */
 
 import { createStorageBuffer, createEmptyBuffer, readBuffer, acquirePooledBuffer } from './gpu.js';
+import { retainResource, destroyResource } from './resource_scope.js';
 
 import patchEmbedWGSL from '../shaders/patch_embed_dinov2.wgsl?raw';
 import layerNormWGSL from '../shaders/layernorm_vit.wgsl?raw';
@@ -45,6 +46,7 @@ function makeUniform(device, data) {
   });
   new Uint8Array(buf.getMappedRange()).set(bytes);
   buf.unmap();
+  retainResource(device, buf);
   return buf;
 }
 
@@ -179,8 +181,9 @@ export class DINOv2Backbone {
 
     // Destroy old buffers if grid size changed
     if (this._workBufs) {
-      for (const buf of Object.values(this._workBufs)) buf.destroy();
+      for (const buf of Object.values(this._workBufs)) destroyResource(device, buf);
       this._bindGroupCache.clear();
+      this._workBufs = null;
     }
 
     this._workBufs = {
@@ -197,6 +200,7 @@ export class DINOv2Backbone {
       ffnOutBuf: createEmptyBuffer(device, T * 4),
       qkvWorkBuf: createEmptyBuffer(device, N * 3 * D * 4),
     };
+    for (const buf of Object.values(this._workBufs)) retainResource(device, buf);
     this._workTokenH = tokenH;
     this._workTokenW = tokenW;
   }

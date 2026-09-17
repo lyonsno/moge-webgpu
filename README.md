@@ -49,8 +49,9 @@ await inference.run(imageData, {
   readback get their own submit/yield seams. Chunked submits are
   **bit-identical** to the monolithic run — same dispatch stream, persistent
   buffers.
-- Measured on M4 Max/Chrome: the page rendered 170–218 frames at **16.8ms p95
-  frame intervals (60fps held)** during a full cooperative inference.
+- Cooperative submission keeps the page rendering during inference; it is
+  not a sustained-frame-rate guarantee. Live-flame composition on M4 Max
+  still shows perceptible periodic slowdown and remains under investigation.
 - The run emits a kit-schema **scheduler verification receipt**: cooperative
   behavior is claimed only from genuinely observed submit/yield events, never
   from configuration or synthesized timing traces
@@ -107,12 +108,22 @@ await inference.warmUp();               // optional: one discarded cooperative r
 const result = await inference.run(imageData, {
   scheduler: { mode: 'cooperative', splitVitBlocks: true, splitDecoderResBlocks: true, pacing: 'bounded-prefix' },
 });
+// When the host retires this instance (not after each inference):
+await inference.dispose(); // releases MoGe resources, never destroys gpu.device
 ```
 
 Device acquisition and backend identity come from the kit's shared
 gpu-environment helpers (`requestBrowserWebGpuDevice`,
-`createWebGpuBackendIdentity`; kit `^0.1.48`). Run-transient GPU buffers are
-pooled per device and reused across runs (steady state allocates nothing).
+`createWebGpuBackendIdentity`; kit `^0.1.49`). Repeated `init()` calls share
+one initialization. `run()` waits for an initialization already in progress;
+call `init()` first. Each instance allows one run at a time (including warm-up
+and debug comparisons); overlapping calls reject with an explicit busy error.
+Separate instances may borrow the same device, with independent pools and
+caches. Pooled intermediates are reused across runs; uploads and readbacks
+remain transient allocations. Success and failure both drain submitted work
+before recycling buffers. `dispose()` rejects new work, waits for accepted
+initialization/inference, and releases this instance's resources. The host
+retains ownership of the device and any renderer or other inference instance.
 The first consumer is Kaminos' live-flame composition pages, which run MoGe
 beside the pyro volume simulation.
 

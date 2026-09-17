@@ -9,6 +9,7 @@ import {
   createWebGpuDeviceRequest,
   requestBrowserWebGpuDevice,
 } from '@kaminos/webgpu-inference-kit';
+import { retainResource } from './resource_scope.js';
 
 // Kept for embedding hosts that merge inference limits into a shared-device
 // request; mirrors the kit's copied limit-key set.
@@ -123,12 +124,12 @@ export function createEmptyBuffer(device, size, usage = 0) {
 }
 
 /**
- * Per-device GPU buffer pool. Model runs allocate dozens of large transient
+ * GPU buffer pool (keyed by each model's scoped device). Runs use large transient
  * buffers (decoder conv outputs at 296^2/592^2); allocating them fresh every
  * run leaks memory and stalls the queue on allocation. The pool hands out
  * exact-size+usage buffers, never issues an in-use buffer twice, and returns
  * everything to its free lists at releaseAll() (end of a run) without
- * destroying — steady state is zero allocations per run. Reuse is safe for
+ * destroying — previously seen size/usage pairs can be reused. Reuse is safe for
  * outputs that are fully written by their producing dispatch, which is every
  * pooled site here.
  */
@@ -141,7 +142,7 @@ export function createBufferPool(device) {
       const key = keyOf(size, usage);
       const list = free.get(key);
       let buffer = list && list.length ? list.pop() : null;
-      if (!buffer) buffer = device.createBuffer({ size, usage, mappedAtCreation: false });
+      if (!buffer) buffer = retainResource(device, device.createBuffer({ size, usage, mappedAtCreation: false }));
       inUse.add(buffer);
       buffer.__poolKey = key;
       return buffer;

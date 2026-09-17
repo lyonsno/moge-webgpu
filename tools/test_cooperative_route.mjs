@@ -111,7 +111,31 @@ try {
       || run.routeResult?.schedulerVerificationReceipt
       || receipt?.schedulerVerification
       || null;
+
+    // Actual WebGPU conformance for the lifecycle repair: native method
+    // receivers, real resource handles, cross-instance pool isolation, and
+    // host-buffer readback after retiring an inference instance. This is not
+    // another model-quality or foreground-smoothness claim.
+    const model = window.__mogeInference;
+    const device = model.device;
+    const { bufferPoolFor, readBuffer } = await import('/src/lib/gpu.js');
+    const other = new model.constructor({ device });
+    const ownPool = bufferPoolFor(model._device);
+    const otherPool = bufferPoolFor(other._device);
+    const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
+    const owned = ownPool.acquire(16, usage);
+    const survivor = otherPool.acquire(16, usage);
+    device.queue.writeBuffer(survivor, 0, new Float32Array([1, 2, 3, 4]));
+    ownPool.releaseAll();
+    const otherStillInUse = otherPool.stats().inUse === 1 && otherPool.stats().free === 0;
+    if (!otherStillInUse || owned === survivor) throw new Error('shared-device pools alias or release another owner');
+    await model.dispose();
+    const survivingValues = Array.from(await readBuffer(device, survivor, 16));
+    if (survivingValues.join(',') !== '1,2,3,4') throw new Error('host device/other instance damaged by disposal');
+    await other.dispose();
+    const lifecycle = { otherStillInUse, survivingValues, hostDevicePreserved: true };
     return {
+      lifecycle,
       elapsedMs,
       framesDuring,
       routeStatus: receipt?.status ?? null,

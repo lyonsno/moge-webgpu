@@ -28,6 +28,7 @@
  */
 
 import { createStorageBuffer, createEmptyBuffer, readBuffer, releaseRunBuffers } from './gpu.js';
+import { createResourceScope } from './resource_scope.js';
 import {
   dispatchConv2d,
   dispatchReluConv2d,
@@ -905,9 +906,26 @@ export class MoGeInference {
     this.backendIdentity = gpu.backendIdentity || null;
     this.weights = null;
     this.backbone = null;
+    this._scope = createResourceScope(this.device);
+    this._device = this._scope.device;
+    this._initPromise = null;
+    this._runPromise = null;
+    this._disposePromise = null;
+    this._closing = false;
   }
 
-  async init(onProgress) {
+  init(onProgress) {
+    if (this._closing) return Promise.reject(new Error('MoGe instance is disposed'));
+    if (!this._initPromise) this._initPromise = this._initialize(onProgress).catch(error => {
+      this._scope.dispose();
+      this.weights = null;
+      this.backbone = null;
+      throw error;
+    });
+    return this._initPromise;
+  }
+
+  async _initialize(onProgress) {
     try {
       // Test hook: harnesses that assert stub-route semantics (e.g. the route
       // receipt contract) opt in explicitly, since the hosted-weights fallback
@@ -916,28 +934,81 @@ export class MoGeInference {
         throw new Error('forced stub weights (forceStub test mode)');
       }
       const weightsUrl = await resolveWeightsUrl();
-      this.weights = await loadWeights(this.device, weightsUrl, onProgress);
+      this.weights = await loadWeights(this._device, weightsUrl, onProgress);
       this.useRealWeights = true;
       this.weightsSource = weightsUrl === HOSTED_WEIGHTS_URL ? 'hosted' : 'local';
       console.log(`Loaded real MoGe-2 weights (${this.weightsSource}: ${weightsUrl})`);
 
       // Initialize backbone
-      this.backbone = new DINOv2Backbone(this.device);
+      this.backbone = new DINOv2Backbone(this._device);
       this.backbone.init();
       console.log('DINOv2 backbone initialized');
 
       // Precompile decoder/utility pipelines so the first run does not pay
       // synchronous Metal pipeline compilation mid-inference.
-      const warmed = await warmUpPipelines(this.device);
+      const warmed = await warmUpPipelines(this._device);
       console.log(`Warmed ${warmed.length} compute pipelines`);
 
       // Expose for console debugging
       window.__mogeInference = this;
     } catch (e) {
       console.warn('Failed to load real weights, using stubs:', e.message);
+      // Partial real-weight/pipeline initialization owns resources too. Drop
+      // its entire cache key before constructing the explicitly labeled stub.
+      await this.device.queue.onSubmittedWorkDone();
+      this._scope.dispose();
+      this._scope = createResourceScope(this.device);
+      this._device = this._scope.device;
+      this.backbone = null;
+      this.weights = null;
       this.weights = this._createStubWeights();
       this.useRealWeights = false;
     }
+  }
+
+  // One invocation per instance. Separate instances may share the real device
+  // but have independent cache keys and allocation pools.
+  _invoke(operation) {
+    if (this._closing) return Promise.reject(new Error('MoGe instance is disposed'));
+    if (this._runPromise) return Promise.reject(new Error('MoGe instance is already running'));
+    if (!this._initPromise) return Promise.reject(new Error('Call init() before running MoGe'));
+    const run = (async () => {
+      await this._initPromise;
+      this._scope.beginRun();
+      try {
+        return await operation();
+      } finally {
+        // Submitted work may still refer to buffers even if CPU encoding,
+        // callbacks, readback, or validation failed. Never recycle them early.
+        try {
+          await this.device.queue.onSubmittedWorkDone();
+        } finally {
+          releaseRunBuffers(this._device);
+          this._scope.endRun();
+        }
+      }
+    })();
+    this._runPromise = run.finally(() => { this._runPromise = null; });
+    return this._runPromise;
+  }
+
+  dispose() {
+    if (this._disposePromise) return this._disposePromise;
+    this._closing = true;
+    this._disposePromise = (async () => {
+      await Promise.allSettled([this._initPromise, this._runPromise]);
+      try {
+        await this.device.queue.onSubmittedWorkDone();
+      } finally {
+        this._scope.dispose();
+        this.weights = null;
+        this.backbone = null;
+        this._device = null;
+        this._scope = null;
+        if (globalThis.window?.__mogeInference === this) delete window.__mogeInference;
+      }
+    })();
+    return this._disposePromise;
   }
 
   /**
@@ -948,6 +1019,9 @@ export class MoGeInference {
    * the host responsive during warm-up. Returns the warm-up run's timings.
    */
   async warmUp({ imageData = null, scheduler = null } = {}) {
+    if (this._closing) throw new Error('MoGe instance is disposed');
+    if (!this._initPromise) throw new Error('Call init() before warming up MoGe');
+    await this._initPromise;
     if (!this.useRealWeights) return null;
     let img = imageData;
     if (!img) {
@@ -979,7 +1053,7 @@ export class MoGeInference {
   }
 
   _createStubWeights() {
-    const d = this.device;
+    const d = this._device;
     const rand = (n) => {
       const data = new Float32Array(n);
       for (let i = 0; i < n; i++) data[i] = (Math.random() - 0.5) * 0.02;
@@ -1075,12 +1149,16 @@ export class MoGeInference {
    * Run backbone comparison against PyTorch reference tensors.
    * Usage from console: await window.__mogeInference.runBackboneCompare()
    */
-  async runBackboneCompare() {
+  runBackboneCompare() {
+    return this._invoke(() => this._runBackboneCompare());
+  }
+
+  async _runBackboneCompare() {
     if (!this.backbone || !this.useRealWeights) {
       console.error('Backbone not initialized or using stub weights');
       return;
     }
-    const device = this.device;
+    const device = this._device;
     const tokenH = 37, tokenW = 37;
 
     // Load normalized input from layer dumps (same image used for PyTorch reference)
@@ -1097,12 +1175,16 @@ export class MoGeInference {
    * Detailed sub-block analysis of transformer block 0.
    * Usage from console: await window.__mogeInference.runBlock0Compare()
    */
-  async runBlock0Compare() {
+  runBlock0Compare() {
+    return this._invoke(() => this._runBlock0Compare());
+  }
+
+  async _runBlock0Compare() {
     if (!this.backbone || !this.useRealWeights) {
       console.error('Backbone not initialized');
       return;
     }
-    const device = this.device;
+    const device = this._device;
     const tokenH = 37, tokenW = 37;
     const resp = await fetch('/layer_dumps/input_normalized.bin');
     const inputData = new Float32Array(await resp.arrayBuffer());
@@ -1114,11 +1196,15 @@ export class MoGeInference {
   /**
    * Run full inference.
    */
-  async run(imageData, options = {}) {
+  run(imageData, options = {}) {
+    return this._invoke(() => this._run(imageData, options));
+  }
+
+  async _run(imageData, options = {}) {
     const totalStart = performance.now();
     const phaseTimings = {};
     const { width, height } = imageData;
-    const device = this.device;
+    const device = this._device;
     const encoderDim = MODEL_CONFIG.encoder.dimOut;
 
     // Determine token grid size
@@ -1864,10 +1950,9 @@ export class MoGeInference {
     }
 
     // Clean up: unpooled per-run uploads are destroyed; all pooled transient
-    // outputs (decoder levels, backbone projections) return to the pool for
-    // reuse on the next run.
+    // outputs (decoder levels, backbone projections) return to the pool in
+    // the invocation's finally block, on success or failure.
     neckInputs.forEach(f => f.buffer.destroy());
-    releaseRunBuffers(device);
 
     phaseTimings.postprocessMs = performance.now() - postprocessStart;
     phaseTimings.totalMs = performance.now() - totalStart;

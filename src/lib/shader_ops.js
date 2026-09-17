@@ -16,6 +16,7 @@ import pixelshuffleWGSL from '../shaders/pixelshuffle.wgsl?raw';
 import upsampleWGSL from '../shaders/upsample.wgsl?raw';
 
 import { createStorageBuffer, createEmptyBuffer, acquirePooledBuffer } from './gpu.js';
+import { retainResource } from './resource_scope.js';
 
 const pipelineCaches = new WeakMap();
 const uniformCaches = new WeakMap();
@@ -52,6 +53,7 @@ function cachedUniform(device, data) {
   });
   new Uint8Array(buf.getMappedRange()).set(bytes);
   buf.unmap();
+  retainResource(device, buf);
   uniformCache.set(key, buf);
   return buf;
 }
@@ -61,6 +63,7 @@ function getDummyBias(device) {
   let dummyBiasBuf = dummyBiasBuffers.get(device);
   if (!dummyBiasBuf) {
     dummyBiasBuf = createStorageBuffer(device, new Float32Array([0]));
+    retainResource(device, dummyBiasBuf);
     dummyBiasBuffers.set(device, dummyBiasBuf);
   }
   return dummyBiasBuf;
