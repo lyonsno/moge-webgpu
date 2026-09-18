@@ -1629,7 +1629,10 @@ export class MoGeInference {
       await device.queue.onSubmittedWorkDone();
       stagedGpuPhaseTimings.neckInputSubmitWaitMs = performance.now() - waitStart;
       if (coop) {
-        coopEvent(coop, 'decoder-heads', 'queue-work-done-end', { waitMs: stagedGpuPhaseTimings.neckInputSubmitWaitMs });
+        coopEvent(coop, 'decoder-heads', 'queue-work-done-end', {
+          waitMs: stagedGpuPhaseTimings.neckInputSubmitWaitMs,
+          chunk: 'neck-input',
+        });
         await coopAdmit(coop, 'decoder-heads', 'neck-input', { signal: options.signal });
         await coopYield(coop, 'decoder-heads');
       }
@@ -1787,7 +1790,10 @@ export class MoGeInference {
       const tailWaitMs = performance.now() - waitStart;
       stagedGpuPhaseTimings.decoderSubmitWaitMs = coopDecoderWaitMs + tailWaitMs;
       if (coop) {
-        coopEvent(coop, 'decoder-heads', 'queue-work-done-end', { waitMs: tailWaitMs });
+        coopEvent(coop, 'decoder-heads', 'queue-work-done-end', {
+          waitMs: tailWaitMs,
+          chunk: 'decoder-tail',
+        });
         await coopAdmit(coop, 'decoder-heads', 'decoder-tail', { signal: options.signal });
         await coopYield(coop, 'decoder-heads');
       }
