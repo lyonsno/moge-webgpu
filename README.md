@@ -72,6 +72,7 @@ renderer or simulation — the kit's core product target.
 | `pacing` | `'strict-drain'` | `'bounded-prefix'` keeps up to `maxInFlightChunks` submits in flight and awaits only the oldest fence (GPU stays saturated; queued-ahead work stays bounded) |
 | `maxInFlightChunks` | `2` | bounded-prefix depth |
 | `yieldMs` | `4` | browser yield between chunks (`0` is a bare macrotask yield) |
+| `admit` | — | optional async embedding-host callback after a submitted GPU chunk reaches the configured pacing boundary; receipt records callback identity and observed start/end events, never the function |
 
 Finest granularity (`splitVitBlocks` + `splitDecoderResBlocks`) puts ~230
 submissions in a run, the fattest being a single 3×3 conv at 296². Under
@@ -85,6 +86,12 @@ Every chunk records submit, wait, yield and fence-retire events on a
 `block-7:attn-scores`, `neck:level-3:res-block-0:conv2`), so foreground hitches
 can be attributed to the exact submission (`tools/probe_hitch_alignment.mjs`
 aligns rAF frame gaps with submit→retire occupancy spans).
+
+An embedding host may supply `admit({ phase, chunk, signal })` to require a
+host-owned opportunity before the next GPU chunk is encoded. The callback is
+allowed to fail the run when its external liveness predicate disappears. It
+does not itself establish presentation or hardware-priority authority; the
+host must retain and validate the observation that let the callback return.
 
 ## Embedding in a host application
 

@@ -15,6 +15,7 @@
  */
 
 import {
+  coopAdmit,
   cooperativeSchedulerDescriptor,
   createMogeSchedulerVerificationReceipt,
   resolveCooperativeScheduler,
@@ -134,9 +135,52 @@ const PHASES = ['backbone', 'decoder-heads', 'output-readback'];
     `got ${descriptor.effectiveScheduler.phaseChunkSize.backbone}`);
 }
 
+// 6. A host-owned foreground admission hook survives scheduler resolution.
+//    The prior scheduler drops it, so an embedding host cannot require a
+//    fresh render/simulation opportunity between submitted model chunks.
+{
+  const admit = async () => {};
+  const coop = resolveCooperativeScheduler({ mode: 'cooperative', admit });
+  check('host-admission-preserved', coop.admit === admit,
+    'resolved scheduler dropped the host admission callback');
+  const descriptor = cooperativeSchedulerDescriptor(coop, { backboneTotalItems: 24 });
+  check('host-admission-requested-identity', descriptor.requestedScheduler.hostAdmission === 'callback',
+    JSON.stringify(descriptor.requestedScheduler));
+  check('host-admission-effective-identity', descriptor.effectiveScheduler.hostAdmission === 'callback',
+    JSON.stringify(descriptor.effectiveScheduler));
+}
+
+// 7. Admission is observed, supplies chunk identity, and fails loud.
+{
+  const calls = [];
+  const coop = resolveCooperativeScheduler({
+    mode: 'cooperative',
+    admit: async value => calls.push(value),
+  });
+  await coopAdmit(coop, 'backbone', 'block-0:qkv', { signal: 'fixture-signal' });
+  check('host-admission-call', calls.length === 1
+    && calls[0].phase === 'backbone'
+    && calls[0].chunk === 'block-0:qkv'
+    && calls[0].signal === 'fixture-signal', JSON.stringify(calls));
+  check('host-admission-events', coop.events.at(-2)?.kind === 'host-admission-start'
+    && coop.events.at(-1)?.kind === 'host-admission-end'
+    && coop.events.at(-1)?.status === 'advanced', JSON.stringify(coop.events));
+
+  const rejected = resolveCooperativeScheduler({
+    mode: 'cooperative',
+    admit: async () => { throw new Error('flame unavailable'); },
+  });
+  await coopAdmit(rejected, 'decoder-heads', 'neck-input').then(
+    () => check('host-admission-rejection', false, 'rejection was swallowed'),
+    error => check('host-admission-rejection', error.message === 'flame unavailable', error.message),
+  );
+  check('host-admission-failure-event', rejected.events.at(-1)?.status === 'failed'
+    && rejected.events.at(-1)?.error === 'flame unavailable', JSON.stringify(rejected.events));
+}
+
 if (failures.length) {
   console.log('FAIL:');
   for (const f of failures) console.log(`  - ${f}`);
   process.exit(1);
 }
-console.log(`PASS (${5} cases)`);
+console.log(`PASS (${7} cases)`);

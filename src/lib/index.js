@@ -5,7 +5,9 @@
  * it to MoGeInference; weights stream from a local /weights.bin when present,
  * otherwise from the hosted HuggingFace copy. Cooperative scheduling is
  * requested per run via options.scheduler ({ mode: 'cooperative', yieldMs,
- * vitBlockChunkSize, waitForSubmittedWorkDone }).
+ * vitBlockChunkSize, waitForSubmittedWorkDone, admit }). `admit` is an
+ * embedding-host callback at submitted GPU chunk boundaries; its function is
+ * never serialized into the route receipt.
  */
 export { MoGeInference } from './inference.js';
 export {
@@ -18,4 +20,5 @@ export {
 export {
   resolveCooperativeScheduler,
   createMogeSchedulerVerificationReceipt,
+  coopAdmit,
 } from './scheduler_receipt.js';

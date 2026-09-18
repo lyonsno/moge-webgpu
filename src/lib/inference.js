@@ -43,6 +43,7 @@ import {
 import { loadWeights } from './weights.js';
 import {
   resolveCooperativeScheduler,
+  coopAdmit,
   coopEvent,
   coopYield,
   cooperativeSchedulerDescriptor,
@@ -1365,6 +1366,7 @@ export class MoGeInference {
               coopEvent(coop, 'backbone', 'queue-work-done-end', { waitMs,
                 chunk: meta.kind === 'vit-block-segment' ? `block-${meta.block}:${meta.segmentName}`
                   : (meta.kind === 'vit-blocks' ? `blocks-${meta.firstBlock}-${meta.lastBlock}` : meta.kind) });
+              await coopAdmit(coop, 'backbone', backboneChunkLabel, { signal: options.signal });
               await coopYield(coop, 'backbone');
             },
           }
@@ -1628,6 +1630,7 @@ export class MoGeInference {
       stagedGpuPhaseTimings.neckInputSubmitWaitMs = performance.now() - waitStart;
       if (coop) {
         coopEvent(coop, 'decoder-heads', 'queue-work-done-end', { waitMs: stagedGpuPhaseTimings.neckInputSubmitWaitMs });
+        await coopAdmit(coop, 'decoder-heads', 'neck-input', { signal: options.signal });
         await coopYield(coop, 'decoder-heads');
       }
       commandEncoder = device.createCommandEncoder();
@@ -1662,6 +1665,7 @@ export class MoGeInference {
       const waitMs = performance.now() - waitStart;
       coopDecoderWaitMs += waitMs;
       coopEvent(coop, 'decoder-heads', 'queue-work-done-end', { waitMs, chunk: chunkLabel });
+      await coopAdmit(coop, 'decoder-heads', chunkLabel, { signal: options.signal });
       await coopYield(coop, 'decoder-heads');
     };
     let neckOutputs;
@@ -1784,6 +1788,7 @@ export class MoGeInference {
       stagedGpuPhaseTimings.decoderSubmitWaitMs = coopDecoderWaitMs + tailWaitMs;
       if (coop) {
         coopEvent(coop, 'decoder-heads', 'queue-work-done-end', { waitMs: tailWaitMs });
+        await coopAdmit(coop, 'decoder-heads', 'decoder-tail', { signal: options.signal });
         await coopYield(coop, 'decoder-heads');
       }
     } else {

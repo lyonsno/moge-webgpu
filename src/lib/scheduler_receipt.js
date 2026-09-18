@@ -45,6 +45,9 @@ export function resolveCooperativeScheduler(requested) {
     pacing: requested.pacing === 'bounded-prefix' ? 'bounded-prefix' : 'strict-drain',
     maxInFlightChunks: Math.max(1, Math.floor(Number(requested.maxInFlightChunks) || 2)),
     waitForSubmittedWorkDone: requested.waitForSubmittedWorkDone !== false,
+    // Embedding-only hook. It is intentionally kept as a function here and
+    // represented by identity (never serialized) in route receipts.
+    admit: typeof requested.admit === 'function' ? requested.admit : null,
     events: [],
   };
 }
@@ -66,6 +69,28 @@ export async function coopYield(coop, phase) {
   coopEvent(coop, phase, 'yield-start');
   await new Promise(resolve => setTimeout(resolve, coop.yieldMs));
   coopEvent(coop, phase, 'yield-end', { yieldMs: coop.yieldMs });
+}
+
+export async function coopAdmit(coop, phase, chunk, extra = {}) {
+  if (!coop?.admit) return;
+  const startedAtMs = performance.now();
+  coopEvent(coop, phase, 'host-admission-start', { chunk });
+  try {
+    await coop.admit({ phase, chunk, ...extra });
+    coopEvent(coop, phase, 'host-admission-end', {
+      chunk,
+      waitMs: performance.now() - startedAtMs,
+      status: 'advanced',
+    });
+  } catch (error) {
+    coopEvent(coop, phase, 'host-admission-end', {
+      chunk,
+      waitMs: performance.now() - startedAtMs,
+      status: 'failed',
+      error: error?.message || String(error),
+    });
+    throw error;
+  }
 }
 
 /**
@@ -92,6 +117,7 @@ export function cooperativeSchedulerDescriptor(coop, { backboneTotalItems } = {}
     waitForSubmittedWorkDone: coop.waitForSubmittedWorkDone,
     pacing: coop.pacing,
     maxInFlightChunks: coop.maxInFlightChunks,
+    hostAdmission: coop.admit ? 'callback' : 'none',
   };
   return {
     requestedScheduler: { ...base, phaseChunkSize: requestedChunks },
