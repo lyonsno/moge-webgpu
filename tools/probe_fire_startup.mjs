@@ -74,6 +74,9 @@ try {
   report.effectiveUrl = response.url();
   assert.equal(response.status(), 200);
   assert.equal(new URL(report.effectiveUrl).origin, url.origin);
+  await page.bringToFront();
+  report.pageVisibility = await page.evaluate(() => document.visibilityState);
+  assert.equal(report.pageVisibility, 'visible', 'native startup page must be foreground-visible');
   await page.waitForFunction(() => {
     const state = window.__kaminosVolumePrototype?.debugState();
     return state?.error || (state?.active && state.frameCount > 8 && state.simStepCount > 8);
