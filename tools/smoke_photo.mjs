@@ -89,8 +89,10 @@ try {
     assert.equal(report.parity.monolithicSchedulerStatus, 'scheduler-unverified', 'Monolithic negative baseline is explicit');
   }
   report.phase = 'mobile';
-  await page.setViewport({ width: 390, height: 844, deviceScaleFactor: 2, isMobile: true, hasTouch: true });
+  // Changing mobile emulation reloads the page and discards the inferred result.
+  await page.setViewport({ width: 390, height: 844, deviceScaleFactor: 2 });
   await settle();
+  if (report.infer) assert.equal(await page.evaluate(() => window.__mogePhoto?.phase), 'complete', 'Mobile result witness must retain completed inference');
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, 'Mobile has no horizontal overflow');
   await page.screenshot({ path: path.join(out, 'mobile.png'), fullPage: true });
   assert.deepEqual(report.errors, [], 'No browser/shader errors');
