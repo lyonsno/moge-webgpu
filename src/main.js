@@ -16,14 +16,14 @@ function error(err) { $('error').textContent = err.message; $('error').hidden = 
 function setBusy(value) {
   busy = value;
   for (const id of ['upload-button', 'sample-button', 'run-button', 'file-input']) $(id).disabled = value;
+  $('run-button').disabled = value || !navigator.gpu || !selected;
   $('run-button').querySelector('span').textContent = value ? 'Processing' : 'Reveal depth';
   $('progress').hidden = !value;
   $('progress').removeAttribute('value');
 }
 
-async function selectImage(blob, name) {
-  if (busy) return;
-  const ticket = ++selection;
+async function selectImage(blob, name, ticket = ++selection) {
+  if (busy || ticket !== selection) return;
   const bitmap = await createImageBitmap(blob);
   if (ticket !== selection || busy) { bitmap.close(); return; }
   const canvas = document.createElement('canvas');
@@ -32,7 +32,7 @@ async function selectImage(blob, name) {
   selected = { canvas, name };
   $('selected-image').src = canvas.toDataURL('image/jpeg');
   $('selected-name').textContent = name;
-  $('run-button').disabled = false;
+  $('run-button').disabled = !navigator.gpu;
   $('error').hidden = true;
   if (!viewer.hasDepth) { viewer.setImage(canvas); $('displayed-name').textContent = name; }
   status(inference ? 'Model loaded' : 'First run downloads model weights (~660 MB)');
@@ -40,9 +40,11 @@ async function selectImage(blob, name) {
 
 async function useExample() {
   if (busy) return;
+  const ticket = ++selection;
   const response = await fetch(sampleUrl);
+  if (ticket !== selection) return;
   if (!response.ok) throw new Error(`Example photograph could not load (${response.status})`);
-  await selectImage(await response.blob(), 'Celebration');
+  await selectImage(await response.blob(), 'Celebration', ticket);
 }
 
 async function run() {
@@ -64,11 +66,13 @@ async function run() {
           status(`Loading weights: ${(received / 1048576).toFixed(0)} MB${total > 0 ? ` / ${(total / 1048576).toFixed(0)} MB` : ''}`);
           if (total > 0) { $('progress').max = total; $('progress').value = received; }
         });
+        if (!candidate.useRealWeights) throw new Error('Could not load real model weights. Check your connection and try again.');
         inference = candidate;
       } catch (err) { await candidate.dispose(); throw err; }
     }
     phase = 'inference'; status('Estimating depth and surface normals'); $('progress').removeAttribute('value');
     const imageData = input.canvas.getContext('2d').getImageData(0, 0, input.canvas.width, input.canvas.height);
+    window.__mogeInputCanvas = input.canvas;
     const t0 = performance.now();
     const result = await inference.run(imageData, { scheduler: {
       mode: 'cooperative', splitVitBlocks: true, splitDecoderResBlocks: true, pacing: 'bounded-prefix',
@@ -85,6 +89,7 @@ async function run() {
     $('result-detail').textContent = `${result.width} × ${result.height} / ${seconds.toFixed(2)} s`;
     status('Depth complete');
     window.__mogeResult = result;
+    Object.assign(window.__mogeDebug || (window.__mogeDebug = {}), { elapsed: `${seconds}s`, outputSize: `${result.width}x${result.height}` });
     window.__mogePhoto = { phase: 'complete', seconds, name: input.name, width: result.width, height: result.height };
     if (debug) $('debug-output').textContent = JSON.stringify({ ...window.__mogePhoto, debug: window.__mogeDebug }, null, 2);
   } catch (err) {

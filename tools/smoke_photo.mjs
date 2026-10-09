@@ -12,7 +12,7 @@ const report = { ok: false, phase: 'launch', executablePath, url: process.env.DE
   sourceCommit: execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(), errors: [], infer: process.argv.includes('--infer') };
 let browser, page;
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
-const settle = () => new Promise(resolve => setTimeout(resolve, 600));
+const settle = () => new Promise(resolve => setTimeout(resolve, 1500));
 try {
   assert.ok(executablePath && !executablePath.includes('/Applications/Google Chrome.app/'), 'Independent testing browser required');
   browser = await puppeteer.launch({ executablePath, headless: true, args: ['--enable-unsafe-webgpu'],
@@ -42,8 +42,9 @@ try {
     report.firstRun = await page.evaluate(() => ({ ...window.__mogePhoto,
       validDepth: window.__mogeResult && [...window.__mogeResult.depth].filter(d => Number.isFinite(d) && d > 0).length,
       scheduler: window.__mogeResult?.schedulerVerificationReceipt,
-      backend: window.__mogeDebug }));
+      backend: window.__mogeDebug, useRealWeights: window.__mogeInference?.useRealWeights }));
     assert.equal(report.firstRun.phase, 'complete', 'Actual model and surface must complete');
+    assert.equal(report.firstRun.useRealWeights, true, 'No fallback result may pass as a model witness');
     assert.ok(report.firstRun.validDepth > 0);
     await settle();
     const canvas = await page.$('#photo-canvas');
@@ -84,5 +85,6 @@ try {
 } finally {
   if (browser) await browser.close();
   await fs.writeFile(path.join(out, 'report.json'), JSON.stringify(report, null, 2));
-  console.log(JSON.stringify(report));
+  console.log(JSON.stringify({ ok: report.ok, phase: report.phase, firstSeconds: report.firstRun?.seconds,
+    repeatSeconds: report.repeatRun?.seconds, error: report.error, reportPath: path.join(out, 'report.json') }));
 }

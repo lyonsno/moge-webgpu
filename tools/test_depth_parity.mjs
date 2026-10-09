@@ -20,10 +20,11 @@
  */
 
 import puppeteer from 'puppeteer-core';
+import { uploadAndRunPhoto, testingBrowserPath } from './photo_app_driver.mjs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-const CHROME_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+const CHROME_PATH = testingBrowserPath();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 async function main() {
@@ -58,10 +59,10 @@ async function main() {
 
     const testImagePath = path.resolve(__dirname, '..', 'public', 'test_fixtures', 'input.png');
     const fileInput = await page.$('#file-input');
-    await fileInput.uploadFile(testImagePath);
+    await uploadAndRunPhoto(page, testImagePath);
 
     await page.waitForFunction(
-      () => document.getElementById('output')?.classList.contains('visible') && window.__mogeResult,
+      () => (window.__mogePhoto?.phase === 'complete' || document.getElementById('output')?.classList.contains('visible')) && window.__mogeResult,
       { timeout: 300000 }
     );
 

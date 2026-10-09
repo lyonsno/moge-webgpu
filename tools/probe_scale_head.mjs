@@ -10,10 +10,11 @@
  * Usage: node tools/probe_scale_head.mjs [--port 5183]
  */
 import puppeteer from 'puppeteer-core';
+import { uploadAndRunPhoto, testingBrowserPath } from './photo_app_driver.mjs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-const CHROME_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+const CHROME_PATH = testingBrowserPath();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const args = process.argv.slice(2);
@@ -34,7 +35,7 @@ page.on('console', msg => {
 
 await page.goto(`http://localhost:${port}/`, { waitUntil: 'networkidle0', timeout: 60000 });
 const fileInput = await page.$('#file-input');
-await fileInput.uploadFile(path.resolve(__dirname, '..', 'public', 'test_fixtures', 'input.png'));
+await uploadAndRunPhoto(page, path.resolve(__dirname, '..', 'public', 'test_fixtures', 'input.png'));
 await page.waitForFunction(() => window.__mogeResult, { timeout: 300000 });
 
 const refRaw = await page.evaluate(async () => {

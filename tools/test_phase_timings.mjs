@@ -7,8 +7,9 @@
  */
 
 import puppeteer from 'puppeteer-core';
+import { uploadAndRunPhoto, testingBrowserPath } from './photo_app_driver.mjs';
 
-const CHROME_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+const CHROME_PATH = testingBrowserPath();
 const REQUIRED_PHASES = [
   'preprocessMs',
   'backboneEncodeMs',
@@ -47,9 +48,9 @@ async function main() {
   try {
     await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'networkidle0', timeout: 30000 });
     const input = await page.$('#file-input');
-    await input.uploadFile('public/test_fixtures/input.png');
+    await uploadAndRunPhoto(page, 'public/test_fixtures/input.png');
     await page.waitForFunction(
-      () => document.getElementById('output')?.classList.contains('visible'),
+      () => (window.__mogePhoto?.phase === 'complete' || document.getElementById('output')?.classList.contains('visible')),
       { timeout: 300000 }
     );
 

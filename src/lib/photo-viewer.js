@@ -104,15 +104,21 @@ export class PhotoViewer {
       uniforms: { photograph: { value: texture }, reveal: { value: 0 }, relight: { value: 0 },
         lightDirection: { value: this.light }, viewMode: { value: 0 } } });
     const next = new THREE.Mesh(geometry, material);
+    const original = new THREE.Mesh(new THREE.PlaneGeometry(aspect, 1), new THREE.MeshBasicMaterial({ map: texture }));
+    original.visible = false;
     next.frustumCulled = false;
     const previous = this.mesh;
+    const previousOriginal = this.original;
+    this.original = original; this.scene.add(original);
     this.scene.add(next); this.mesh = next; this.aspect = aspect; this.camera.far = data.far;
     this.hasDepth = !!result; this.reveal = this.reducedMotion && result ? 1 : 0;
     this.reset(); this.resize();
+    this.openedAt = performance.now();
     if (previous) {
       this.scene.remove(previous); previous.geometry.dispose();
       previous.material.uniforms.photograph.value.dispose(); previous.material.dispose();
     }
+    if (previousOriginal) { this.scene.remove(previousOriginal); previousOriginal.geometry.dispose(); previousOriginal.material.dispose(); }
   }
 
   reset() {
@@ -130,9 +136,11 @@ export class PhotoViewer {
   render() {
     if (!this.mesh || document.hidden) return;
     const original = this.view === 'original';
+    this.mesh.visible = !original; this.original.visible = original;
     this.reveal += ((this.hasDepth && !original ? 1 : 0) - this.reveal) * 0.09;
     this.current.lerp(this.target, 0.08);
-    const x = this.hasDepth && !original ? this.current.x + this.orbit.x : 0;
+    const opening = this.hasDepth && !this.reducedMotion ? Math.sin(Math.min(1, (performance.now() - this.openedAt) / 1200) * Math.PI) * 0.025 : 0;
+    const x = this.hasDepth && !original ? this.current.x + this.orbit.x + opening : 0;
     const y = this.hasDepth && !original ? this.current.y + this.orbit.y : 0;
     this.camera.position.set(x, -y, original ? 1 : this.zoom); this.camera.lookAt(0, 0, 0);
     this.mesh.material.uniforms.reveal.value = this.reveal;
@@ -145,6 +153,7 @@ export class PhotoViewer {
     this.renderer.setAnimationLoop(null); this.resizeObserver.disconnect();
     for (const [event, handler] of Object.entries(this.listeners)) this.canvas.removeEventListener(event, handler);
     if (this.mesh) { this.mesh.geometry.dispose(); this.mesh.material.uniforms.photograph.value.dispose(); this.mesh.material.dispose(); }
+    if (this.original) { this.original.geometry.dispose(); this.original.material.dispose(); }
     this.renderer.dispose();
   }
 }

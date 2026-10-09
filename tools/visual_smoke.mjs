@@ -9,10 +9,11 @@
  */
 
 import puppeteer from 'puppeteer-core';
+import { uploadAndRunPhoto, testingBrowserPath } from './photo_app_driver.mjs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-const CHROME_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+const CHROME_PATH = testingBrowserPath();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 async function main() {
@@ -61,12 +62,12 @@ async function main() {
     // Upload the test image via the file input
     const testImagePath = path.resolve(__dirname, '..', 'public', 'test_fixtures', 'input.png');
     const fileInput = await page.$('#file-input');
-    await fileInput.uploadFile(testImagePath);
+    await uploadAndRunPhoto(page, testImagePath);
 
     // Wait for inference to complete by watching for the output panel to become visible
     console.log('Waiting for inference to complete...');
     await page.waitForFunction(
-      () => document.getElementById('output')?.classList.contains('visible'),
+      () => (window.__mogePhoto?.phase === 'complete' || document.getElementById('output')?.classList.contains('visible')),
       { timeout: 300000 }
     );
 
@@ -76,14 +77,18 @@ async function main() {
     await new Promise(r => setTimeout(r, 2000));
 
     // Capture depth canvas
-    const depthEl = await page.$('#depth-canvas');
+    if (await page.$('#view')) await page.select('#view', 'depth');
+    await new Promise(r => setTimeout(r, 1500));
+    const depthEl = await page.$('#photo-canvas') || await page.$('#depth-canvas');
     if (depthEl) {
       await depthEl.screenshot({ path: '/tmp/moge-smoke-depth.png' });
       console.log('Saved /tmp/moge-smoke-depth.png');
     }
 
     // Capture normals canvas
-    const normalEl = await page.$('#normal-canvas');
+    if (await page.$('#view')) await page.select('#view', 'normals');
+    await new Promise(r => setTimeout(r, 500));
+    const normalEl = await page.$('#photo-canvas') || await page.$('#normal-canvas');
     if (normalEl) {
       await normalEl.screenshot({ path: '/tmp/moge-smoke-normals.png' });
       console.log('Saved /tmp/moge-smoke-normals.png');

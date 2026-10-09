@@ -10,10 +10,11 @@
  */
 
 import puppeteer from 'puppeteer-core';
+import { uploadAndRunPhoto, testingBrowserPath } from './photo_app_driver.mjs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-const CHROME_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+const CHROME_PATH = testingBrowserPath();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 function parseArgs() {
@@ -75,9 +76,9 @@ async function runTarget(browser, target, runs) {
     if (!fileInput) throw new Error('file input #file-input not found');
 
     const firstStart = performance.now();
-    await fileInput.uploadFile(testImagePath);
+    await uploadAndRunPhoto(page, testImagePath);
     await page.waitForFunction(
-      () => document.getElementById('output')?.classList.contains('visible'),
+      () => (window.__mogePhoto?.phase === 'complete' || document.getElementById('output')?.classList.contains('visible')),
       { timeout: 300000 }
     );
     const firstEnd = performance.now();
@@ -92,7 +93,7 @@ async function runTarget(browser, target, runs) {
       const warm = await page.evaluate(async () => {
         const inf = window.__mogeInference;
         if (!inf) throw new Error('MoGeInference not exposed on window');
-        const inputCanvas = document.getElementById('input-canvas');
+        const inputCanvas = (window.__mogeInputCanvas || document.getElementById('input-canvas'));
         if (!inputCanvas || inputCanvas.width === 0 || inputCanvas.height === 0) {
           throw new Error('input canvas missing or blank');
         }

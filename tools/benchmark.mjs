@@ -10,10 +10,11 @@
  */
 
 import puppeteer from 'puppeteer-core';
+import { uploadAndRunPhoto, testingBrowserPath } from './photo_app_driver.mjs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-const CHROME_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+const CHROME_PATH = testingBrowserPath();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 function parseArgs() {
@@ -96,11 +97,11 @@ async function main() {
     // Upload image to trigger inference
     const fileInput = await page.$('#file-input');
     const firstInfStart = Date.now();
-    await fileInput.uploadFile(testImagePath);
+    await uploadAndRunPhoto(page, testImagePath);
 
     // Wait for inference complete
     await page.waitForFunction(
-      () => document.getElementById('output')?.classList.contains('visible'),
+      () => (window.__mogePhoto?.phase === 'complete' || document.getElementById('output')?.classList.contains('visible')),
       { timeout: 300000 }
     );
     const firstInfEnd = Date.now();
@@ -122,7 +123,7 @@ async function main() {
         if (!inf) throw new Error('MoGeInference not exposed on window');
 
         // Get the input canvas data
-        const inputCanvas = document.getElementById('input-canvas');
+        const inputCanvas = (window.__mogeInputCanvas || document.getElementById('input-canvas'));
         const ctx = inputCanvas.getContext('2d');
         const imageData = ctx.getImageData(0, 0, inputCanvas.width, inputCanvas.height);
 

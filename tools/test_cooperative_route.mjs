@@ -20,10 +20,11 @@
  */
 
 import puppeteer from 'puppeteer-core';
+import { uploadAndRunPhoto, testingBrowserPath } from './photo_app_driver.mjs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-const CHROME_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+const CHROME_PATH = testingBrowserPath();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const args = process.argv.slice(2);
@@ -47,8 +48,7 @@ try {
 
   // The app initializes GPU + weights lazily on first image. Trigger a normal
   // run via the file input, then drive the cooperative run directly.
-  const fileInput = await page.$('#file-input');
-  await fileInput.uploadFile(path.resolve(__dirname, '..', 'public', 'test_fixtures', 'input.png'));
+  await uploadAndRunPhoto(page, path.resolve(__dirname, '..', 'public', 'test_fixtures', 'input.png'));
   await page.waitForFunction(
     () => window.__mogeInference?.useRealWeights && window.__mogeResult,
     { timeout: 300000 }
@@ -80,12 +80,14 @@ try {
     ctx.drawImage(img, 0, 0);
     const imageData = ctx.getImageData(0, 0, img.width, img.height);
 
-    // Negative path: the monolithic first run must NOT claim scheduler
+    // Explicit negative baseline, independent of the presentation's scheduler.
+    const monolithic = await window.__mogeInference.run(imageData, { scheduler: { mode: 'monolithic' } });
+    // Negative path: the monolithic run must NOT claim scheduler
     // verification (no observed events exist for it).
     const monolithicSchedulerStatus =
       window.__mogeDebug?.webGpuRouteReceipt?.runtime?.schedulerVerification?.status ?? null;
 
-    const monolithicDepth = window.__mogeResult.depth;
+    const monolithicDepth = monolithic.depth;
     const frameCountBefore = window.__frameIntervals.length;
     const t0 = performance.now();
     const run = await window.__mogeInference.run(imageData, {
