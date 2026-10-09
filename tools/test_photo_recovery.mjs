@@ -25,6 +25,7 @@ try {
     const { MoGeInference } = await import('/src/lib/inference.js');
     MoGeInference.prototype.init = async function () { this.useRealWeights = true; };
     MoGeInference.prototype.run = async function () {
+      if (window.__testHoldNext) await new Promise(resolve => { window.__testReleaseRun = resolve; });
       if (window.__testRejectNext) throw new Error('TEST: simulated inference failure');
       return { width: 2, height: 2, depth: new Float32Array([1, 1.01, 1.02, 1.03]),
         normals: new Float32Array([0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1]) };
@@ -32,6 +33,13 @@ try {
   });
   await page.click('#run-button');
   await page.waitForFunction(() => window.__mogePhoto?.phase === 'complete');
+  await page.evaluate(() => { window.__testHoldNext = true; });
+  await page.click('#run-button');
+  await page.waitForFunction(() => typeof window.__testReleaseRun === 'function');
+  await page.focus('#zoom');
+  await page.evaluate(() => { window.__testHoldNext = false; window.__testReleaseRun(); });
+  await page.waitForFunction(() => window.__mogePhoto?.phase === 'complete');
+  assert.equal(await page.evaluate(() => document.activeElement.id), 'zoom', 'Completed rerun must preserve Explore focus');
   assert.equal(await page.$eval('#explore-controls', el => el.disabled), false);
   assert.match(await page.$eval('#status', el => el.textContent), /^Inference: [\d.]+ s$/);
   assert.match(await page.$eval('#elapsed', el => el.textContent), /^Total: [\d.]+ s \(including preparation\)$/);

@@ -96,7 +96,9 @@ async function run() {
     status(`Inference: ${seconds.toFixed(2)} s`);
     completedInput = input;
     document.body.classList.add('has-result');
-    $('photograph-section').before($('explore-section'));
+    if ($('explore-section').nextElementSibling !== $('photograph-section')) {
+      $('photograph-section').before($('explore-section'));
+    }
     window.__mogeResult = result;
     Object.assign(window.__mogeDebug || (window.__mogeDebug = {}), { elapsed: `${seconds}s`, outputSize: `${result.width}x${result.height}` });
     window.__mogePhoto = { phase: 'complete', seconds, name: input.name, width: result.width, height: result.height };
