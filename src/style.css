@@ -1,0 +1,74 @@
+:root { font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #e9efec; background: #101313; font-synthesis: none; letter-spacing: 0; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+button, input, select { font: inherit; }
+button, a, select, input { -webkit-tap-highlight-color: transparent; }
+button, select { cursor: pointer; }
+a { color: inherit; text-decoration: none; }
+button { color: inherit; border: 1px solid #39413e; border-radius: 6px; background: transparent; }
+button:hover:not(:disabled) { background: #26312c; }
+button:disabled, fieldset:disabled { opacity: 0.45; cursor: default; }
+button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible, canvas:focus-visible { outline: 2px solid #bce786; outline-offset: 3px; }
+svg { width: 18px; height: 18px; flex-shrink: 0; stroke-width: 1.6; }
+header { height: 88px; padding: 0 36px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #303632; }
+.brand { display: flex; align-items: baseline; gap: 12px; font-size: 28px; font-weight: 650; }
+.brand span { font-size: 12px; font-weight: 400; color: #a0b1a6; }
+nav { display: flex; gap: 26px; align-items: center; font-size: 13px; }
+nav a { display: flex; align-items: center; gap: 6px; min-height: 44px; }
+.workspace { display: grid; grid-template-columns: minmax(0, 1fr) 320px; min-height: calc(100svh - 142px); }
+.scene { position: relative; min-height: 550px; overflow: hidden; }
+#photo-canvas { width: 100%; height: 100%; position: absolute; inset: 0; display: block; touch-action: none; cursor: grab; }
+#photo-canvas:active { cursor: grabbing; }
+.scene-heading { position: absolute; top: 30px; left: 36px; pointer-events: none; text-shadow: 0 2px 12px #101313; }
+h1 { font-size: 30px; font-weight: 500; line-height: 1.15; margin: 0 0 12px; }
+#scene-state { font-size: 11px; background: #101313d9; padding: 5px 8px; border-left: 2px solid #bce786; }
+#scene-caption { position: absolute; bottom: 22px; left: 36px; right: 28px; display: flex; justify-content: space-between; gap: 14px; font-size: 12px; color: #a0b1a6; pointer-events: none; }
+#displayed-name { max-width: 55%; overflow-wrap: anywhere; }
+.drop-overlay { display: none; position: absolute; inset: 12px; border: 2px dashed #bce786; background: #101313cc; place-items: center; pointer-events: none; }
+.dragover .drop-overlay { display: grid; }
+aside { background: #171c19; border-left: 1px solid #303632; padding: 30px 24px; display: flex; flex-direction: column; }
+.section-title { display: flex; align-items: center; gap: 10px; margin: 0 0 20px; }
+.step { color: #93a198; font: 11px ui-monospace, monospace; }
+h2 { font-size: 14px; font-weight: 550; margin: 0; }
+.upload { display: flex; gap: 12px; align-items: center; padding: 10px; text-align: left; width: 100%; min-width: 0; }
+.upload img { width: 48px; height: 56px; object-fit: cover; border-radius: 3px; }
+.upload > span { min-width: 0; flex: 1; }
+.upload strong { display: block; font-size: 12px; font-weight: 500; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; }
+.upload span span { display: block; font-size: 11px; color: #a0b1a6; margin-top: 6px; }
+.text-button { border: 0; align-self: flex-start; font-size: 12px; color: #b6c7ba; padding: 12px 0; margin-bottom: 12px; }
+.primary { display: flex; justify-content: center; align-items: center; gap: 10px; min-height: 46px; background: #c3e98d; border-color: #c3e98d; color: #1b2b13; font-size: 13px; font-weight: 650; }
+.primary:hover:not(:disabled) { background: #d1f1a8; }
+.run-state { font-size: 11px; color: #a0b1a6; min-height: 92px; padding: 14px 0 20px; display: flex; flex-direction: column; gap: 7px; }
+progress { width: 100%; height: 3px; accent-color: #c3e98d; }
+#error { color: #f6aeaa; font-size: 12px; line-height: 1.5; margin: 0 0 20px; overflow-wrap: anywhere; }
+fieldset { padding: 0; margin: 0; border: 0; min-width: 0; }
+.segmented { display: flex; padding: 3px; border: 1px solid #39413e; border-radius: 6px; }
+.segmented button { display: flex; flex: 1; gap: 7px; justify-content: center; align-items: center; min-height: 38px; font-size: 12px; border: 0; }
+.segmented button[aria-pressed="true"] { background: #364438; color: #e1f5cb; }
+.zoom-label { display: flex; justify-content: space-between; margin: 23px 0 12px; font-size: 12px; }
+output { color: #a0b1a6; font: 11px ui-monospace, monospace; }
+input[type="range"] { width: 100%; margin: 0; accent-color: #c3e98d; }
+.view-row { display: flex; align-items: center; gap: 8px; margin-top: 23px; font-size: 12px; }
+select { min-width: 0; width: 100%; background: #202923; color: #dde6dd; border: 1px solid #39413e; border-radius: 4px; padding: 9px 3px; font-size: 11px; }
+.icon-button { flex-shrink: 0; width: 36px; height: 36px; display: grid; place-items: center; }
+.model-info { display: flex; gap: 9px; align-items: flex-start; font-size: 11px; margin-top: auto; padding-top: 42px; color: #b6c7ba; }
+.model-info span span { display: block; color: #7e9385; margin-top: 6px; }
+.dot { width: 6px; height: 6px; background: #88baa5; border-radius: 50%; margin-top: 4px; }
+footer { min-height: 54px; padding: 16px 36px; border-top: 1px solid #303632; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px; color: #8c9b92; font-size: 11px; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+[hidden] { display: none !important; }
+#debug-output { white-space: pre-wrap; padding: 20px; font-size: 11px; }
+@media(max-width: 760px) {
+  header { height: 72px; padding: 0 20px; }
+  .brand { font-size: 24px; gap: 7px; }
+  nav { gap: 14px; font-size: 11px; }
+  .workspace { grid-template-columns: 1fr; }
+  .scene { height: 62svh; min-height: 360px; }
+  .scene-heading { left: 20px; top: 22px; }
+  h1 { font-size: 24px; }
+  #scene-caption { left: 20px; right: 20px; bottom: 14px; font-size: 10px; }
+  aside { padding: 22px 20px; border-left: 0; border-top: 1px solid #303632; }
+  .run-state { min-height: 70px; }
+  .model-info { padding-top: 26px; }
+  footer { padding: 18px 20px; }
+}

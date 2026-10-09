@@ -1,123 +1,47 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>MoGe-WebGPU — Browser-Native Depth Estimation</title>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      font-family: system-ui, -apple-system, sans-serif;
-      background: #0a0a0a;
-      color: #e0e0e0;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      min-height: 100vh;
-    }
-    header {
-      padding: 2rem;
-      text-align: center;
-    }
-    h1 { font-size: 1.8rem; font-weight: 600; }
-    .subtitle { color: #888; margin-top: 0.3rem; font-size: 0.9rem; }
-    #drop-zone {
-      width: 512px;
-      height: 320px;
-      border: 2px dashed #444;
-      border-radius: 12px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      cursor: pointer;
-      transition: border-color 0.2s;
-      margin: 1rem;
-    }
-    #drop-zone:hover, #drop-zone.dragover { border-color: #6af; }
-    #drop-zone p { color: #666; font-size: 1rem; }
-    #status {
-      padding: 1rem;
-      color: #aaa;
-      font-size: 0.85rem;
-      max-width: 600px;
-      text-align: center;
-    }
-    #output {
-      display: none;
-      gap: 1rem;
-      padding: 1rem;
-      flex-wrap: wrap;
-      justify-content: center;
-    }
-    #output.visible { display: flex; }
-    .output-panel {
-      background: #1a1a1a;
-      border-radius: 8px;
-      padding: 0.5rem;
-    }
-    .output-panel h3 {
-      font-size: 0.75rem;
-      color: #888;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      margin-bottom: 0.5rem;
-    }
-    canvas { border-radius: 4px; display: block; }
-    #pointcloud-canvas {
-      width: 512px;
-      height: 384px;
-      cursor: grab;
-    }
-    #pointcloud-canvas:active { cursor: grabbing; }
-    #error {
-      color: #f66;
-      padding: 1rem;
-      max-width: 600px;
-      text-align: center;
-      display: none;
-    }
-  </style>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Turn a photograph into an interactive depth scene with MoGe-2, running locally in your browser with the Kaminos WebGPU Inference Kit.">
+  <title>MoGe | A photograph, with depth</title>
+  <link rel="icon" href="data:,">
 </head>
 <body>
   <header>
-    <h1>MoGe-WebGPU</h1>
-    <p class="subtitle">Single-image depth estimation running entirely in your browser via WebGPU compute shaders</p>
+    <a class="brand" href="./">MoGe<span>by Kaminos</span></a>
+    <nav aria-label="Project"><a href="https://github.com/lyonsno/kaminos/tree/main/webgpu-inference-kit">Inference Kit <i data-lucide="arrow-up-right"></i></a><a href="https://github.com/lyonsno/moge-webgpu" aria-label="Source on GitHub" title="Source on GitHub"><i data-lucide="code-xml"></i></a></nav>
   </header>
-
-  <div id="drop-zone">
-    <p>Drop an image here or click to upload</p>
-    <input type="file" id="file-input" accept="image/*" hidden>
-  </div>
-
-  <div id="status"></div>
-  <div id="error"></div>
-  <!-- Diagnostics panel; hidden unless the page is opened with ?debug=1 -->
-  <pre id="debug-output" style="display: none; color: #0f0; background: #111; padding: 1rem; max-width: 800px; font-size: 0.75rem; border-radius: 8px; white-space: pre-wrap;"></pre>
-  <script>
-    if (new URLSearchParams(location.search).get('debug')) {
-      document.getElementById('debug-output').style.display = 'block';
-    }
-  </script>
-
-  <div id="output">
-    <div class="output-panel">
-      <h3>Input</h3>
-      <canvas id="input-canvas" width="256" height="256"></canvas>
-    </div>
-    <div class="output-panel">
-      <h3>Depth</h3>
-      <canvas id="depth-canvas" width="256" height="256"></canvas>
-    </div>
-    <div class="output-panel">
-      <h3>Normals</h3>
-      <canvas id="normal-canvas" width="256" height="256"></canvas>
-    </div>
-    <div class="output-panel">
-      <h3>3D Pointcloud</h3>
-      <canvas id="pointcloud-canvas" width="512" height="384"></canvas>
-    </div>
-  </div>
-
+  <main>
+    <section class="workspace" aria-label="Interactive photograph">
+      <div class="scene" id="drop-zone">
+        <canvas id="photo-canvas" tabindex="0" aria-label="Photograph depth scene. Arrow keys move the camera or light; Home resets the view."></canvas>
+        <div class="scene-heading"><h1>A photograph,<br>with depth.</h1><span id="scene-state">Original photograph</span></div>
+        <div id="scene-caption"><span id="displayed-name">Celebration</span><span id="result-detail">MoGe-2 / WebGPU</span></div>
+        <div class="drop-overlay">Open photograph</div>
+      </div>
+      <aside>
+        <div class="section-title"><span class="step">01</span><h2>Photograph</h2></div>
+        <button id="upload-button" class="upload"><img id="selected-image" src="/test_fixtures/input.png" alt="Selected photograph"><span><strong id="selected-name">Celebration</strong><span>Choose photograph</span></span><i data-lucide="image-plus"></i></button>
+        <input type="file" id="file-input" accept="image/*" hidden>
+        <button id="sample-button" class="text-button">Use example</button>
+        <button id="run-button" class="primary" disabled><i data-lucide="scan"></i><span>Reveal depth</span></button>
+        <div class="run-state"><span id="status" role="status" aria-live="polite">Loading photograph</span><progress id="progress" hidden></progress><span id="elapsed"></span></div>
+        <div id="error" role="alert" hidden></div>
+        <div class="section-title"><span class="step">02</span><h2>Explore</h2></div>
+        <fieldset id="explore-controls" disabled>
+          <legend class="sr-only">Scene controls</legend>
+          <div class="segmented" aria-label="Interaction"><button data-tool="move" aria-pressed="true" title="Move camera"><i data-lucide="move-3d"></i>Move</button><button data-tool="light" aria-pressed="false" title="Move light"><i data-lucide="sun"></i>Relight</button></div>
+          <label class="zoom-label" for="zoom">Distance <output id="zoom-value">1.00</output></label>
+          <input id="zoom" type="range" min="0.7" max="1.5" step="0.01" value="1">
+          <div class="view-row"><label for="view">View</label><select id="view"><option value="photo">Photograph + depth</option><option value="original">Original photograph</option><option value="depth">Depth map</option><option value="normals">Surface normals</option></select><button id="reset" class="icon-button" title="Reset camera and light" aria-label="Reset camera and light"><i data-lucide="rotate-ccw"></i></button></div>
+        </fieldset>
+        <div class="model-info"><span class="dot"></span><span>MoGe-2 ViT-Large<span>Local WebGPU inference</span></span></div>
+      </aside>
+    </section>
+  </main>
+  <footer><span>Kaminos WebGPU Inference Kit</span><span>Depth &amp; surface normals from one image</span></footer>
+  <pre id="debug-output" hidden></pre>
   <script type="module" src="/src/main.js"></script>
 </body>
 </html>

@@ -1,191 +1,124 @@
-/**
- * MoGe-WebGPU — Main entry point
- *
- * MoGe-2 (DINOv2 ViT-Large + ConvStack decoder) inference in WebGPU compute.
- * Produces depth, surface normals, and interactive 3D pointcloud from a single image.
- */
-
+import './style.css';
+import { createIcons, ArrowUpRight, CodeXml, ImagePlus, Scan, Move3d, Sun, RotateCcw } from 'lucide';
 import { initGPU } from './lib/gpu.js';
 import { MoGeInference } from './lib/inference.js';
-import { PointcloudRenderer } from './lib/pointcloud.js';
+import { PhotoViewer } from './lib/photo-viewer.js';
 
-let gpu = null;
-let inference = null;
-let pointcloudRenderer = null;
-let handlingImage = false;
+createIcons({ icons: { ArrowUpRight, CodeXml, ImagePlus, Scan, Move3d, Sun, RotateCcw } });
+const $ = id => document.getElementById(id);
+let viewer, gpu, inference, selected, busy = false, selection = 0, timer;
+const sampleUrl = `${import.meta.env.BASE_URL}test_fixtures/input.png`;
+const debug = new URLSearchParams(location.search).has('debug');
+$('debug-output').hidden = !debug;
 
-const dropZone = document.getElementById('drop-zone');
-const fileInput = document.getElementById('file-input');
-const statusEl = document.getElementById('status');
-const errorEl = document.getElementById('error');
-const outputEl = document.getElementById('output');
-
-function setStatus(msg) {
-  statusEl.textContent = msg;
-  errorEl.style.display = 'none';
+function status(message) { $('status').textContent = message; }
+function error(err) { $('error').textContent = err.message; $('error').hidden = false; console.error(err); }
+function setBusy(value) {
+  busy = value;
+  for (const id of ['upload-button', 'sample-button', 'run-button', 'file-input']) $(id).disabled = value;
+  $('run-button').querySelector('span').textContent = value ? 'Processing' : 'Reveal depth';
+  $('progress').hidden = !value;
+  $('progress').removeAttribute('value');
 }
 
-function setError(msg) {
-  errorEl.textContent = msg;
-  errorEl.style.display = 'block';
-  statusEl.textContent = '';
+async function selectImage(blob, name) {
+  if (busy) return;
+  const ticket = ++selection;
+  const bitmap = await createImageBitmap(blob);
+  if (ticket !== selection || busy) { bitmap.close(); return; }
+  const canvas = document.createElement('canvas');
+  canvas.width = bitmap.width; canvas.height = bitmap.height;
+  canvas.getContext('2d').drawImage(bitmap, 0, 0); bitmap.close();
+  selected = { canvas, name };
+  $('selected-image').src = canvas.toDataURL('image/jpeg');
+  $('selected-name').textContent = name;
+  $('run-button').disabled = false;
+  $('error').hidden = true;
+  if (!viewer.hasDepth) { viewer.setImage(canvas); $('displayed-name').textContent = name; }
+  status(inference ? 'Model loaded' : 'First run downloads model weights (~660 MB)');
 }
 
-// --- Drop zone ---
-dropZone.addEventListener('click', () => fileInput.click());
-dropZone.addEventListener('dragover', (e) => {
-  e.preventDefault();
-  dropZone.classList.add('dragover');
-});
-dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
-dropZone.addEventListener('drop', (e) => {
-  e.preventDefault();
-  dropZone.classList.remove('dragover');
-  const file = e.dataTransfer.files[0];
-  if (file && file.type.startsWith('image/')) handleImage(file);
-});
-fileInput.addEventListener('change', () => {
-  if (fileInput.files[0]) handleImage(fileInput.files[0]);
-});
+async function useExample() {
+  if (busy) return;
+  const response = await fetch(sampleUrl);
+  if (!response.ok) throw new Error(`Example photograph could not load (${response.status})`);
+  await selectImage(await response.blob(), 'Celebration');
+}
 
-async function handleImage(file) {
-  if (handlingImage) {
-    errorEl.textContent = 'An image is already processing. Please wait before choosing another.';
-    errorEl.style.display = 'block';
-    return;
-  }
-  handlingImage = true;
+async function run() {
+  if (busy || !selected) return;
+  const input = selected;
+  setBusy(true); $('error').hidden = true;
+  const start = performance.now();
+  window.__mogePhoto = { phase: 'running', name: input.name };
+  timer = setInterval(() => { $('elapsed').textContent = `${((performance.now() - start) / 1000).toFixed(1)} s elapsed`; }, 100);
+  let phase = 'device';
   try {
-    setStatus('Initializing WebGPU...');
-    if (!gpu) {
-      gpu = await initGPU();
-    }
-
-    setStatus('Loading image...');
-    const bitmap = await createImageBitmap(file);
-
-    // Pass original image to inference — run() handles resize to model input size
-    const inputCanvas = document.getElementById('input-canvas');
-    inputCanvas.width = bitmap.width;
-    inputCanvas.height = bitmap.height;
-    const ctx = inputCanvas.getContext('2d');
-    ctx.drawImage(bitmap, 0, 0);
-    const imageData = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
-
+    status('Connecting to WebGPU');
+    if (!gpu) gpu = await initGPU();
     if (!inference) {
-      inference = new MoGeInference(gpu);
-      setStatus('Loading MoGe-2 weights (622 MB, first load only)...');
-      await inference.init((received, total) => {
-        const mb = (received / 1024 / 1024).toFixed(0);
-        const totalMb = (total / 1024 / 1024).toFixed(0);
-        setStatus(`Loading weights: ${mb} / ${totalMb} MB`);
-      });
+      phase = 'weights'; status('Loading model weights');
+      const candidate = new MoGeInference(gpu);
+      try {
+        await candidate.init((received, total) => {
+          status(`Loading weights: ${(received / 1048576).toFixed(0)} MB${total > 0 ? ` / ${(total / 1048576).toFixed(0)} MB` : ''}`);
+          if (total > 0) { $('progress').max = total; $('progress').value = received; }
+        });
+        inference = candidate;
+      } catch (err) { await candidate.dispose(); throw err; }
     }
-
-    setStatus('Running MoGe-2 inference...');
-
+    phase = 'inference'; status('Estimating depth and surface normals'); $('progress').removeAttribute('value');
+    const imageData = input.canvas.getContext('2d').getImageData(0, 0, input.canvas.width, input.canvas.height);
     const t0 = performance.now();
-    const result = await inference.run(imageData);
-    window.__mogeResult = result; // for automated harnesses (tools/test_depth_parity.mjs)
-    const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
-
-    setStatus(`Inference complete in ${elapsed}s`);
-
-    // Display depth map (output may be different size than input)
-    displayDepthMap(result.depth, result.width, result.height);
-
-    // Display normal map
-    displayNormalMap(result.normals, result.width, result.height);
-
-    // Display pointcloud
-    if (!pointcloudRenderer) {
-      const pcCanvas = document.getElementById('pointcloud-canvas');
-      pointcloudRenderer = new PointcloudRenderer(gpu, pcCanvas);
-      await pointcloudRenderer.init();
-    }
-    pointcloudRenderer.setPoints(result.points, result.colors);
-
-    outputEl.classList.add('visible');
-
-    // Write diagnostics to a visible element
-    const debugEl = document.getElementById('debug-output');
-    if (debugEl) {
-      const dbg = window.__mogeDebug || {};
-      // Add depth range info
-      let dMin = Infinity, dMax = -Infinity;
-      for (let i = 0; i < result.depth.length; i++) {
-        if (isFinite(result.depth[i])) {
-          dMin = Math.min(dMin, result.depth[i]);
-          dMax = Math.max(dMax, result.depth[i]);
-        }
-      }
-      dbg.depthRange = `[${dMin.toFixed(4)}, ${dMax.toFixed(4)}]`;
-      dbg.outputSize = `${result.width}x${result.height}`;
-      dbg.elapsed = elapsed + 's';
-      debugEl.textContent = JSON.stringify(dbg, null, 2);
-    }
-  } catch (e) {
-    setError(`Error: ${e.message}`);
-    console.error(e);
-    // Also write errors to debug output
-    const debugEl = document.getElementById('debug-output');
-    if (debugEl) {
-      debugEl.textContent = JSON.stringify({ error: e.message, stack: e.stack }, null, 2);
-    }
-  } finally {
-    handlingImage = false;
-  }
+    const result = await inference.run(imageData, { scheduler: {
+      mode: 'cooperative', splitVitBlocks: true, splitDecoderResBlocks: true, pacing: 'bounded-prefix',
+    } });
+    const seconds = (performance.now() - t0) / 1000;
+    phase = 'surface'; status('Opening depth surface');
+    await new Promise(resolve => requestAnimationFrame(() => setTimeout(resolve, 0)));
+    viewer.setImage(input.canvas, result);
+    viewer.view = 'photo'; $('view').value = 'photo';
+    $('zoom').value = 1; $('zoom-value').value = '1.00';
+    $('explore-controls').disabled = false;
+    $('scene-state').textContent = 'Inferred depth';
+    $('displayed-name').textContent = input.name;
+    $('result-detail').textContent = `${result.width} × ${result.height} / ${seconds.toFixed(2)} s`;
+    status('Depth complete');
+    window.__mogeResult = result;
+    window.__mogePhoto = { phase: 'complete', seconds, name: input.name, width: result.width, height: result.height };
+    if (debug) $('debug-output').textContent = JSON.stringify({ ...window.__mogePhoto, debug: window.__mogeDebug }, null, 2);
+  } catch (err) {
+    error(err); status(`Stopped during ${phase}`);
+    window.__mogePhoto = { phase, error: err.message };
+    if (debug) $('debug-output').textContent = JSON.stringify(window.__mogePhoto, null, 2);
+  } finally { clearInterval(timer); setBusy(false); }
 }
 
-function displayDepthMap(depth, w, h) {
-  const canvas = document.getElementById('depth-canvas');
-  canvas.width = w;
-  canvas.height = h;
-  const ctx = canvas.getContext('2d');
-  const img = ctx.createImageData(w, h);
-
-  // Use percentile-based normalization for robust display
-  const finiteVals = [];
-  for (let i = 0; i < depth.length; i++) {
-    if (isFinite(depth[i])) finiteVals.push(depth[i]);
-  }
-  finiteVals.sort((a, b) => a - b);
-  const p2 = finiteVals[Math.floor(finiteVals.length * 0.02)] || 0;
-  const p98 = finiteVals[Math.floor(finiteVals.length * 0.98)] || 1;
-  const min = p2;
-  const range = (p98 - p2) || 1;
-
-  // Viridis-ish colormap: near=warm yellow, far=cool blue
-  for (let i = 0; i < depth.length; i++) {
-    const v = depth[i];
-    const t = isFinite(v) ? Math.max(0, Math.min(1, (v - min) / range)) : 0;
-    const idx = i * 4;
-    // Near (low depth) = warm, far (high depth) = cool
-    img.data[idx + 0] = Math.floor((1 - t) * 255);
-    img.data[idx + 1] = Math.floor(Math.sin(t * Math.PI) * 200);
-    img.data[idx + 2] = Math.floor(t * 255);
-    img.data[idx + 3] = isFinite(v) ? 255 : 0;
-  }
-  ctx.putImageData(img, 0, 0);
-}
-
-function displayNormalMap(normals, w, h) {
-  const canvas = document.getElementById('normal-canvas');
-  canvas.width = w;
-  canvas.height = h;
-  const ctx = canvas.getContext('2d');
-  const img = ctx.createImageData(w, h);
-
-  for (let i = 0; i < w * h; i++) {
-    const nx = normals[i * 3 + 0];
-    const ny = normals[i * 3 + 1];
-    const nz = normals[i * 3 + 2];
-    const idx = i * 4;
-    // Standard normal map coloring: (n+1)/2 * 255
-    img.data[idx + 0] = Math.floor((nx * 0.5 + 0.5) * 255);
-    img.data[idx + 1] = Math.floor((ny * 0.5 + 0.5) * 255);
-    img.data[idx + 2] = Math.floor((nz * 0.5 + 0.5) * 255);
-    img.data[idx + 3] = 255;
-  }
-  ctx.putImageData(img, 0, 0);
-}
+$('upload-button').onclick = () => $('file-input').click();
+$('file-input').onchange = () => {
+  const file = $('file-input').files[0]; $('file-input').value = '';
+  if (file) selectImage(file, file.name).catch(error);
+};
+$('sample-button').onclick = () => useExample().catch(error);
+$('run-button').onclick = run;
+const drop = $('drop-zone');
+drop.addEventListener('dragover', e => { e.preventDefault(); if (!busy) drop.classList.add('dragover'); });
+drop.addEventListener('dragleave', () => drop.classList.remove('dragover'));
+drop.addEventListener('drop', e => {
+  e.preventDefault(); drop.classList.remove('dragover');
+  if (busy) return;
+  const file = e.dataTransfer.files[0];
+  if (file) selectImage(file, file.name).catch(error);
+});
+for (const button of document.querySelectorAll('[data-tool]')) button.onclick = () => {
+  viewer.mode = button.dataset.tool;
+  for (const other of document.querySelectorAll('[data-tool]')) other.setAttribute('aria-pressed', String(other === button));
+};
+$('zoom').oninput = () => { viewer.zoom = Number($('zoom').value); $('zoom-value').value = viewer.zoom.toFixed(2); };
+$('view').onchange = () => { viewer.view = $('view').value; };
+$('reset').onclick = () => { viewer.reset(); $('zoom').value = 1; $('zoom-value').value = '1.00'; };
+try {
+  viewer = new PhotoViewer($('photo-canvas'));
+  await useExample();
+  if (!navigator.gpu) { status('WebGPU unavailable in this browser'); $('run-button').disabled = true; }
+} catch (err) { error(err); status('Photograph viewer could not start'); }
