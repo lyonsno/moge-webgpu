@@ -4,6 +4,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import puppeteer from 'puppeteer-core';
+import { uploadAndRunPhoto } from './photo_app_driver.mjs';
 
 const out = path.resolve(process.env.PHOTO_SMOKE_OUT || '/tmp/moge-photo-smoke');
 await fs.mkdir(out, { recursive: true });
@@ -37,8 +38,7 @@ try {
   assert.ok(pixels.max - pixels.min > 50, 'Photograph canvas must have visible image detail');
   if (report.infer) {
     report.phase = 'inference';
-    await page.click('#run-button');
-    await page.waitForFunction(() => window.__mogePhoto?.phase !== 'running', { timeout: 0 });
+    await uploadAndRunPhoto(page, path.resolve('public/test_fixtures/input.png'));
     report.firstRun = await page.evaluate(() => ({ ...window.__mogePhoto,
       validDepth: window.__mogeResult && [...window.__mogeResult.depth].filter(d => Number.isFinite(d) && d > 0).length,
       scheduler: window.__mogeResult?.schedulerVerificationReceipt,
@@ -70,6 +70,23 @@ try {
     report.repeatRun = await page.evaluate(() => window.__mogePhoto);
     assert.equal(report.repeatRun.phase, 'complete');
     report.interactionHashes = { home, moved, lit };
+    report.phase = 'monolithic-parity';
+    report.parity = await page.evaluate(async () => {
+      const input = window.__mogeInputCanvas;
+      const data = input.getContext('2d').getImageData(0, 0, input.width, input.height);
+      const previous = window.__mogeResult;
+      const mono = await window.__mogeInference.run(data, { scheduler: { mode: 'monolithic' } });
+      if (mono.depth.length !== previous.depth.length) throw new Error('Monolithic depth shape changed');
+      let maxAbsDiff = 0;
+      for (let i = 0; i < mono.depth.length; i++) {
+        if (!Number.isFinite(mono.depth[i]) || !Number.isFinite(previous.depth[i])) throw new Error('Nonfinite depth');
+        maxAbsDiff = Math.max(maxAbsDiff, Math.abs(mono.depth[i] - previous.depth[i]));
+      }
+      return { maxAbsDiff, count: mono.depth.length,
+        monolithicSchedulerStatus: window.__mogeDebug?.webGpuRouteReceipt?.runtime?.schedulerVerification?.status };
+    });
+    assert.ok(report.parity.maxAbsDiff < 1e-5, 'Cooperative demo preserves monolithic depth');
+    assert.equal(report.parity.monolithicSchedulerStatus, 'scheduler-unverified', 'Monolithic negative baseline is explicit');
   }
   report.phase = 'mobile';
   await page.setViewport({ width: 390, height: 844, deviceScaleFactor: 2, isMobile: true, hasTouch: true });
