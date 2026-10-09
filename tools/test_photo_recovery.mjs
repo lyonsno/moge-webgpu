@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import puppeteer from 'puppeteer-core';
 import path from 'node:path';
+import { mkdir } from 'node:fs/promises';
 
 const executablePath = process.env.CHROME_PATH;
 assert.ok(executablePath && !executablePath.includes('/Applications/Google Chrome.app/'));
@@ -32,6 +33,31 @@ try {
   await page.click('#run-button');
   await page.waitForFunction(() => window.__mogePhoto?.phase === 'complete');
   assert.equal(await page.$eval('#explore-controls', el => el.disabled), false);
+  assert.match(await page.$eval('#status', el => el.textContent), /^Inference: [\d.]+ s$/);
+  assert.match(await page.$eval('#elapsed', el => el.textContent), /^Total: [\d.]+ s \(including preparation\)$/);
+  assert.equal(await page.$eval('aside', el => el.firstElementChild.id), 'explore-section');
+  assert.equal(await page.$eval('#run-button', el => el.classList.contains('primary')), false);
+  assert.equal(await page.$eval('#run-button span', el => el.textContent), 'Run again');
+  assert.match(await page.$eval('#result-detail', el => el.textContent), /inference/);
+  await page.$eval('#zoom', el => { el.value = '1.2'; el.dispatchEvent(new Event('input')); });
+  assert.equal(await page.$eval('#zoom-value', el => el.value), '1.20x');
+  await page.click('#reset');
+  assert.equal(await page.$eval('#zoom-value', el => el.value), '1.00x');
+  if (process.env.PHOTO_UI_OUT) {
+    await mkdir(process.env.PHOTO_UI_OUT, { recursive: true });
+    for (const [name, width, height] of [['desktop', 1440, 960], ['narrow', 390, 844]]) {
+      await page.setViewport({ width, height });
+      await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+      const bounds = await page.evaluate(() => {
+        const a = document.getElementById('explore-section').getBoundingClientRect();
+        const b = document.getElementById('photograph-section').getBoundingClientRect();
+        return { bottom: a.bottom, nextTop: b.top };
+      });
+      assert.ok(bounds.bottom <= bounds.nextTop, 'Explore and photograph controls cannot overlap');
+      await page.screenshot({ path: path.join(process.env.PHOTO_UI_OUT, `${name}-synthetic-result.png`), fullPage: true });
+    }
+  }
   await page.evaluate(() => { window.__testPrevious = window.__mogeResult; window.__testRejectNext = true; });
   await page.click('#run-button');
   await page.waitForFunction(() => window.__mogePhoto?.phase === 'inference');
@@ -73,5 +99,7 @@ try {
   await request.continue();
   await page.waitForNetworkIdle();
   assert.equal(await page.$eval('#selected-name', el => el.textContent), 'input.png', 'Older example fetch cannot replace newer selection');
+  assert.equal(await page.$eval('#run-button', el => el.classList.contains('primary')), true, 'New image restores the main action');
+  assert.equal(await page.$eval('#elapsed', el => el.textContent), '', 'Selection must clear the previous run total');
   console.log('Photo recovery: simulated fallback refused, retry, retained result after simulated failure, repeat passed (synthetic controller test only)');
 } finally { await browser.close(); }

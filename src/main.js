@@ -6,7 +6,7 @@ import { PhotoViewer } from './lib/photo-viewer.js';
 
 createIcons({ icons: { ArrowUpRight, CodeXml, ImagePlus, Scan, Move3d, Sun, RotateCcw } });
 const $ = id => document.getElementById(id);
-let viewer, gpu, inference, selected, busy = false, selection = 0, timer;
+let viewer, gpu, inference, selected, completedInput, busy = false, selection = 0, timer;
 const sampleUrl = `${import.meta.env.BASE_URL}test_fixtures/input.png`;
 const debug = new URLSearchParams(location.search).has('debug');
 $('debug-output').hidden = !debug;
@@ -17,7 +17,9 @@ function setBusy(value) {
   busy = value;
   for (const id of ['upload-button', 'sample-button', 'run-button', 'file-input']) $(id).disabled = value;
   $('run-button').disabled = value || !navigator.gpu || !selected;
-  $('run-button').querySelector('span').textContent = value ? 'Processing' : 'Reveal depth';
+  const pending = selected !== completedInput;
+  $('run-button').classList.toggle('primary', !viewer?.hasDepth || pending);
+  $('run-button').querySelector('span').textContent = value ? 'Processing' : pending ? 'Reveal depth' : 'Run again';
   $('progress').hidden = !value;
   $('progress').removeAttribute('value');
 }
@@ -30,12 +32,14 @@ async function selectImage(blob, name, ticket = ++selection) {
   canvas.width = bitmap.width; canvas.height = bitmap.height;
   canvas.getContext('2d').drawImage(bitmap, 0, 0); bitmap.close();
   selected = { canvas, name };
+  $('elapsed').textContent = '';
   $('selected-image').src = canvas.toDataURL('image/jpeg');
   $('selected-name').textContent = name;
   $('run-button').disabled = !navigator.gpu;
   $('error').hidden = true;
   if (!viewer.hasDepth) { viewer.setImage(canvas); $('displayed-name').textContent = name; }
   status(inference ? 'Model loaded' : 'First run downloads model weights (~660 MB)');
+  setBusy(false);
 }
 
 async function useExample() {
@@ -52,8 +56,10 @@ async function run() {
   const input = selected;
   setBusy(true); $('error').hidden = true;
   const start = performance.now();
+  const updateElapsed = () => { $('elapsed').textContent = `Total: ${((performance.now() - start) / 1000).toFixed(1)} s (including preparation)`; };
+  updateElapsed();
   window.__mogePhoto = { phase: 'running', name: input.name };
-  timer = setInterval(() => { $('elapsed').textContent = `${((performance.now() - start) / 1000).toFixed(1)} s elapsed`; }, 100);
+  timer = setInterval(updateElapsed, 100);
   let phase = 'device';
   try {
     status('Connecting to WebGPU');
@@ -82,12 +88,15 @@ async function run() {
     await new Promise(resolve => requestAnimationFrame(() => setTimeout(resolve, 0)));
     viewer.setImage(input.canvas, result);
     viewer.view = 'photo'; $('view').value = 'photo';
-    $('zoom').value = 1; $('zoom-value').value = '1.00';
+    $('zoom').value = 1; $('zoom-value').value = '1.00x';
     $('explore-controls').disabled = false;
     $('scene-state').textContent = 'Inferred depth';
     $('displayed-name').textContent = input.name;
-    $('result-detail').textContent = `${result.width} × ${result.height} / ${seconds.toFixed(2)} s`;
-    status('Depth complete');
+    $('result-detail').textContent = `${result.width} × ${result.height} / ${seconds.toFixed(2)} s inference`;
+    status(`Inference: ${seconds.toFixed(2)} s`);
+    completedInput = input;
+    document.body.classList.add('has-result');
+    $('photograph-section').before($('explore-section'));
     window.__mogeResult = result;
     Object.assign(window.__mogeDebug || (window.__mogeDebug = {}), { elapsed: `${seconds}s`, outputSize: `${result.width}x${result.height}` });
     window.__mogePhoto = { phase: 'complete', seconds, name: input.name, width: result.width, height: result.height };
@@ -96,7 +105,7 @@ async function run() {
     error(err); status(`Stopped during ${phase}`);
     window.__mogePhoto = { phase, error: err.message };
     if (debug) $('debug-output').textContent = JSON.stringify(window.__mogePhoto, null, 2);
-  } finally { clearInterval(timer); setBusy(false); }
+  } finally { clearInterval(timer); updateElapsed(); setBusy(false); }
 }
 
 $('upload-button').onclick = () => $('file-input').click();
@@ -119,9 +128,9 @@ for (const button of document.querySelectorAll('[data-tool]')) button.onclick = 
   viewer.mode = button.dataset.tool;
   for (const other of document.querySelectorAll('[data-tool]')) other.setAttribute('aria-pressed', String(other === button));
 };
-$('zoom').oninput = () => { viewer.zoom = Number($('zoom').value); $('zoom-value').value = viewer.zoom.toFixed(2); };
+$('zoom').oninput = () => { const zoom = Number($('zoom').value); viewer.zoom = 1 / zoom; $('zoom-value').value = `${zoom.toFixed(2)}x`; };
 $('view').onchange = () => { viewer.view = $('view').value; };
-$('reset').onclick = () => { viewer.reset(); $('zoom').value = 1; $('zoom-value').value = '1.00'; };
+$('reset').onclick = () => { viewer.reset(); $('zoom').value = 1; $('zoom-value').value = '1.00x'; };
 try {
   viewer = new PhotoViewer($('photo-canvas'));
   await useExample();
