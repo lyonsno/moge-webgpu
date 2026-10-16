@@ -90,7 +90,9 @@ aligns rAF frame gaps with submit→retire occupancy spans).
 
 `npm run build:lib` produces `dist-lib/moge-inference.js`: a single
 self-contained ES module (WGSL inlined, no bundler needed on the host) that
-runs inference on a device the host owns:
+runs in your browser application.
+
+The standalone module runs on a GPU device your application owns. By default, it downloads hosted weights; pass `{ weightsUrl }` as the constructor's second argument to use your own copy. Loading and initialization errors reject rather than substituting synthetic output. Keep the instance for repeated runs, then call `dispose()` to release its resources without destroying your device.
 
 ```js
 import { MoGeInference, initGPU, borrowedDeviceBackendIdentity } from './moge-inference.js';
@@ -101,7 +103,7 @@ const gpu = await initGPU();
 // const gpu = { device, adapter, backendIdentity: borrowedDeviceBackendIdentity({ adapter, device }) };
 
 const inference = new MoGeInference(gpu);
-await inference.init(progress => {});  // weights stream from HuggingFace if no local copy
+await inference.init(progress => {});
 await inference.warmUp();               // optional: one discarded cooperative run so the
                                         // first visible run is steady state (pipelines
                                         // dispatched, bind groups built, buffer pool filled)
