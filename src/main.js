@@ -12,6 +12,16 @@ const debug = new URLSearchParams(location.search).has('debug');
 $('debug-output').hidden = !debug;
 
 function status(message) { $('status').textContent = message; }
+async function demoWeightsOptions() {
+  // Local development convenience belongs to this page, not embedded apps.
+  try {
+    const response = await fetch('/weights.bin', { method: 'HEAD' });
+    if (response.ok && !(response.headers.get('content-type') || '').includes('text/html')) {
+      return { weightsUrl: '/weights.bin' };
+    }
+  } catch { /* The library's hosted default remains available. */ }
+  return {};
+}
 function error(err) { $('error').textContent = err.message; $('error').hidden = false; console.error(err); }
 function setBusy(value) {
   busy = value;
@@ -66,7 +76,7 @@ async function run() {
     if (!gpu) gpu = await initGPU();
     if (!inference) {
       phase = 'weights'; status('Loading model weights');
-      const candidate = new MoGeInference(gpu);
+      const candidate = new MoGeInference(gpu, await demoWeightsOptions());
       try {
         await candidate.init((received, total) => {
           status(`Loading weights: ${(received / 1048576).toFixed(0)} MB${total > 0 ? ` / ${(total / 1048576).toFixed(0)} MB` : ''}`);

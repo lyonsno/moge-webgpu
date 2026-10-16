@@ -2,8 +2,9 @@
  * Library entry for embedding MoGe-2 WebGPU inference in a host application.
  *
  * The host owns the GPUDevice (share it with a renderer/simulation) and passes
- * it to MoGeInference; weights stream from a local /weights.bin when present,
- * otherwise from the hosted HuggingFace copy. Cooperative scheduling is
+ * it to MoGeInference. The optional second argument selects weightsUrl;
+ * otherwise weights stream from the hosted HuggingFace copy. Loading errors
+ * reject init(); diagnosticStub must be selected explicitly. Scheduling is
  * requested per run via options.scheduler ({ mode: 'cooperative', yieldMs,
  * vitBlockChunkSize, waitForSubmittedWorkDone }).
  */
