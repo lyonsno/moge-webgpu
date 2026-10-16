@@ -888,22 +888,20 @@ async function dispatchConvStackProfiledResampler(device, encoder, inFeatures, w
 // Hosted fp16 weights (see tools/convert_weights.py for how they were produced).
 const HOSTED_WEIGHTS_URL = 'https://huggingface.co/lyonsno/moge-webgpu/resolve/main/weights.bin';
 
-// Prefer a locally converted public/weights.bin; fall back to the hosted copy.
-// Vite's SPA fallback answers missing files with 200 text/html, so a plain
-// fetch cannot distinguish "no local weights" from success — check content-type.
-async function resolveWeightsUrl() {
-  try {
-    const head = await fetch('/weights.bin', { method: 'HEAD' });
-    const type = head.headers.get('content-type') || '';
-    if (head.ok && !type.includes('text/html')) return '/weights.bin';
-  } catch (e) { /* fall through to hosted */ }
-  return HOSTED_WEIGHTS_URL;
-}
-
 export class MoGeInference {
-  constructor(gpu) {
+  constructor(gpu, { weightsUrl = HOSTED_WEIGHTS_URL, diagnosticStub = false } = {}) {
+    if (typeof weightsUrl !== 'string' || !weightsUrl.trim()) {
+      throw new TypeError('MoGe weightsUrl must be a nonempty string');
+    }
+    if (typeof diagnosticStub !== 'boolean') {
+      throw new TypeError('MoGe diagnosticStub must be a boolean');
+    }
     this.device = gpu.device;
     this.backendIdentity = gpu.backendIdentity || null;
+    this.weightsUrl = weightsUrl;
+    this.diagnosticStub = diagnosticStub;
+    this.useRealWeights = false;
+    this.weightsSource = null;
     this.weights = null;
     this.backbone = null;
     this._scope = createResourceScope(this.device);
@@ -916,54 +914,41 @@ export class MoGeInference {
 
   init(onProgress) {
     if (this._closing) return Promise.reject(new Error('MoGe instance is disposed'));
-    if (!this._initPromise) this._initPromise = this._initialize(onProgress).catch(error => {
-      this._scope.dispose();
-      this.weights = null;
-      this.backbone = null;
+    if (!this._initPromise) this._initPromise = this._initialize(onProgress).catch(async error => {
+      // Initialization can submit pipeline warm-up work before failing.
+      try {
+        await this.device.queue.onSubmittedWorkDone();
+      } finally {
+        this._scope.dispose();
+        this.weights = null;
+        this.backbone = null;
+        this.useRealWeights = false;
+        this.weightsSource = null;
+      }
       throw error;
     });
     return this._initPromise;
   }
 
   async _initialize(onProgress) {
-    try {
-      // Test hook: harnesses that assert stub-route semantics (e.g. the route
-      // receipt contract) opt in explicitly, since the hosted-weights fallback
-      // otherwise makes stub mode unreachable in any networked browser.
-      if (typeof location !== 'undefined' && new URLSearchParams(location.search).get('forceStub')) {
-        throw new Error('forced stub weights (forceStub test mode)');
-      }
-      const weightsUrl = await resolveWeightsUrl();
-      this.weights = await loadWeights(this._device, weightsUrl, onProgress);
-      this.useRealWeights = true;
-      this.weightsSource = weightsUrl === HOSTED_WEIGHTS_URL ? 'hosted' : 'local';
-      console.log(`Loaded real MoGe-2 weights (${this.weightsSource}: ${weightsUrl})`);
-
-      // Initialize backbone
-      this.backbone = new DINOv2Backbone(this._device);
-      this.backbone.init();
-      console.log('DINOv2 backbone initialized');
-
-      // Precompile decoder/utility pipelines so the first run does not pay
-      // synchronous Metal pipeline compilation mid-inference.
-      const warmed = await warmUpPipelines(this._device);
-      console.log(`Warmed ${warmed.length} compute pipelines`);
-
-      // Expose for console debugging
-      window.__mogeInference = this;
-    } catch (e) {
-      console.warn('Failed to load real weights, using stubs:', e.message);
-      // Partial real-weight/pipeline initialization owns resources too. Drop
-      // its entire cache key before constructing the explicitly labeled stub.
-      await this.device.queue.onSubmittedWorkDone();
-      this._scope.dispose();
-      this._scope = createResourceScope(this.device);
-      this._device = this._scope.device;
-      this.backbone = null;
-      this.weights = null;
+    if (this.diagnosticStub) {
       this.weights = this._createStubWeights();
-      this.useRealWeights = false;
+      this.weightsSource = 'diagnostic-stub';
+      return;
     }
+    this.weights = await loadWeights(this._device, this.weightsUrl, onProgress);
+    this.useRealWeights = true;
+    this.weightsSource = this.weightsUrl === HOSTED_WEIGHTS_URL ? 'hosted' : 'explicit';
+    console.log(`Loaded real MoGe-2 weights (${this.weightsSource}: ${this.weightsUrl})`);
+
+    this.backbone = new DINOv2Backbone(this._device);
+    this.backbone.init();
+    console.log('DINOv2 backbone initialized');
+
+    // Precompile pipelines before the first visible inference run.
+    const warmed = await warmUpPipelines(this._device);
+    console.log(`Warmed ${warmed.length} compute pipelines`);
+    if (typeof window !== 'undefined') window.__mogeInference = this;
   }
 
   // One invocation per instance. Separate instances may share the real device

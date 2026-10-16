@@ -37,9 +37,7 @@ async function main() {
   page.on('pageerror', err => console.error('PAGE ERROR:', err.message));
 
   try {
-    // forceStub: this harness asserts the stub-route receipt contract; without
-    // it, local or hosted real weights would load and status would be 'real'.
-    await page.goto(`http://127.0.0.1:${port}/?forceStub=1`, { waitUntil: 'networkidle0', timeout: 30000 });
+    await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'networkidle0', timeout: 30000 });
     const result = await page.evaluate(async () => {
       const inputResp = await fetch('/test_fixtures/input.png');
       const blob = await inputResp.blob();
@@ -54,7 +52,7 @@ async function main() {
       const { initGPU } = await import('/src/lib/gpu.js');
       const { MoGeInference } = await import('/src/lib/inference.js');
       const gpu = await initGPU();
-      const inf = new MoGeInference(gpu);
+      const inf = new MoGeInference(gpu, { diagnosticStub: true });
       await inf.init();
       await inf.run(imageData, {
         profileStagedGpu: true,

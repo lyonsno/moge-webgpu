@@ -32,7 +32,7 @@ COOP=$?
 node tools/test_depth_parity.mjs --port $PORT > "$OUT/parity.log" 2>&1
 PARITY=$?
 # The route-receipt harness asserts stub-route semantics; it opts into stub
-# mode explicitly via ?forceStub=1 (real/hosted weights would otherwise load).
+# mode explicitly via diagnosticStub (real/hosted weights otherwise load).
 node tools/test_webgpu_route_receipt.mjs --port $PORT > "$OUT/route_receipt.log" 2>&1
 RECEIPT=$?
 
