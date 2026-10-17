@@ -88,14 +88,18 @@ aligns rAF frame gaps with submit→retire occupancy spans).
 
 ## Embedding in a host application
 
-`npm run build:lib` produces `dist-lib/moge-inference.js`: a single
-self-contained ES module (WGSL inlined, no bundler needed on the host) that
-runs in your browser application.
+MoGe turns a photograph into depth, surface normals, and a 3D point map on your application's GPU. Install the package and pass it your application's GPU device. Hosted weights load by default; you can supply your own weight URL. Reuse the model across images, then dispose of its resources without destroying your device.
+
+```sh
+npm install @kaminos/moge
+```
+
+The [application guide](GETTING_STARTED.md) covers loading, repeated inference, cleanup, and building the standalone module from source.
 
 The standalone module runs on a GPU device your application owns. By default, it downloads hosted weights; pass `{ weightsUrl }` as the constructor's second argument to use your own copy. Loading and initialization errors reject rather than substituting synthetic output. Keep the instance for repeated runs, then call `dispose()` to release its resources without destroying your device.
 
 ```js
-import { MoGeInference, initGPU, borrowedDeviceBackendIdentity } from './moge-inference.js';
+import { MoGeInference, initGPU, borrowedDeviceBackendIdentity } from '@kaminos/moge';
 
 // Either let MoGe acquire a device (kit shared helper) …
 const gpu = await initGPU();

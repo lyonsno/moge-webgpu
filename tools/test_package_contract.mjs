@@ -35,6 +35,18 @@ try {
   const require = createRequire(path.join(app, 'package.json'));
   const entry = require.resolve('@kaminos/moge');
   const manifest = require('@kaminos/moge/package.json');
+  const readme = await fs.readFile(path.join(path.dirname(entry), 'README.md'), 'utf8');
+  assert.equal(readme, await fs.readFile(path.join(root, 'GETTING_STARTED.md'), 'utf8'));
+  const snippets = [...readme.matchAll(/^```js\n([\s\S]*?)^```/gm)].map(match => match[1]);
+  assert.ok(snippets.length > 0, 'the installed README must contain an application example');
+  for (const [index, contents] of snippets.entries()) {
+    const example = path.join(app, `readme-${index}.js`);
+    await fs.writeFile(example, contents);
+    await build({ root: app, configFile: false, logLevel: 'error', build: {
+      target: 'esnext', outDir: path.join(scratch, `readme-${index}`),
+      lib: { entry: example, formats: ['es'], fileName: 'example' },
+    } });
+  }
   assert.equal(manifest.private, true);
   assert.equal(manifest.license, 'MIT');
   assert.equal(manifest.version, '0.2.3');

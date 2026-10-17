@@ -16,7 +16,8 @@ export async function packMoGeModule({ out, version = '0.1.0' } = {}) {
   const stage = await fs.mkdtemp(path.join(os.tmpdir(), 'moge-pack-'));
   try {
     await build({ root, configFile: path.join(root, 'vite.lib.config.js'), build: { outDir: stage }, logLevel: 'error' });
-    for (const file of ['README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.txt']) await fs.copyFile(path.join(root, file), path.join(stage, file));
+    await fs.copyFile(path.join(root, 'GETTING_STARTED.md'), path.join(stage, 'README.md'));
+    for (const file of ['LICENSE', 'THIRD_PARTY_NOTICES.txt']) await fs.copyFile(path.join(root, file), path.join(stage, file));
     const manifest = {
       name: '@kaminos/moge', version, private: true, type: 'module', license: 'MIT',
       description: 'MoGe-2 depth estimation running entirely in WebGPU compute shaders',
