@@ -2,6 +2,7 @@
   "name": "moge-webgpu",
   "version": "0.0.1",
   "private": true,
+  "license": "MIT",
   "description": "MoGe-2 depth estimation running entirely in WebGPU compute shaders",
   "type": "module",
   "scripts": {

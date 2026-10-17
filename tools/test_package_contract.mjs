@@ -26,7 +26,7 @@ try {
   assert.equal(packed.version, '0.2.3');
   assert.equal(await fs.readFile(path.join(output, 'keep.txt'), 'utf8'), 'caller-owned output');
   const entries = execFileSync('tar', ['-tzf', packed.tarball], { encoding: 'utf8' }).trim().split('\n').sort();
-  assert.deepEqual(entries, ['LICENSE', 'README.md', 'moge-inference.js', 'package.json'].map(file => `package/${file}`).sort());
+  assert.deepEqual(entries, ['LICENSE', 'README.md', 'THIRD_PARTY_NOTICES.txt', 'moge-inference.js', 'package.json'].map(file => `package/${file}`).sort());
   const app = path.join(scratch, 'app');
   await fs.mkdir(app);
   await fs.writeFile(path.join(app, 'package.json'), JSON.stringify({ private: true, type: 'module' }));
@@ -36,11 +36,14 @@ try {
   const entry = require.resolve('@kaminos/moge');
   const manifest = require('@kaminos/moge/package.json');
   assert.equal(manifest.private, true);
+  assert.equal(manifest.license, 'MIT');
   assert.equal(manifest.version, '0.2.3');
   assert.equal(manifest.dependencies, undefined);
   assert.deepEqual(await fs.readFile(entry), await fs.readFile(path.join(reference, 'moge-inference.js')),
     'packaging must not change the exercised MoGe runtime');
   assert.deepEqual(await fs.readFile(path.join(path.dirname(entry), 'LICENSE')), await fs.readFile(path.join(root, 'LICENSE')));
+  assert.deepEqual(await fs.readFile(path.join(path.dirname(entry), 'THIRD_PARTY_NOTICES.txt')),
+    await fs.readFile(path.join(root, 'THIRD_PARTY_NOTICES.txt')));
   const api = await import(pathToFileURL(entry).href);
   assert.equal(typeof api.initGPU, 'function');
   assert.equal(typeof api.MoGeInference.prototype.run, 'function');

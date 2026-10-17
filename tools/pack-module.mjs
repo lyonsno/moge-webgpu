@@ -16,13 +16,13 @@ export async function packMoGeModule({ out, version = '0.1.0' } = {}) {
   const stage = await fs.mkdtemp(path.join(os.tmpdir(), 'moge-pack-'));
   try {
     await build({ root, configFile: path.join(root, 'vite.lib.config.js'), build: { outDir: stage }, logLevel: 'error' });
-    for (const file of ['README.md', 'LICENSE']) await fs.copyFile(path.join(root, file), path.join(stage, file));
+    for (const file of ['README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.txt']) await fs.copyFile(path.join(root, file), path.join(stage, file));
     const manifest = {
-      name: '@kaminos/moge', version, private: true, type: 'module', license: 'UNLICENSED',
+      name: '@kaminos/moge', version, private: true, type: 'module', license: 'MIT',
       description: 'MoGe-2 depth estimation running entirely in WebGPU compute shaders',
       main: './moge-inference.js',
       exports: { '.': './moge-inference.js', './package.json': './package.json' },
-      files: ['moge-inference.js', 'README.md', 'LICENSE'],
+      files: ['moge-inference.js', 'README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.txt'],
       repository: { type: 'git', url: 'git+https://github.com/lyonsno/moge-webgpu.git' },
       keywords: ['webgpu', 'moge', 'depth-estimation', 'surface-normals', '3d-reconstruction'],
     };
