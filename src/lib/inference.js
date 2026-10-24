@@ -45,6 +45,7 @@ import {
   resolveCooperativeScheduler,
   coopEvent,
   coopYield,
+  runCooperativeCommand,
   cooperativeSchedulerDescriptor,
   createMogeSchedulerVerificationReceipt,
 } from './scheduler_receipt.js';
@@ -1186,6 +1187,11 @@ export class MoGeInference {
   }
 
   async _run(imageData, options = {}) {
+    const coopPre = resolveCooperativeScheduler(options.scheduler);
+    if (coopPre?.schedule && (options.profileDecoderSubstages || options.profileNeckLevels ||
+        options.profileNeckInternals || options.profileNeckResampler)) {
+      throw new Error('MoGe internal profilers own their submissions; use the direct model without an application schedule');
+    }
     const totalStart = performance.now();
     const phaseTimings = {};
     const { width, height } = imageData;
@@ -1230,7 +1236,6 @@ export class MoGeInference {
     // Cooperative mode: the ~800k-iteration normalization loop is main-thread
     // work before the first submit (the probe-attributed no-scheduler-span gap
     // at the very start of a run); band it by rows with yields between bands.
-    const coopPre = resolveCooperativeScheduler(options.scheduler);
     const preRows = coopPre ? 64 : imgH;
     for (let row0 = 0; row0 < imgH; row0 += preRows) {
       const iEnd = Math.min(imgH, row0 + preRows) * imgW;
@@ -1343,8 +1348,10 @@ export class MoGeInference {
               const backboneChunkLabel = meta.kind === 'vit-block-segment' ? `block-${meta.block}:${meta.segmentName}`
                 : (meta.kind === 'vit-blocks' ? `blocks-${meta.firstBlock}-${meta.lastBlock}` : meta.kind);
               const waitStart = performance.now();
-              device.queue.submit([chunkEncoder.finish()]);
-              await coopPace('backbone', backboneChunkLabel);
+              await runCooperativeCommand(coop, 'backbone', async () => {
+                device.queue.submit([chunkEncoder.finish()]);
+                await coopPace('backbone', backboneChunkLabel);
+              });
               const waitMs = performance.now() - waitStart;
               backboneWaitMs += waitMs;
               coopEvent(coop, 'backbone', 'queue-work-done-end', { waitMs,
@@ -1608,8 +1615,10 @@ export class MoGeInference {
     if (stagedSubmits) {
       if (coop) coopEvent(coop, 'decoder-heads', 'queue-work-done-start', { chunk: 'neck-input' });
       const waitStart = performance.now();
-      device.queue.submit([commandEncoder.finish()]);
-      await device.queue.onSubmittedWorkDone();
+      await runCooperativeCommand(coop, 'decoder-heads', async () => {
+        device.queue.submit([commandEncoder.finish()]);
+        await device.queue.onSubmittedWorkDone();
+      });
       stagedGpuPhaseTimings.neckInputSubmitWaitMs = performance.now() - waitStart;
       if (coop) {
         coopEvent(coop, 'decoder-heads', 'queue-work-done-end', { waitMs: stagedGpuPhaseTimings.neckInputSubmitWaitMs });
@@ -1642,8 +1651,10 @@ export class MoGeInference {
       const chunkLabel = `${label}:level-${meta.level}${meta.part ? `:${meta.part}` : ''}`;
       coopEvent(coop, 'decoder-heads', 'queue-work-done-start', { chunk: chunkLabel });
       const waitStart = performance.now();
-      device.queue.submit([levelEncoder.finish()]);
-      await coopPace('decoder-heads', chunkLabel);
+      await runCooperativeCommand(coop, 'decoder-heads', async () => {
+        device.queue.submit([levelEncoder.finish()]);
+        await coopPace('decoder-heads', chunkLabel);
+      });
       const waitMs = performance.now() - waitStart;
       coopDecoderWaitMs += waitMs;
       coopEvent(coop, 'decoder-heads', 'queue-work-done-end', { waitMs, chunk: chunkLabel });
@@ -1763,8 +1774,10 @@ export class MoGeInference {
     } else if (stagedSubmits) {
       if (coop) coopEvent(coop, 'decoder-heads', 'queue-work-done-start', { chunk: 'decoder-tail' });
       const waitStart = performance.now();
-      device.queue.submit([decoderEncoder.finish()]);
-      await device.queue.onSubmittedWorkDone();
+      await runCooperativeCommand(coop, 'decoder-heads', async () => {
+        device.queue.submit([decoderEncoder.finish()]);
+        await device.queue.onSubmittedWorkDone();
+      });
       const tailWaitMs = performance.now() - waitStart;
       stagedGpuPhaseTimings.decoderSubmitWaitMs = coopDecoderWaitMs + tailWaitMs;
       if (coop) {
@@ -1785,11 +1798,11 @@ export class MoGeInference {
     if (coop && coop.pacing === 'bounded-prefix') await coopDrain();
     if (coop) coopEvent(coop, 'output-readback', 'readback-wait-start');
     const gpuReadbackStart = performance.now();
-    const [pointsRaw, normalsRaw, maskRaw] = await Promise.all([
+    const [pointsRaw, normalsRaw, maskRaw] = await runCooperativeCommand(coop, 'output-readback', () => Promise.all([
       readBuffer(device, lastPoints.buffer, lastPoints.C * lastPoints.H * lastPoints.W * 4),
       readBuffer(device, lastNormals.buffer, lastNormals.C * lastNormals.H * lastNormals.W * 4),
       readBuffer(device, lastMask.buffer, lastMask.C * lastMask.H * lastMask.W * 4),
-    ]);
+    ]));
     phaseTimings.gpuReadbackMs = performance.now() - gpuReadbackStart;
     if (stagedSubmits) stagedGpuPhaseTimings.outputReadbackMs = phaseTimings.gpuReadbackMs;
     if (coop) {
@@ -1829,7 +1842,7 @@ export class MoGeInference {
     // Read CLS token for scale head (deferred from backbone to avoid mid-pipeline sync)
     if (backboneClsTokenBuf && !clsTokenData) {
       const clsReadbackStart = performance.now();
-      clsTokenData = await readBuffer(device, backboneClsTokenBuf, encoderDim * 4);
+      clsTokenData = await runCooperativeCommand(coop, 'output-readback', () => readBuffer(device, backboneClsTokenBuf, encoderDim * 4));
       phaseTimings.clsReadbackMs = performance.now() - clsReadbackStart;
     } else {
       phaseTimings.clsReadbackMs = 0;

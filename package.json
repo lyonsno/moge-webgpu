@@ -28,7 +28,8 @@
     "test:scheduler-receipt-unit": "node tools/test_scheduler_receipt_unit.mjs",
     "build:lib": "vite build --config vite.lib.config.js",
     "test:embedding": "npm run build:lib && node --test tools/test_embedding_contract.mjs && node tools/test_inference_lifecycle.mjs",
-    "test:buffer-pool-unit": "node tools/test_buffer_pool_unit.mjs"
+    "test:buffer-pool-unit": "node tools/test_buffer_pool_unit.mjs",
+    "test:application-schedule": "node tools/test_application_schedule.mjs"
   },
   "devDependencies": {
     "@kaminos/webgpu-inference-kit": "^0.1.49",

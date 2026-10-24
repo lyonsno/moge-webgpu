@@ -28,8 +28,16 @@ function cloneJson(value) {
 // moge scheduler profile: per-phase chunked submits with browser yields) ---
 
 export function resolveCooperativeScheduler(requested) {
+  const schedule = requested?.schedule;
+  if (schedule && (requested.mode !== 'cooperative' || !schedule.invocation ||
+      typeof schedule.runtime?.prepareCommandDutyAtBoundary !== 'function' ||
+      typeof schedule.runtime?.settleCommandDuty !== 'function' ||
+      typeof schedule.control?.runDuty !== 'function' || typeof schedule.withForeground !== 'function')) {
+    throw new TypeError('MoGe application schedule requires cooperative mode, runtime, invocation, control and foreground');
+  }
   if (!requested || requested.mode !== 'cooperative') return null;
   return {
+    schedule,
     mode: 'cooperative',
     yieldMs: Math.max(0, Number.isFinite(Number(requested.yieldMs)) ? Number(requested.yieldMs) : 4),
     vitBlockChunkSize: Math.max(1, Math.floor(Number(requested.vitBlockChunkSize) || 1)),
@@ -63,9 +71,43 @@ export function coopEvent(coop, phase, kind, extra = {}) {
 
 export async function coopYield(coop, phase) {
   if (!coop) return;
-  coopEvent(coop, phase, 'yield-start');
-  await new Promise(resolve => setTimeout(resolve, coop.yieldMs));
-  coopEvent(coop, phase, 'yield-end', { yieldMs: coop.yieldMs });
+  const yieldWork = async () => {
+    throwIfStopped(coop.schedule);
+    coopEvent(coop, phase, 'yield-start');
+    await new Promise(resolve => setTimeout(resolve, coop.yieldMs));
+    throwIfStopped(coop.schedule);
+    coopEvent(coop, phase, 'yield-end', { yieldMs: coop.yieldMs });
+  };
+  if (coop.schedule) {
+    await coop.schedule.control.runDuty(() => coop.schedule.withForeground(`moge:${phase}`, yieldWork));
+  } else await yieldWork();
+}
+
+function throwIfStopped(schedule) {
+  if (!schedule?.signal?.aborted) return;
+  const error = new Error(String(schedule.signal.reason?.message ?? schedule.signal.reason ?? 'MoGe stopped'));
+  error.name = 'AbortError';
+  throw error;
+}
+
+// Preserve the producer's existing chunks and pacing; the host admits each
+// actual submission/readback before it reaches the shared queue.
+export async function runCooperativeCommand(coop, phase, work) {
+  const schedule = coop?.schedule;
+  if (!schedule) return work();
+  return schedule.control.runDuty(async () => {
+    throwIfStopped(schedule);
+    const duty = await schedule.runtime.prepareCommandDutyAtBoundary({ phase, kind: 'compute' }, schedule.invocation);
+    try {
+      throwIfStopped(schedule);
+      const result = await work();
+      schedule.runtime.settleCommandDuty(duty, { status: 'encoded' });
+      return result;
+    } catch (error) {
+      schedule.runtime.settleCommandDuty(duty, { status: 'failed', error });
+      throw error;
+    }
+  });
 }
 
 /**
